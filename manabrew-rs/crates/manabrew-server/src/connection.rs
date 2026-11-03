@@ -1706,7 +1706,7 @@ fn handle_client_message(
             info!(
                 "[lobby] '{}' resuming room {} (hosted={}, players={:?})",
                 username,
-                &room_id[..8.min(room_id.len())],
+                room_id.get(..8).unwrap_or(&room_id),
                 request.hosted,
                 request.player_order,
             );
