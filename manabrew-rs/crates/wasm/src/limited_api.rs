@@ -718,6 +718,8 @@ pub struct CubeImportResultDto {
     pub rejected_card_count: u32,
 }
 
+const CUBE_RANKINGS_PATH: &str = "draft/rankings_cubecobra.txt";
+
 struct WasmLimitedState {
     sessions: HashMap<String, SealedDeckGroup>,
     drafts: HashMap<String, BoosterDraft>,
@@ -729,6 +731,17 @@ struct WasmLimitedState {
 
 impl WasmLimitedState {
     fn new() -> Self {
+        forge_limited::set_magic_db(forge_limited::MagicDb {
+            card_rules: |name| crate::card_loader::get_card_db()?.get_by_card_name(name),
+            cube_rankings: || {
+                crate::card_loader::get_card_db()?
+                    .archive()?
+                    .extras
+                    .iter()
+                    .find(|extra| extra.path.as_str() == CUBE_RANKINGS_PATH)
+                    .map(|extra| extra.raw.as_str())
+            },
+        });
         Self {
             sessions: HashMap::new(),
             drafts: HashMap::new(),
@@ -861,9 +874,13 @@ pub fn limited_start_sealed(setup_json: JsValue) -> Result<JsValue, JsError> {
                 card_pool.len()
             )));
         }
+        let mut ranker = CardRanker::new(state.rank_cache.clone());
+        if pool_type == LimitedPoolType::Custom {
+            ranker = ranker.with_cube_rankings(&card_pool);
+        }
+        let ranker = Arc::new(ranker);
         let mut gen = SealedCardPoolGenerator::new(pool_type, card_pool)
             .with_template_and_pool_limit(template, setup.num_boosters as usize, setup.singleton);
-        let ranker = Arc::new(CardRanker::new(state.rank_cache.clone()));
         let cache = state.rank_cache.clone();
         let group = gen.generate_sealed_deck(
             "Sealed Pool",
@@ -919,7 +936,11 @@ pub fn limited_start_booster_draft(setup_json: JsValue) -> Result<JsValue, JsErr
                 card_pool.len()
             )));
         }
-        let ranker = Arc::new(CardRanker::new(state.rank_cache.clone()));
+        let mut ranker = CardRanker::new(state.rank_cache.clone());
+        if setup.custom_pool {
+            ranker = ranker.with_cube_rankings(&card_pool);
+        }
+        let ranker = Arc::new(ranker);
         let color_of: Arc<dyn Fn(&PaperCard) -> ColorSet + Send + Sync> =
             Arc::new(|c: &PaperCard| c.colors);
         let template = if setup.custom_pool {
@@ -1027,7 +1048,11 @@ pub fn limited_start_multiplayer_draft(
             .into_iter()
             .map(|h| (h.seat as usize, h.name))
             .collect();
-        let ranker = Arc::new(CardRanker::new(state.rank_cache.clone()));
+        let mut ranker = CardRanker::new(state.rank_cache.clone());
+        if setup.custom_pool {
+            ranker = ranker.with_cube_rankings(&card_pool);
+        }
+        let ranker = Arc::new(ranker);
         let color_of: Arc<dyn Fn(&PaperCard) -> ColorSet + Send + Sync> =
             Arc::new(|c: &PaperCard| c.colors);
         let template = if setup.custom_pool {

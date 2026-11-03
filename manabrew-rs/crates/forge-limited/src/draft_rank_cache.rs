@@ -34,6 +34,18 @@ impl DraftRankCache {
         self.register_set(set_code, ReadDraftRankings::parse(body));
     }
 
+    pub fn ranking(&self, set_code: &str, card_name: &str) -> Option<f64> {
+        let guard = self.by_set.read().expect("DraftRankCache poisoned");
+        let ranks = guard.get(&set_code.to_lowercase())?;
+        let rank = ranks.get(&card_name.to_lowercase()).copied()?;
+        Some(Self::relative(rank, ranks))
+    }
+
+    pub fn relative(rank: u32, ranks: &HashMap<String, u32>) -> f64 {
+        let set_size = ranks.values().copied().max().unwrap_or(rank).max(1);
+        rank as f64 / set_size as f64
+    }
+
     pub fn rank(&self, set_code: &str, card_name: &str) -> Option<u32> {
         let guard = self.by_set.read().expect("DraftRankCache poisoned");
         guard
@@ -54,6 +66,15 @@ impl DraftRankCache {
             }
         }
         best
+    }
+
+    pub fn best_ranking(&self, card_name: &str) -> Option<f64> {
+        let guard = self.by_set.read().expect("DraftRankCache poisoned");
+        let needle = card_name.to_lowercase();
+        guard
+            .values()
+            .filter_map(|ranks| ranks.get(&needle).map(|&r| Self::relative(r, ranks)))
+            .min_by(f64::total_cmp)
     }
 
     pub fn loaded_sets(&self) -> Vec<String> {

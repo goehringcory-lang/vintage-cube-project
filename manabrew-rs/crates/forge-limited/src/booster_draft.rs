@@ -497,7 +497,7 @@ impl BoosterDraft {
             let player = &self.seats[seat];
             let mut colors = crate::deck_colors::DeckColors::new();
             for card in &player.picked {
-                colors.observe(card, (self.color_of)(card));
+                colors.observe((self.color_of)(card), self.ranker.get_raw_score(card));
             }
             let ranked = self.ranker.rank_cards_in_pack(
                 pack.cards(),

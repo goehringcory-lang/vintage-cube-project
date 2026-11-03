@@ -19,7 +19,14 @@ pub use build::{build_archive_from_sources, ArchiveSources, BuildStats};
 
 pub const ARCHIVE_FORMAT_VERSION: u32 = 6;
 
-pub const DEFAULT_EXTRA_DIRS: &[&str] = &["formats", "lists", "defaults", "effects", "ai"];
+pub const DEFAULT_EXTRA_DIRS: &[&str] = &[
+    "formats",
+    "lists",
+    "defaults",
+    "effects",
+    "ai",
+    "draft/rankings_cubecobra.txt",
+];
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 #[archive(check_bytes)]

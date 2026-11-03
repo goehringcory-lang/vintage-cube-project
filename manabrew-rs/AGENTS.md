@@ -73,6 +73,8 @@ Continuous statics with `AffectedDefined` resolve that defined-card set before a
 
 Flavor names declared as `Variant:<variant>:FlavorName:<name>` script lines (Universes Within and Through the Omenpaths printings) are lookup aliases. `CardDatabase::load_from_archive` registers them from raw scripts before any card is parsed, so name-only imports such as MTGO cube lists resolve them.
 
+Limited AI reads card rules and the cube pick order through `forge_limited::set_magic_db`, which both hosts (`src-tauri/src/limited_manager.rs`, `crates/wasm/src/limited_api.rs`) register; without it the ranker falls back to rarity and the deck builder to `color_of`/`is_land`. Cube pools (custom pool drafts and Custom sealed) rank with Forge's `res/draft/rankings_cubecobra.txt`, carried in the cardset archive extras and filtered to the pool so checkpoints stay small. `LimitedDeckBuilder` mirrors Java's `LimitedDeckBuilder` but always picks colors from the final pool (Java's `SealedDeckBuilder.chooseColors`), lets colored-identity mana rocks such as Moxen and Talismans count as on-color, caps colorless utility lands at three, and does not port `checkRemRandomDeckCards` because DeckHints/DeckNeeds are not parsed. `DeckColors` stays open for `PICKS_BEFORE_COMMITTING` picks instead of Java's first-two-colors lock.
+
 Limited selection resolves cards to physical pack IDs. `PaperCard` equality compares set, collector number and foil, but omits name; name-only cube imports can therefore make unlike cards equal. When resolving a ranked or submitted card, match its name as well as `PaperCard` equality. An explicit pending occurrence ID takes priority so identical copies remain independently selectable.
 
 ## `manabrew-engine` crate — module map

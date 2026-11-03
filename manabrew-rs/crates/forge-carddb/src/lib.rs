@@ -1,8 +1,10 @@
+pub mod card_ai_hints;
 pub mod card_face;
 pub mod card_rules;
 pub mod database;
 pub mod parser;
 
+pub use card_ai_hints::CardAiHints;
 pub use card_face::CardFace;
 pub use card_rules::CardRules;
 pub use database::CardDatabase;

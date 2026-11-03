@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 forge-foundation = { path = "../forge-foundation" }
+forge-carddb = { path = "../forge-carddb" }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 rand = "0.8"
