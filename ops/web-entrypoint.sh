@@ -14,10 +14,25 @@ set -e
 #     EMAIL_SIGN_IN, forgeWasm from FORGE_WASM. Can only enable, never disable.
 #   hubApiUrl: from HUB_API_URL — deck hub + auth API origin; unset leaves the
 #     app on its compiled-in VITE_HUB_API_URL / api.manabrew.app default.
+
+js_string() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+if [ -n "${RELAY_HOST:-}" ]; then
+	case "${RELAY_PORT:-443}" in
+	'' | *[!0-9]*)
+		echo "[entrypoint] RELAY_PORT must be a number, got '${RELAY_PORT}'." >&2
+		exit 1
+		;;
+	esac
+fi
+
 {
 	echo 'window.__MANABREW_RUNTIME__ = {'
 	if [ -n "${RELAY_HOST:-}" ]; then
-		echo "  relay: { host: \"${RELAY_HOST}\", port: ${RELAY_PORT:-443}, password: \"${RELAY_PASSWORD:-forge}\" },"
+		printf '  relay: { host: "%s", port: %s, password: "%s" },\n' \
+			"$(js_string "${RELAY_HOST}")" "${RELAY_PORT:-443}" "$(js_string "${RELAY_PASSWORD:-forge}")"
 	fi
 	case "$(printf '%s' "${HOSTED_AI_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" in
 	1 | true | yes | on) echo '  hostedAiEnabled: true,' ;;
@@ -53,7 +68,7 @@ set -e
 		echo "  featureFlags: {${flags} },"
 	fi
 	if [ -n "${HUB_API_URL:-}" ]; then
-		echo "  hubApiUrl: \"${HUB_API_URL}\","
+		printf '  hubApiUrl: "%s",\n' "$(js_string "${HUB_API_URL}")"
 	fi
 	echo '};'
 } >/srv/manabrew/config.js
