@@ -40,6 +40,7 @@ jobs:
   # (schedule, dispatch) warm everything.
   changes:
     name: Changed inputs
+    if: github.repository == 'witchesofthehill/manabrew'
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
