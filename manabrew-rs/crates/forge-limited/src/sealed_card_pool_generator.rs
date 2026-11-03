@@ -186,7 +186,7 @@ impl SealedCardPoolGenerator {
         let ranked_pool = ranker.get_ordered_raw_scores(&human_pool);
         for card in ranked_pool.iter().take(top_third) {
             let colors = color_of(card);
-            chosen.observe(card, colors);
+            chosen.observe(colors, ranker.get_raw_score(card));
             if chosen.is_locked() {
                 break;
             }
@@ -228,7 +228,7 @@ impl SealedCardPoolGenerator {
             let ai_ranked = ranker.get_ordered_raw_scores(&pool);
             for card in ai_ranked.iter().take(ai_top) {
                 let colors = color_of(card);
-                ai_chosen.observe(card, colors);
+                ai_chosen.observe(colors, ranker.get_raw_score(card));
                 if ai_chosen.is_locked() {
                     break;
                 }

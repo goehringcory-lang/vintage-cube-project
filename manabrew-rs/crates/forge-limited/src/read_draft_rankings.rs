@@ -7,12 +7,12 @@ impl ReadDraftRankings {
         let mut out = HashMap::new();
         for line in body.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            if trimmed.is_empty() || trimmed.starts_with("//") {
                 continue;
             }
             let mut parts = trimmed.split('|');
             let rank_str = match parts.next() {
-                Some(s) => s.trim(),
+                Some(s) => s.trim().trim_start_matches('#'),
                 None => continue,
             };
             let name = match parts.next() {

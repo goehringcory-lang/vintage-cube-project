@@ -85,7 +85,8 @@ impl LimitedAgent for LimitedPlayerAI {
         );
         let pick = ranked.into_iter().next()?;
         let pick_colors = (self.color_of)(&pick);
-        self.colors.observe(&pick, pick_colors);
+        self.colors
+            .observe(pick_colors, self.ranker.get_raw_score(&pick));
         self.pile.push(pick.clone());
         Some(pick)
     }

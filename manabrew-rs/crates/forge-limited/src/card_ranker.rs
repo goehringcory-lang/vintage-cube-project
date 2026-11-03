@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::card_ranking_comparator::CardRankingComparator;
 use crate::draft_rank_cache::DraftRankCache;
+use crate::magic_db::rules_of;
+use crate::read_draft_rankings::ReadDraftRankings;
+
+const BASIC_LANDS: [&str; 5] = ["Plains", "Island", "Swamp", "Mountain", "Forest"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardRankerState {
@@ -52,48 +56,82 @@ impl CardRanker {
         self
     }
 
-    fn normalise_rank(rank: u32) -> f64 {
-        let bounded = rank.min(250) as f64;
-        ((250.0 - bounded) / 250.0) * 100.0
+    pub fn with_cube_rankings(self, pool: &[PaperCard]) -> Self {
+        let Some(body) = crate::magic_db::cube_rankings() else {
+            return self;
+        };
+        let all = ReadDraftRankings::parse(body);
+        let rankings = pool
+            .iter()
+            .filter_map(|card| {
+                let key = card.name.to_lowercase();
+                all.get(&key).map(|&rank| (key, rank))
+            })
+            .collect();
+        self.with_custom_rankings(rankings)
     }
 
     pub fn get_raw_score(&self, card: &PaperCard) -> f64 {
-        if let Some(custom) = &self.custom_rankings {
-            if let Some(r) = custom.get(&card.name.to_lowercase()).copied() {
-                return Self::normalise_rank(r);
-            }
+        if BASIC_LANDS.contains(&card.name.as_str()) {
+            return Self::SCORE_UNPICKABLE;
         }
-        if let Some(r) = self.rank_cache.rank(&card.set_code, &card.name) {
-            return Self::normalise_rank(r);
+        let rkg = match &self.custom_rankings {
+            Some(custom) => custom
+                .get(&card.name.to_lowercase())
+                .map(|&rank| DraftRankCache::relative(rank, custom))
+                .or_else(|| self.default_ranking(card).map(|r| r + 1.0))
+                .map(|r| r / 2.0),
+            None => self.default_ranking(card),
+        };
+        match rkg {
+            Some(rkg) => 100.0 - 100.0 * rkg,
+            None => match card.rarity {
+                Rarity::Mythic => 20.0,
+                Rarity::Rare => 15.0,
+                Rarity::Uncommon => 10.0,
+                Rarity::Common => 5.0,
+                Rarity::BasicLand => Self::SCORE_UNPICKABLE,
+                Rarity::Special | Rarity::Token | Rarity::Unknown => 0.0,
+            },
         }
-        if let Some(r) = self.rank_cache.best_rank(&card.name) {
-            return Self::normalise_rank(r);
-        }
-        match card.rarity {
-            Rarity::Mythic => 70.0,
-            Rarity::Rare => 60.0,
-            Rarity::Uncommon => 40.0,
-            Rarity::Common => 25.0,
-            Rarity::BasicLand => 10.0,
-            Rarity::Special | Rarity::Token | Rarity::Unknown => 5.0,
-        }
+    }
+
+    fn default_ranking(&self, card: &PaperCard) -> Option<f64> {
+        self.rank_cache
+            .ranking(&card.set_code, &card.name)
+            .or_else(|| self.rank_cache.best_ranking(&card.name))
+    }
+
+    fn rem_ai_decks(card: &PaperCard) -> bool {
+        rules_of(card).is_some_and(|rules| rules.ai_hints.rem_ai_decks)
     }
 
     pub fn get_scores(&self, cards: &[PaperCard]) -> Vec<(f64, PaperCard)> {
         cards
             .iter()
-            .map(|c| (self.get_raw_score(c), c.clone()))
+            .map(|c| {
+                let mut score = self.get_raw_score(c);
+                if Self::rem_ai_decks(c) {
+                    score -= 20.0;
+                }
+                (score, c.clone())
+            })
             .collect()
     }
 
     pub fn get_ordered_raw_scores(&self, cards: &[PaperCard]) -> Vec<PaperCard> {
-        let mut scored = self.get_scores(cards);
+        let mut scored: Vec<(f64, PaperCard)> = cards
+            .iter()
+            .map(|c| (self.get_raw_score(c), c.clone()))
+            .collect();
         CardRankingComparator::sort(&mut scored);
         scored.into_iter().map(|(_, c)| c).collect()
     }
 
     pub fn rank_cards_in_deck(&self, cards: &[PaperCard]) -> Vec<PaperCard> {
-        self.get_ordered_raw_scores(cards)
+        let mut scored = self.get_scores(cards);
+        CardRankingComparator::sort(&mut scored);
+        scored.into_iter().map(|(_, c)| c).collect()
     }
 
     pub fn rank_cards_in_pack(
@@ -108,17 +146,16 @@ impl CardRanker {
         let mut scored: Vec<(f64, PaperCard)> = pack
             .iter()
             .map(|c| {
-                let raw = self.get_raw_score(c);
-                let colors = card_color_lookup(c);
-                let score = if !chosen_colors.is_colorless()
-                    && !can_add_more_colors
-                    && !colors.is_colorless()
-                    && !chosen_colors.contains_all_colors_from(colors)
-                {
-                    Self::SCORE_UNPICKABLE
-                } else {
-                    raw
-                };
+                let mut score = self.get_raw_score(c);
+                if Self::rem_ai_decks(c) {
+                    score -= 20.0;
+                }
+                let colors = rules_of(c)
+                    .map(|rules| rules.deckbuilding_colors())
+                    .unwrap_or_else(|| card_color_lookup(c));
+                if !can_add_more_colors && !chosen_colors.contains_all_colors_from(colors) {
+                    score -= 50.0;
+                }
                 (score, c.clone())
             })
             .collect();
