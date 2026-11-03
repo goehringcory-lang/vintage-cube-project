@@ -1263,7 +1263,8 @@ class WebServerApi implements IServerApi {
       this.eventBus.emit("server:reconnecting", { phase: "idle" as const, attempt: 0 });
     } catch (e) {
       console.warn("[relay-disconnect] reconnect attempt failed", e);
-      this.scheduleReconnect("network", this.nextBackoffMs());
+      // A socket that errored still fires onclose, which schedules the retry.
+      if (this.ws === null) this.scheduleReconnect("network", this.nextBackoffMs());
     }
   }
 
