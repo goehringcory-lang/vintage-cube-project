@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use forge_card_script::{ParsedCardScript, ScriptLineKind};
 use forge_foundation::{CardSplitType, CardTypeLine, ColorSet, ManaCost};
 
+use crate::card_ai_hints::CardAiHints;
 use crate::card_face::CardFace;
 use crate::card_rules::CardRules;
 
@@ -16,6 +17,7 @@ pub struct CardScriptParser {
     partner_with: Option<String>,
     normalized_name: String,
     tokens: Vec<String>,
+    ai_hints: CardAiHints,
 }
 
 impl CardScriptParser {
@@ -28,6 +30,7 @@ impl CardScriptParser {
             partner_with: None,
             normalized_name: String::new(),
             tokens: Vec::new(),
+            ai_hints: CardAiHints::default(),
         }
     }
 
@@ -39,6 +42,7 @@ impl CardScriptParser {
         self.partner_with = None;
         self.normalized_name.clear();
         self.tokens.clear();
+        self.ai_hints = CardAiHints::default();
     }
 
     /// Parse all lines from a card script and produce a CardRules.
@@ -94,6 +98,17 @@ impl CardScriptParser {
                     self.ensure_face(face_idx);
                     if let Some(face) = &mut self.faces[face_idx] {
                         face.abilities.push(value_str.to_string());
+                    }
+                } else if key == "AI" {
+                    let (variable, value) = match value_str.split_once(':') {
+                        Some((variable, value)) => (variable, Some(value)),
+                        None => (value_str, None),
+                    };
+                    if variable == "RemoveDeck" {
+                        let is = |v: &str| value.is_some_and(|value| value.eq_ignore_ascii_case(v));
+                        self.ai_hints.rem_ai_decks |= is("All");
+                        self.ai_hints.rem_random_decks |= is("Random");
+                        self.ai_hints.rem_non_commander_decks |= is("NonCommander");
                     }
                 } else if key == "AlternateMode" {
                     if let Some(mode) = CardSplitType::from_str_compat(value_str) {
@@ -279,7 +294,7 @@ impl CardScriptParser {
                 }
             }
             _ => {
-                // AI:, other keys — ignored for engine
+                // other keys — ignored for engine
             }
         }
     }
@@ -337,6 +352,7 @@ impl CardScriptParser {
             meld_with: self.meld_with.take(),
             partner_with: self.partner_with.take(),
             tokens: std::mem::take(&mut self.tokens),
+            ai_hints: std::mem::take(&mut self.ai_hints),
         })
     }
 }

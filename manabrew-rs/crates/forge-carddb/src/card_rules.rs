@@ -2,6 +2,7 @@ use forge_foundation::{CardSplitType, ColorSet, ManaCost};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::card_ai_hints::CardAiHints;
 use crate::card_face::CardFace;
 
 /// Complete card definition with all faces. Mirrors Java `CardRules`.
@@ -18,6 +19,8 @@ pub struct CardRules {
     pub partner_with: Option<String>,
     #[serde(default)]
     pub tokens: Vec<String>,
+    #[serde(default)]
+    pub ai_hints: CardAiHints,
 }
 
 impl CardRules {
@@ -63,6 +66,28 @@ impl CardRules {
 
     pub fn cmc(&self) -> i32 {
         self.mana_cost().cmc()
+    }
+
+    pub fn deckbuilding_colors(&self) -> ColorSet {
+        if self.main_part.type_line.is_land() {
+            let oracle = self.main_part.oracle_text.to_lowercase();
+            let mut mask = self.color_identity.mask();
+            for (i, basic) in ["plains", "island", "swamp", "mountain", "forest"]
+                .iter()
+                .enumerate()
+            {
+                if oracle.contains(basic) {
+                    mask |= 1 << i;
+                }
+            }
+            ColorSet::from_mask(mask)
+        } else {
+            let mut mask = self.color().mask();
+            if let Some(other) = &self.other_part {
+                mask |= other.mana_cost.color_profile();
+            }
+            ColorSet::from_mask(mask)
+        }
     }
 
     /// Calculate color identity from face colors + mana symbols in oracle text.
