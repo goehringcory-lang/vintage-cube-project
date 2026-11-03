@@ -1,0 +1,700 @@
+import { Container, Graphics, Rectangle } from "pixi.js";
+import { getUiControlFloor } from "@/themes/typography";
+import gsap from "gsap";
+import { CARD_H, CARD_W, GAME_CARD_SIZES } from "@/components/game/game.constants";
+import type { Theme } from "@/hooks/useTheme";
+import { CardSprite } from "../CardSprite";
+import { hexToNum } from "../colorUtils";
+import { animationsEnabled } from "../effects/enabled";
+import type { ScreenBounds, ScreenPos } from "../types";
+import { HOVER_SCALE, StackCardSprite } from "./StackCardSprite";
+import {
+  computeStackLayout,
+  reconcileStackHover,
+  STACK_COMPACT_BOTTOM_RESERVE,
+  STACK_COMPACT_TOP_INSET,
+  STACK_OFFSET_Y,
+} from "./stackLayout";
+import type { StackAnchorProvider, StackCallbacks, StackSpec } from "./stack.types";
+import { gameCardFaceIndex } from "@/lib/gameCard";
+
+const MAX_CARD_HEIGHT_FRAC = 0.55;
+const COMPACT_MAX_CARD_HEIGHT_FRAC = 0.69;
+const HOVER_MOVE_MS = 0.16;
+const HOVER_EASE = "power2.out";
+
+const PEEK_HOLD_S = 1.2;
+const COLLAPSE_MS = 0.2;
+const COLLAPSE_EASE = "power3.out";
+const BTN_W = 18;
+const BTN_H = 64;
+const BTN_RADIUS = 5;
+const BTN_HOVER_SCALE = 1.22;
+const BTN_PRESS_SCALE = 0.94;
+const BTN_ARROW_W = 6;
+const BTN_ARROW_H = 11;
+const BTN_GAP = 6;
+
+export class StackLayer implements StackAnchorProvider {
+  readonly container: Container;
+  private theme: Theme;
+  private readonly callbacks: StackCallbacks;
+  private readonly compact: boolean;
+  private sprites = new Map<string, StackCardSprite>();
+  private faceOverrides = new Map<string, boolean>();
+  private rulesViewOverrides = new Map<string, boolean>();
+  private rulesViewDefault = false;
+  private updatingSpec = false;
+  private spec: StackSpec = {
+    cards: [],
+    flash: null,
+    showPreStackFlash: false,
+    collapsed: false,
+  };
+  private retiringSprites = new Set<StackCardSprite>();
+  private hoveredId: string | null = null;
+  private viewW = 0;
+  private viewH = 0;
+  private bounds: ScreenBounds | null = null;
+  private flashSprite: CardSprite | null = null;
+  private flashToken: string | null = null;
+  private promptReferenceId: string | null = null;
+  private promptReferenceColor: number | null = null;
+
+  private btn = new Container();
+  private btnGlow = new Graphics();
+  private btnGfx = new Graphics();
+  private btnPulsing = false;
+  private btnTween: gsap.core.Tween | null = null;
+  private btnPressed = false;
+  private btnHovered = false;
+  private btnVisible = false;
+  private btnTargetX = 0;
+  private prevHoveredIndex = -1;
+
+  private peeking = false;
+  private peekTimer: gsap.core.Tween | null = null;
+  private prevCardIds = new Set<string>();
+  private builtCardWidth: number = GAME_CARD_SIZES.preview.width;
+  private prevFanOut: boolean | null = null;
+
+  private cardWidth(): number {
+    if (this.viewH <= 0) return GAME_CARD_SIZES.preview.width;
+    const height = this.compact
+      ? Math.min(
+          this.viewH * COMPACT_MAX_CARD_HEIGHT_FRAC,
+          this.viewH -
+            STACK_COMPACT_TOP_INSET -
+            STACK_COMPACT_BOTTOM_RESERVE -
+            Math.max(0, this.spec.cards.length - 1) * STACK_OFFSET_Y,
+        )
+      : this.viewH * MAX_CARD_HEIGHT_FRAC;
+    return Math.min(GAME_CARD_SIZES.preview.width, (height * CARD_W) / CARD_H);
+  }
+
+  private faceScale(): number {
+    return this.cardWidth() / CARD_W;
+  }
+
+  private cardHeight(): number {
+    return CARD_H * this.faceScale();
+  }
+
+  constructor(theme: Theme, callbacks: StackCallbacks, compact = false) {
+    this.theme = theme;
+    this.callbacks = callbacks;
+    this.compact = compact;
+    this.container = new Container();
+    this.container.sortableChildren = true;
+
+    this.btnGlow.eventMode = "none";
+    this.btnGlow.visible = false;
+    this.btnGfx.eventMode = "none";
+    this.btn.addChild(this.btnGlow, this.btnGfx);
+    this.btn.zIndex = 400;
+    this.btn.visible = false;
+    this.btn.eventMode = "static";
+    this.btn.cursor = "pointer";
+    this.btn.on("pointertap", () => this.callbacks.onToggleCollapsed());
+    this.btn.on("pointerdown", () => this.setBtnState("press", true));
+    this.btn.on("pointerup", () => this.setBtnState("press", false));
+    this.btn.on("pointerupoutside", () => this.setBtnState("press", false));
+    this.btn.on("pointercancel", () => this.setBtnState("press", false));
+    this.btn.on("pointerover", () => this.setBtnState("hover", true));
+    this.btn.on("pointerout", () => {
+      this.setBtnState("hover", false);
+      this.setBtnState("press", false);
+    });
+
+    this.container.addChild(this.btn);
+  }
+
+  setTheme(theme: Theme): void {
+    this.theme = theme;
+    for (const sprite of this.sprites.values()) sprite.setTheme(theme);
+    this.layout();
+  }
+
+  setRulesViewDefault(active: boolean): void {
+    if (this.rulesViewDefault === active) return;
+    this.rulesViewDefault = active;
+    this.rulesViewOverrides.clear();
+    for (const sprite of this.sprites.values()) sprite.setRulesView(active);
+    this.flashSprite?.setHandRulesView(active);
+  }
+
+  setViewport(width: number, height: number): void {
+    if (this.viewW === width && this.viewH === height) return;
+    const previousCardWidth = this.cardWidth();
+    this.viewW = width;
+    this.viewH = height;
+    if (this.flashSprite && this.cardWidth() !== previousCardWidth) {
+      gsap.killTweensOf(this.flashSprite.scale);
+      this.flashSprite.scale.set(this.faceScale());
+    }
+    if (this.sprites.size > 0 && this.cardWidth() !== this.builtCardWidth) {
+      for (const sprite of this.sprites.values()) sprite.destroy();
+      this.sprites.clear();
+      if (this.hoveredId !== null) {
+        this.hoveredId = null;
+        this.callbacks.onHover(null);
+      }
+      this.prevCardIds = new Set();
+      this.setSpec(this.spec);
+      return;
+    }
+    this.layout();
+  }
+
+  setSpec(spec: StackSpec): void {
+    this.updatingSpec = true;
+    const previousCardWidth = this.cardWidth();
+    this.spec = spec;
+    if (this.sprites.size > 0 && this.cardWidth() !== this.builtCardWidth) {
+      for (const sprite of this.sprites.values()) sprite.destroy();
+      this.sprites.clear();
+      if (this.hoveredId !== null) {
+        this.hoveredId = null;
+        this.callbacks.onHover(null);
+      }
+      this.prevCardIds = new Set();
+    }
+    if (this.flashSprite && this.cardWidth() !== previousCardWidth) {
+      gsap.killTweensOf(this.flashSprite.scale);
+      this.flashSprite.scale.set(this.faceScale());
+    }
+    const seen = new Set<string>();
+    const incoming = new Set(spec.cards.map((c) => c.id));
+    const reusableBySource = new Map<string, string>();
+    const replacements = new Map<string, string>();
+    for (const [id, sprite] of this.sprites) {
+      if (!incoming.has(id)) reusableBySource.set(sprite.sourceId, id);
+    }
+    for (const card of spec.cards) {
+      seen.add(card.id);
+      let sprite = this.sprites.get(card.id);
+      if (!sprite) {
+        const staleId = reusableBySource.get(card.sourceId);
+        const reused = staleId !== undefined ? this.sprites.get(staleId) : undefined;
+        if (reused) {
+          reusableBySource.delete(card.sourceId);
+          this.sprites.delete(staleId!);
+          this.sprites.set(card.id, reused);
+          replacements.set(staleId!, card.id);
+          const staleOverride = this.faceOverrides.get(staleId!);
+          this.faceOverrides.delete(staleId!);
+          if (staleOverride !== undefined) this.faceOverrides.set(card.id, staleOverride);
+          const staleRulesViewOverride = this.rulesViewOverrides.get(staleId!);
+          this.rulesViewOverrides.delete(staleId!);
+          if (staleRulesViewOverride !== undefined) {
+            this.rulesViewOverrides.set(card.id, staleRulesViewOverride);
+          }
+          reused.setSpec(card, staleOverride === undefined ? undefined : staleOverride ? 1 : 0);
+          continue;
+        }
+        const transformed = this.faceOverrides.get(card.id);
+        this.builtCardWidth = this.cardWidth();
+        sprite = new StackCardSprite(
+          this.theme,
+          card,
+          this.builtCardWidth,
+          this.rulesViewOverrides.get(card.id) ?? this.rulesViewDefault,
+          this.callbacks.onRenderRequested,
+          (id) => this.callbacks.onTargetSpell(id),
+          (id) => this.setHovered(id),
+          (id) => this.toggleRulesView(id),
+          (id) => this.toggleFace(id),
+          (card, bounds) => this.callbacks.onLongPressCard?.(card, bounds),
+          transformed === undefined ? undefined : transformed ? 1 : 0,
+          () => {
+            if (this.updatingSpec) return;
+            this.layout();
+            this.callbacks.onRenderRequested?.();
+          },
+        );
+        this.container.addChild(sprite.container);
+        this.sprites.set(card.id, sprite);
+      } else {
+        const transformed = this.faceOverrides.get(card.id);
+        sprite.setSpec(card, transformed === undefined ? undefined : transformed ? 1 : 0);
+      }
+    }
+    for (const [id, sprite] of [...this.sprites]) {
+      if (seen.has(id)) continue;
+      this.sprites.delete(id);
+      this.faceOverrides.delete(id);
+      this.rulesViewOverrides.delete(id);
+      if (!animationsEnabled()) {
+        sprite.destroy();
+        continue;
+      }
+      this.retiringSprites.add(sprite);
+      sprite.container.eventMode = "none";
+      gsap.to(sprite.container, {
+        alpha: 0,
+        y: sprite.container.y - 22,
+        duration: 0.24,
+        ease: "power2.in",
+        onComplete: () => {
+          this.retiringSprites.delete(sprite);
+          sprite.destroy();
+          this.callbacks.onRenderRequested?.();
+        },
+      });
+    }
+    const nextHoveredId = reconcileStackHover(this.hoveredId, incoming, replacements);
+    if (nextHoveredId !== this.hoveredId) {
+      this.hoveredId = nextHoveredId;
+      this.callbacks.onHover(nextHoveredId);
+    }
+
+    const hasNewCard = spec.cards.some((c) => !this.prevCardIds.has(c.id));
+    this.prevCardIds = new Set(spec.cards.map((c) => c.id));
+    if (spec.collapsed && hasNewCard && spec.cards.length > 0) this.triggerPeek();
+
+    this.syncFlash();
+    this.setPromptReference(this.promptReferenceId, this.promptReferenceColor);
+    this.updatingSpec = false;
+    this.layout();
+  }
+
+  destroy(): void {
+    this.peekTimer?.kill();
+    this.btnTween?.kill();
+    gsap.killTweensOf(this.btnGlow);
+    gsap.killTweensOf(this.btnGlow.scale);
+    gsap.killTweensOf(this.btn.scale);
+    for (const sprite of this.sprites.values()) sprite.destroy();
+    for (const sprite of this.retiringSprites) {
+      gsap.killTweensOf(sprite.container);
+      sprite.destroy();
+    }
+    this.retiringSprites.clear();
+    this.sprites.clear();
+    this.flashSprite?.destroy({ children: true });
+    this.container.destroy({ children: true });
+  }
+
+  getAnchor(stackObjectId: string, toward?: ScreenPos): ScreenPos | null {
+    if (this.effectiveCollapsed()) return this.buttonAnchor();
+    const sprite = this.sprites.get(stackObjectId);
+    if (!sprite) return null;
+    return toward ? sprite.getAnchorTowards(toward) : sprite.getCenter();
+  }
+
+  getCastingAnchor(sourceCardId: string, toward?: ScreenPos): ScreenPos | null {
+    if (this.effectiveCollapsed()) return this.buttonAnchor();
+    for (const sprite of this.sprites.values()) {
+      if (sprite.sourceId !== sourceCardId) continue;
+      return toward ? sprite.getAnchorTowards(toward) : sprite.getCenter();
+    }
+    return null;
+  }
+
+  setPromptReference(stackObjectId: string | null, color: number | null): void {
+    this.promptReferenceId = stackObjectId;
+    this.promptReferenceColor = color;
+    for (const [id, sprite] of this.sprites) {
+      sprite.setPromptReference(id === stackObjectId ? color : null);
+    }
+  }
+
+  getSeeds(): Array<{ cardId: string; x: number; y: number; scale: number }> {
+    const seeds: Array<{ cardId: string; x: number; y: number; scale: number }> = [];
+    for (const sprite of this.sprites.values()) {
+      const c = sprite.getCenter();
+      seeds.push({ cardId: sprite.sourceId, x: c.x, y: c.y, scale: this.faceScale() });
+    }
+    return seeds;
+  }
+
+  hitTest(x: number, y: number): boolean {
+    if (this.btn.visible && this.btn.hitArea) {
+      const point = this.btn.toLocal({ x, y });
+      if (this.btn.hitArea.contains(point.x, point.y)) return true;
+    }
+    if (!this.bounds) return false;
+    if (
+      x < this.bounds.x ||
+      x > this.bounds.x + this.bounds.width ||
+      y < this.bounds.y ||
+      y > this.bounds.y + this.bounds.height
+    ) {
+      return false;
+    }
+    const over = (b: { x: number; y: number; width: number; height: number }): boolean =>
+      x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height;
+    if (this.flashSprite && over(this.flashSprite.getBounds())) return true;
+    for (const sprite of this.sprites.values()) {
+      if (over(sprite.container.getBounds())) return true;
+    }
+    return false;
+  }
+  hitTestRules(x: number, y: number): boolean {
+    return this.rulesSpriteAt(x, y) !== null;
+  }
+
+  scrollRulesAt(x: number, y: number, delta: number, mode: number): boolean {
+    return this.rulesSpriteAt(x, y)?.scrollRules(delta, mode, x, y) ?? false;
+  }
+
+  private rulesSpriteAt(x: number, y: number): StackCardSprite | null {
+    let result: StackCardSprite | null = null;
+    let topZIndex = -Infinity;
+    for (const sprite of this.sprites.values()) {
+      if (!sprite.usesRulesView || !sprite.container.visible) continue;
+      const bounds = sprite.container.getBounds();
+      const contains =
+        x >= bounds.x &&
+        x <= bounds.x + bounds.width &&
+        y >= bounds.y &&
+        y <= bounds.y + bounds.height;
+      if (!contains || sprite.container.zIndex < topZIndex) continue;
+      result = sprite;
+      topZIndex = sprite.container.zIndex;
+    }
+    return result;
+  }
+
+  cancelPointer(pointerId: number): void {
+    for (const sprite of this.sprites.values()) sprite.cancelPointer(pointerId);
+  }
+
+  isAnimating(): boolean {
+    if (
+      this.peeking ||
+      this.btnPulsing ||
+      gsap.isTweening(this.btn) ||
+      gsap.isTweening(this.btn.position) ||
+      gsap.isTweening(this.btn.scale) ||
+      gsap.isTweening(this.btnGlow) ||
+      gsap.isTweening(this.btnGlow.scale)
+    ) {
+      return true;
+    }
+    if (this.retiringSprites.size > 0) return true;
+    if (
+      this.flashSprite &&
+      (!this.flashSprite.imageSettled ||
+        gsap.isTweening(this.flashSprite) ||
+        gsap.isTweening(this.flashSprite.scale))
+    ) {
+      return true;
+    }
+    for (const sprite of this.sprites.values()) {
+      if (sprite.isAnimating()) return true;
+    }
+    return false;
+  }
+
+  toggleFace(stackObjectId: string): void {
+    const card = this.spec.cards.find((candidate) => candidate.id === stackObjectId);
+    if (!card?.card.isDoubleFaced) return;
+    if (this.hoveredId === stackObjectId) this.setHovered(null);
+    const current = this.faceOverrides.get(stackObjectId) ?? gameCardFaceIndex(card.card) === 1;
+    this.faceOverrides.set(stackObjectId, !current);
+    this.setSpec(this.spec);
+  }
+
+  toggleRulesView(stackObjectId: string): void {
+    const sprite = this.sprites.get(stackObjectId);
+    if (!sprite) return;
+    const active = !(this.rulesViewOverrides.get(stackObjectId) ?? sprite.usesRulesView);
+    this.rulesViewOverrides.set(stackObjectId, active);
+    sprite.setRulesView(active);
+  }
+
+  private effectiveCollapsed(): boolean {
+    return this.spec.collapsed && !this.peeking;
+  }
+
+  private buttonAnchor(): ScreenPos | null {
+    return this.btn.visible ? { x: this.btn.position.x - BTN_W / 2, y: this.btn.position.y } : null;
+  }
+
+  private triggerPeek(): void {
+    this.peeking = true;
+    this.peekTimer?.kill();
+    this.peekTimer = gsap.delayedCall(PEEK_HOLD_S, () => {
+      this.peeking = false;
+      this.peekTimer = null;
+      this.layout();
+    });
+  }
+
+  private setHovered(id: string | null): void {
+    if (this.hoveredId === id) return;
+    this.hoveredId = id;
+    this.callbacks.onHover(id);
+    this.layout();
+  }
+
+  private setBtnState(kind: "hover" | "press", active: boolean): void {
+    if (kind === "press") {
+      if (this.btnPressed === active) return;
+      this.btnPressed = active;
+    } else {
+      if (this.btnHovered === active) return;
+      this.btnHovered = active;
+    }
+    gsap.killTweensOf(this.btn.scale);
+    const scale = this.btnPressed ? BTN_PRESS_SCALE : this.btnHovered ? BTN_HOVER_SCALE : 1;
+    if (!animationsEnabled()) {
+      this.btn.scale.set(scale);
+      return;
+    }
+    gsap.to(this.btn.scale, {
+      x: scale,
+      y: scale,
+      duration: this.btnPressed ? 0.06 : 0.14,
+      ease: this.btnPressed ? "power2.out" : "power3.out",
+    });
+  }
+
+  private buttonHitWidth(): number {
+    return Math.max(BTN_W + 12, getUiControlFloor() / BTN_PRESS_SCALE);
+  }
+
+  private layout(): void {
+    const cards = this.spec.cards;
+    const n = cards.length;
+    if (this.viewW === 0 || this.viewH === 0) return;
+
+    const collapsed = this.effectiveCollapsed();
+    const fanOut = !this.spec.collapsed || this.peeking;
+    const transitioning = this.prevFanOut !== null && this.prevFanOut !== fanOut;
+    this.prevFanOut = fanOut;
+
+    const hoveredIndex =
+      collapsed || this.hoveredId === null ? -1 : cards.findIndex((c) => c.id === this.hoveredId);
+    const hoverMove = !transitioning && hoveredIndex !== this.prevHoveredIndex;
+    this.prevHoveredIndex = hoveredIndex;
+    const layout = computeStackLayout({
+      viewWidth: this.viewW,
+      viewHeight: this.viewH,
+      cards: cards.map(
+        (card) =>
+          this.sprites.get(card.id)?.getSize() ?? {
+            width: this.cardWidth(),
+            height: this.cardHeight(),
+          },
+      ),
+      fallbackWidth: this.cardWidth(),
+      fallbackHeight: this.cardHeight(),
+      flash: this.flashSprite
+        ? {
+            width: (this.flashSprite.horizontalFrame ? CARD_H : CARD_W) * this.faceScale(),
+            height: (this.flashSprite.horizontalFrame ? CARD_W : CARD_H) * this.faceScale(),
+          }
+        : null,
+      fanOut,
+      hoveredIndex,
+      hoverScale: HOVER_SCALE,
+      buttonWidth: this.buttonHitWidth(),
+      buttonGap: BTN_GAP,
+      compact: this.compact,
+    });
+
+    let moveDur: number | undefined;
+    let moveEase: string | undefined;
+    if (transitioning) {
+      moveDur = COLLAPSE_MS;
+      moveEase = COLLAPSE_EASE;
+    } else if (hoverMove) {
+      moveDur = HOVER_MOVE_MS;
+      moveEase = HOVER_EASE;
+    }
+
+    cards.forEach((card, idx) => {
+      const sprite = this.sprites.get(card.id);
+      if (!sprite) return;
+      const position = layout.cards[idx]!;
+      const flashed = this.spec.flash?.card.id === card.sourceId;
+      sprite.place(position.x, position.y, position.zIndex, flashed, moveDur, moveEase);
+    });
+
+    this.layoutButton(n > 0, layout.buttonX, layout.centerY, transitioning);
+
+    if (n === 0) {
+      this.bounds = null;
+    } else if (collapsed) {
+      const halfW = (this.buttonHitWidth() / 2) * BTN_HOVER_SCALE + 8;
+      const halfH = (BTN_H / 2) * BTN_HOVER_SCALE + 6;
+      const x = layout.buttonX - halfW;
+      this.bounds = {
+        x,
+        y: layout.centerY - halfH,
+        width: this.viewW - x,
+        height: halfH * 2,
+      };
+    } else {
+      const hoverOverflow = this.compact ? (this.cardHeight() * (HOVER_SCALE - 1)) / 2 : 0;
+      this.bounds = {
+        x: layout.panelLeft,
+        y: layout.panelTop - hoverOverflow,
+        width: layout.pileWidth,
+        height: layout.pileHeight + 2 * hoverOverflow,
+      };
+    }
+
+    this.layoutFlash(layout.flash);
+  }
+
+  private layoutButton(
+    show: boolean,
+    targetX: number,
+    centerY: number,
+    transitioning: boolean,
+  ): void {
+    this.btn.visible = show;
+    if (!show) {
+      this.stopBtnPulse();
+      this.btnTween?.kill();
+      this.btnTween = null;
+      gsap.killTweensOf(this.btn.scale);
+      this.btn.scale.set(1);
+      this.btnVisible = false;
+      return;
+    }
+    this.btn.position.y = centerY;
+    const hitW = this.buttonHitWidth();
+    const hitH = Math.max(BTN_H + 12, getUiControlFloor() / BTN_PRESS_SCALE);
+    this.btn.hitArea = new Rectangle(-hitW / 2, -hitH / 2, hitW, hitH);
+    const justAppeared = !this.btnVisible;
+    this.btnVisible = true;
+    const targetMoved = Math.abs(targetX - this.btnTargetX) > 0.5;
+    this.btnTargetX = targetX;
+    if (justAppeared) {
+      this.btnTween?.kill();
+      this.btnTween = null;
+      this.btn.position.x = targetX;
+    } else if (transitioning) {
+      this.btnTween?.kill();
+      this.btnTween = gsap.to(this.btn.position, {
+        x: targetX,
+        duration: COLLAPSE_MS,
+        ease: COLLAPSE_EASE,
+      });
+    } else if (targetMoved) {
+      this.btnTween?.kill();
+      this.btnTween = gsap.to(this.btn.position, {
+        x: targetX,
+        duration: HOVER_MOVE_MS,
+        ease: HOVER_EASE,
+      });
+    }
+
+    const color = hexToNum(this.theme.gameTheme.activeAction.active);
+    this.btnGlow.clear();
+    this.btnGlow
+      .roundRect(-BTN_W / 2 - 4, -BTN_H / 2 - 4, BTN_W + 8, BTN_H + 8, BTN_RADIUS + 3)
+      .fill({ color });
+    this.drawButton(this.btnGfx, this.spec.collapsed ? "left" : "right");
+
+    if (this.effectiveCollapsed()) this.startBtnPulse();
+    else this.stopBtnPulse();
+  }
+
+  private drawButton(gfx: Graphics, chevron: "left" | "right"): void {
+    const color = hexToNum(this.theme.gameTheme.activeAction.active);
+    const glyph = hexToNum(this.theme.gameTheme.canvas.shadow);
+    const aw = BTN_ARROW_W / 2;
+    const ah = BTN_ARROW_H / 2;
+    gfx.clear();
+    gfx.roundRect(-BTN_W / 2, -BTN_H / 2, BTN_W, BTN_H, BTN_RADIUS).fill({ color });
+    if (chevron === "left") {
+      gfx.moveTo(aw, -ah).lineTo(-aw, 0).lineTo(aw, ah);
+    } else {
+      gfx.moveTo(-aw, -ah).lineTo(aw, 0).lineTo(-aw, ah);
+    }
+    gfx.stroke({ color: glyph, width: 2.5, cap: "round", join: "round" });
+  }
+
+  private startBtnPulse(): void {
+    if (this.btnPulsing) return;
+    this.btnPulsing = true;
+    this.btnGlow.visible = true;
+    this.btnGlow.alpha = 0.4;
+    this.btnGlow.scale.set(1);
+    gsap.to(this.btnGlow, {
+      alpha: 0.08,
+      duration: 0.9,
+      ease: "sine.inOut",
+      yoyo: true,
+      repeat: -1,
+    });
+    gsap.to(this.btnGlow.scale, {
+      x: 1.5,
+      y: 1.16,
+      duration: 0.9,
+      ease: "sine.inOut",
+      yoyo: true,
+      repeat: -1,
+    });
+  }
+
+  private stopBtnPulse(): void {
+    if (!this.btnPulsing) return;
+    this.btnPulsing = false;
+    gsap.killTweensOf(this.btnGlow);
+    gsap.killTweensOf(this.btnGlow.scale);
+    this.btnGlow.visible = false;
+    this.btnGlow.alpha = 0;
+    this.btnGlow.scale.set(1);
+  }
+
+  private syncFlash(): void {
+    const flash = this.spec.flash;
+    const landed = flash ? this.spec.cards.some((c) => c.sourceId === flash.card.id) : false;
+    if (!flash || landed || !this.spec.showPreStackFlash) {
+      this.flashSprite?.destroy({ children: true });
+      this.flashSprite = null;
+      this.flashToken = null;
+      return;
+    }
+    if (this.flashToken === flash.token) return;
+    this.flashSprite?.destroy({ children: true });
+    this.flashToken = flash.token;
+    const sprite = new CardSprite(flash.card, "hand");
+    sprite.onVisualChange = this.callbacks.onRenderRequested;
+    sprite.setHandRulesView(this.rulesViewDefault);
+    const scale = this.faceScale();
+    sprite.scale.set(scale);
+    sprite.zIndex = 300;
+    sprite.eventMode = "none";
+    this.flashSprite = sprite;
+    this.container.addChild(sprite);
+    sprite.setHandRulesScale(scale);
+    gsap.fromTo(sprite, { alpha: 0 }, { alpha: 1, duration: 0.18, ease: "power2.out" });
+    gsap.fromTo(
+      sprite.scale,
+      { x: scale * 0.84, y: scale * 0.84 },
+      { x: scale, y: scale, duration: 0.42, ease: "back.out(1.6)" },
+    );
+  }
+
+  private layoutFlash(position: { x: number; y: number } | null): void {
+    if (!this.flashSprite || !position) return;
+    this.flashSprite.position.set(position.x, position.y);
+  }
+}

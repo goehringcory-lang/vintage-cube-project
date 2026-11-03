@@ -1,0 +1,179 @@
+/**
+ * Shared primitive components for the deck editor views.
+ * Extracted to eliminate duplication across DeckListView card components.
+ */
+import { Button } from "@/components/ui/button";
+import { ChevronDown, Gem, Sparkles } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { FoilBadge } from "@/components/limited/FoilBadge";
+import { ScryfallImg } from "@/components/ScryfallImg";
+import { GeneratedCardImage } from "@/components/game/GeneratedCardImage";
+import type { OverlayAction } from "./deckEditor.utils";
+import type { DeckCard } from "@/protocol/deck";
+export type { OverlayAction } from "./deckEditor.utils";
+export function CardCountBadge({ count, className }: { count: number; className?: string }) {
+  if (count <= 1) return null;
+  return (
+    <div
+      className={cn(
+        "absolute top-1 left-1 bg-overlay/80 text-white text-ui-meta font-bold rounded-full min-w-5 min-h-5 px-1 flex items-center justify-center border border-white/20",
+        className,
+      )}
+      style={{ zIndex: 10 }}
+    >
+      {count}
+    </div>
+  );
+}
+export function CardThumbnail({
+  card,
+  imageSize = "normal",
+  loading,
+}: {
+  card: DeckCard;
+  imageSize?: "small" | "normal";
+  loading?: "eager" | "lazy";
+}) {
+  const { name, foil } = card.identity;
+  const imageUrl = card.uris?.[imageSize];
+  return (
+    <div className="relative w-full">
+      <GeneratedCardImage
+        deckCard={card}
+        loading={loading}
+        className="w-full rounded-lg border border-border/50 shadow-sm"
+        fallback={
+          imageUrl && !imageUrl.startsWith("data:") ? (
+            <ScryfallImg
+              src={imageUrl}
+              alt={name}
+              loading={loading}
+              decoding={loading === "lazy" ? "async" : undefined}
+              className="h-full w-full object-contain"
+              draggable={false}
+            />
+          ) : undefined
+        }
+      />
+      {foil && <FoilBadge />}
+    </div>
+  );
+}
+export function CardAnalysisBadges({
+  isCombo,
+  isGameChanger,
+}: {
+  isCombo?: boolean;
+  isGameChanger?: boolean;
+}) {
+  if (!isCombo && !isGameChanger) return null;
+  return (
+    <div className="absolute bottom-1 right-1 z-30 flex gap-0.5">
+      {isGameChanger && (
+        <div
+          className="rounded-full bg-pt-lethal/90 text-white p-0.5 shadow"
+          title={`Game Changer \u2014 restricted to bracket 3+`}
+        >
+          <Gem className="h-3 w-3" />
+        </div>
+      )}
+      {isCombo && (
+        <div
+          className="rounded-full bg-counter-charge/90 text-white p-0.5 shadow"
+          title={`Part of a combo in this deck`}
+        >
+          <Sparkles className="h-3 w-3" />
+        </div>
+      )}
+    </div>
+  );
+}
+export function CardHoverOverlay({
+  actions,
+  rounded = "rounded-lg",
+  className,
+  onMouseEnter,
+  onMouseLeave,
+}: {
+  actions: OverlayAction[];
+  className?: string;
+  rounded?: string;
+  onMouseEnter?: (e: React.MouseEvent) => void;
+  onMouseLeave?: (e: React.MouseEvent) => void;
+}) {
+  return (
+    <div
+      className={cn(
+        "absolute inset-0 bg-overlay/60 opacity-0 group-hover:opacity-100 touch:opacity-100 transition-opacity flex flex-col items-center justify-center gap-1 pointer-events-none group-hover:pointer-events-auto touch:pointer-events-auto",
+        rounded,
+        className,
+      )}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+    >
+      {actions.map((a) => {
+        const Icon = a.icon;
+        return (
+          <Button
+            key={a.label}
+            size="sm"
+            variant={a.variant === "primary" ? "secondary" : "ghost"}
+            className={cn(
+              "touch:min-w-11 touch:min-h-11 min-h-6 w-full whitespace-normal px-1 text-ui-label",
+              a.variant !== "primary" && "text-white/80 hover:text-white hover:bg-white/10",
+            )}
+            onClick={(e) => {
+              e.stopPropagation();
+              a.onClick();
+            }}
+          >
+            <Icon className="h-3 w-3 mr-1" /> {a.label}
+          </Button>
+        );
+      })}
+    </div>
+  );
+}
+export function SectionHeader({
+  label,
+  count,
+  extraContent,
+  open,
+  onToggle,
+}: {
+  label: string;
+  count: number;
+  extraContent?: React.ReactNode;
+  open?: boolean;
+  onToggle?: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-1.5 mb-1.5 border-b border-border/40 pb-1">
+      <button
+        type="button"
+        className="touch:min-w-11 touch:min-h-11 flex min-w-0 items-center gap-1.5 rounded-sm text-left hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        aria-expanded={open}
+        onClick={onToggle}
+      >
+        {onToggle && (
+          <ChevronDown
+            className={cn("h-3.5 w-3.5 transition-transform", open === false && "-rotate-90")}
+          />
+        )}
+        <span className="text-ui-label font-semibold uppercase tracking-wide text-muted-foreground">
+          {label}
+        </span>
+        <span className="text-ui-meta text-muted-foreground/60">({count})</span>
+      </button>
+      <div className="flex-1" />
+      {extraContent}
+    </div>
+  );
+}
+export function EmptyDropZone({ message = "Drop cards here" }: { message?: string }) {
+  return (
+    <div className="border border-dashed border-border/40 rounded py-3 text-center">
+      <p className="text-ui-meta text-muted-foreground/40">{message}</p>
+    </div>
+  );
+}

@@ -1,0 +1,134 @@
+import type { DraftState, LimitedDraftDecision } from "@/types/limited";
+import type { RoomRelayEnvelope } from "@/types/server";
+
+export const DRAFT_RELAY_PROTOCOL = "draft-v1";
+
+export interface MpDraftConfig {
+  setCode?: string;
+  cubeId?: string;
+  cubeName?: string;
+  podSize: number;
+  rounds: number;
+  picksPerPass: number;
+  seed?: number;
+  pickSeconds?: number;
+  fillWithBots: boolean;
+}
+
+export interface MpDraftSeatAssignment {
+  seat: number;
+  playerSlot: string | null;
+  displayName: string;
+  isHuman: boolean;
+}
+
+export interface DraftStartMessage {
+  type: "start";
+  sessionId: string;
+  config: MpDraftConfig;
+  seats: MpDraftSeatAssignment[];
+}
+
+export interface DraftStateBroadcastMessage {
+  type: "stateUpdate";
+  sessionId: string;
+  seat: number;
+  state: DraftState;
+  history?: LimitedDraftDecision[];
+}
+
+export interface DraftPickMessage {
+  type: "pick";
+  sessionId: string;
+  cardId: string;
+  round: number;
+  pickNumber: number;
+  revision?: string;
+}
+
+export interface DraftResyncMessage {
+  type: "resync";
+  sessionId?: string;
+}
+
+export interface DraftClockWireSeat {
+  seat: number;
+  revision: string;
+  remainingMs: number;
+  deadlineMs: number | null;
+}
+
+export interface DraftClockSyncMessage {
+  type: "clockSync";
+  sessionId: string;
+  sequence: number;
+  paused: boolean;
+  seats: DraftClockWireSeat[];
+}
+
+export interface DraftClockStateMessage {
+  type: "clockState";
+  sessionId: string;
+  sequence: number;
+  paused: boolean;
+  serverNowMs: number;
+  seats: DraftClockWireSeat[];
+}
+
+export interface DraftClockExpiredMessage {
+  type: "clockExpired";
+  sessionId: string;
+  seat: number;
+  revision: string;
+  sequence: number;
+}
+
+export interface DraftNominationMessage {
+  type: "nominate" | "clockNomination";
+  sessionId: string;
+  seat: number;
+  revision: string;
+  cardId: string | null;
+}
+
+export type DraftRelayPayload =
+  | DraftStartMessage
+  | DraftStateBroadcastMessage
+  | DraftPickMessage
+  | DraftResyncMessage
+  | DraftClockSyncMessage
+  | DraftClockStateMessage
+  | DraftClockExpiredMessage
+  | DraftNominationMessage;
+
+export type DraftRelayEnvelope = RoomRelayEnvelope<DraftRelayPayload>;
+
+export function isDraftRelay(env: RoomRelayEnvelope): env is DraftRelayEnvelope {
+  return (
+    env.protocol === DRAFT_RELAY_PROTOCOL &&
+    env.version === 1 &&
+    typeof env.payload === "object" &&
+    env.payload !== null
+  );
+}
+
+export function makeDraftRelay(
+  payload: DraftRelayPayload,
+  opts: {
+    fromPlayer?: string;
+    targetPlayer?: string;
+    roomId?: string;
+    messageId?: string;
+  } = {},
+): DraftRelayEnvelope {
+  return {
+    kind: "roomRelay",
+    protocol: DRAFT_RELAY_PROTOCOL,
+    version: 1,
+    messageId: opts.messageId ?? crypto.randomUUID(),
+    fromPlayer: opts.fromPlayer,
+    targetPlayer: opts.targetPlayer,
+    roomId: opts.roomId,
+    payload,
+  };
+}

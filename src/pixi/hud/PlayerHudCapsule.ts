@@ -1,0 +1,1823 @@
+import { getUiControlFloor, getUiFontFloor, UI_FONT_FAMILY as FONT } from "@/themes/typography";
+import {
+  Bounds,
+  ColorMatrixFilter,
+  Container,
+  Rectangle,
+  Graphics,
+  Point,
+  Sprite,
+  Text,
+  Texture,
+  TextStyle,
+} from "pixi.js";
+import { gsap } from "@/pixi/effects/gsap";
+import { animationsEnabled } from "@/pixi/effects/enabled";
+import type { Theme } from "@/hooks/useTheme";
+import { getTheme } from "@/hooks/useTheme";
+import { MANA_LETTERS } from "@/themes/gameTheme";
+import { getInitials } from "@/components/game/game.utils";
+import { hexToNum } from "../colorUtils";
+import { gameIconTexture } from "../gameIconCache";
+import { getManaSymbolTextureSync, loadManaSymbolTexture } from "../manaSymbolCache";
+import { manaColorFor } from "../manaColors";
+import { loadAvatarTexture } from "./avatarTextureCache";
+import type { PlayerHudSpec, PlayerHudTooltipContent } from "./playerHud.types";
+import type { ScreenBounds, ScreenPos } from "@/pixi/types";
+import { loadCardBack } from "@/pixi/cardBackTexture";
+import type { CardDto } from "@/protocol/game";
+import { useScryfallStore } from "@/stores/useScryfallStore";
+import { useGameStore } from "@/stores/useGameStore";
+import { asGameDeckCard } from "@/lib/decks";
+import { renderCard } from "@/lib/cardRenderer";
+import {
+  releaseCardRaster,
+  selectCardRenderTier,
+  type CardRenderTier,
+} from "@/lib/cardRenderTypes";
+import { createGeneratedCardTexture } from "@/pixi/generatedCardTexture";
+import { usePreferencesStore } from "@/stores/usePreferencesStore";
+import { RING_ABILITIES, zoneBadgeId } from "@/components/game/game.constants";
+import { intentIsHostile } from "@/types/promptType";
+import { gameCardFaceIndex } from "@/lib/gameCard";
+
+const BOT_ICON_NAME = "robot-antennas";
+const SKULL_ICON_NAME = "skull-crossed-bones";
+const OFFLINE_ICON_NAME = "aerial-signal";
+const DETAILS_ICON_NAME = "info";
+const PANEL_PADDING = 10;
+const AVATAR_DIAMETER = 44;
+const SHALLOW_AVATAR_MIN_HEIGHT = 96;
+const SHALLOW_RESOURCE_IDENTITY_OVERLAP = 30;
+const SHALLOW_RESOURCE_RIGHT_INSET = 16;
+const SHALLOW_STATE_BLOCK_HEIGHT = 48;
+const TRAY_HORIZONTAL_PADDING = 6;
+const TRAY_VERTICAL_PADDING = 2;
+const TRAY_RADIUS = 6;
+const STATE_ORDER = ["incoming-damage", "poison", "commander", "monarch", "initiative"];
+
+const iconTextures = new Map<string, Texture>();
+
+const SCRATCH_A = new Point();
+const SCRATCH_B = new Point();
+
+const styleCache = new Map<string, TextStyle>();
+function cachedTextStyle(size: number, weight: TextStyle["fontWeight"], fill: number): TextStyle {
+  size = Math.max(size, getUiFontFloor("meta"));
+  const shadow = getTheme().gameTheme.canvas.shadow;
+  const key = `${size}|${weight}|${fill}|${shadow}`;
+  let s = styleCache.get(key);
+  if (!s) {
+    s = new TextStyle({
+      fontFamily: FONT,
+      fontSize: size,
+      fontWeight: weight,
+      fill,
+      dropShadow: {
+        color: shadow,
+        alpha: 0.55,
+        blur: 3,
+        distance: 1,
+        angle: Math.PI / 2,
+      },
+    });
+    styleCache.set(key, s);
+  }
+  return s;
+}
+
+export type HoverFn = (
+  content: PlayerHudTooltipContent | null,
+  cx?: number,
+  top?: number,
+  bottom?: number,
+  color?: string,
+) => void;
+
+interface ManaPip {
+  sprite: Sprite;
+  count: Text;
+  value?: number;
+}
+
+interface BadgeChip {
+  sprite: Sprite;
+  count: Text;
+  label: Text;
+  hit: Graphics;
+  hitBounds: Rectangle;
+  content: PlayerHudTooltipContent;
+  badgeId?: string;
+}
+
+interface ContentItem {
+  w: number;
+  place: (x: number, y: number) => void;
+}
+
+interface LayoutRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export class PlayerHudCapsule {
+  readonly container: Container;
+  private theme: Theme;
+  private onTarget: () => void;
+  private onShowSheet: () => void;
+  private onHover: HoverFn;
+
+  private bg = new Graphics();
+  private boundsOutline = new Graphics();
+  private combatGlow = new Graphics();
+  private damageWash = new Graphics();
+  private targetRing = new Graphics();
+  private flashRing = new Graphics();
+  private promptReferenceRing = new Graphics();
+  private avatarTex: Texture | null = null;
+  private avatarPhoto = new Sprite();
+  private avatarMask = new Graphics();
+  private avatarFx = new Graphics();
+  private bot = new Sprite();
+  private skull = new Sprite();
+  private offline = new Sprite();
+  private detailsIcon = new Sprite();
+  private initial: Text;
+  private avatarHit = new Graphics();
+  private heart: Text;
+  private life: Text;
+  private lifeFloat: Text;
+  private handCount: Text;
+  private handFan = new Container();
+  private handBacks: Sprite[] = [];
+  private handBackTexture: Texture = Texture.EMPTY;
+  private handFaceIds: (string | null)[] = [];
+  private handFaceCards: (CardDto | undefined)[] = [];
+  private handFaceRequests: (AbortController | undefined)[] = [];
+  private handFaceTextures: (Texture | undefined)[] = [];
+  private handFaceTiers: (CardRenderTier | undefined)[] = [];
+  private unsubscribeHandStyle: (() => void) | null = null;
+  private unsubscribeLocale: (() => void) | null = null;
+  private overflow: Text;
+  private emptyStateText: Text;
+  private overflowHit = new Graphics();
+  private identityHeight = 0;
+  private identityWidth = 0;
+  private panelHeight = 0;
+  private motionEnabled = animationsEnabled();
+  private manaTray = new Graphics();
+  private stateTray = new Graphics();
+  private manaLayer = new Container();
+  private badgeLayer = new Container();
+  private sparkles = new Container();
+  private resourceFloatLayer = new Container();
+  private pips: ManaPip[] = [];
+  private chips: BadgeChip[] = [];
+  private greyscale = new ColorMatrixFilter();
+
+  private spec: PlayerHudSpec;
+  private width = 0;
+  private height = 0;
+  private column = false;
+  private compact = false;
+  private boundsDebug = false;
+  private avatarUrl: string | null = null;
+  private renderedLife: number | null = null;
+  private renderedBadgeCounts = new Map<string, number>();
+  private renderedManaCounts = new Map<string, number>();
+  private resourcesInitialized = false;
+  private resourceFloaters = new Set<Text>();
+  private targetRingMode: "off" | "pulse" | "solid" = "off";
+  private targetTween: gsap.core.Tween | null = null;
+  private flashTween: gsap.core.Tween | null = null;
+  private promptReferenceTween: gsap.core.Tween | null = null;
+  private promptReferenceColor: string | null = null;
+  private lifeTween: gsap.core.Tween | null = null;
+  private offlineTween: gsap.core.Tween | null = null;
+  private offlineActive = false;
+  private combatPulse: gsap.core.Tween | null = null;
+  private combatActive = false;
+  private combatLethalActive = false;
+  private prevFlashing = false;
+  private prevBadgeIds = new Set<string>();
+  private lifeFontSize = 15;
+  private lastSig = "";
+  private avatarCx = 0;
+  private avatarCy = 0;
+  private avatarDia = 0;
+  private contentBounds = new Bounds();
+  private readonly capsuleHitArea = new Rectangle();
+  private readonly overflowHitArea = new Rectangle();
+
+  constructor(
+    theme: Theme,
+    spec: PlayerHudSpec,
+    onTarget: () => void,
+    onShowSheet: () => void,
+    onHover: HoverFn,
+  ) {
+    this.theme = theme;
+    this.spec = spec;
+    this.onTarget = onTarget;
+    this.onShowSheet = onShowSheet;
+    this.onHover = onHover;
+
+    this.container = new Container();
+    this.container.eventMode = "static";
+    this.container.cursor = "pointer";
+    this.container.on("pointertap", () => {
+      this.onHover(null);
+      if (this.spec.isTargetable) this.onTarget();
+      else this.onShowSheet();
+    });
+    this.avatarPhoto.anchor.set(0.5);
+    this.avatarPhoto.visible = false;
+    this.avatarPhoto.eventMode = "none";
+    this.avatarPhoto.mask = this.avatarMask;
+    this.avatarMask.eventMode = "none";
+    this.avatarFx.eventMode = "none";
+    this.combatGlow.eventMode = "none";
+    this.combatGlow.visible = false;
+    this.bot.anchor.set(0.5);
+    this.bot.visible = false;
+    this.skull.anchor.set(0.5);
+    this.skull.visible = false;
+    this.offline.anchor.set(0.5);
+    this.offline.visible = false;
+    this.greyscale.desaturate();
+    this.damageWash.eventMode = "none";
+    this.targetRing.eventMode = "none";
+    this.flashRing.eventMode = "none";
+    this.promptReferenceRing.eventMode = "none";
+    this.promptReferenceRing.visible = false;
+    this.manaTray.eventMode = "none";
+    this.boundsOutline.eventMode = "none";
+    this.stateTray.eventMode = "none";
+    this.sparkles.eventMode = "none";
+    this.resourceFloatLayer.eventMode = "none";
+
+    this.avatarHit.eventMode = "static";
+    this.avatarHit.cursor = "pointer";
+
+    this.initial = new Text({ text: "", style: this.textStyle(16) });
+    this.initial.anchor.set(0.5);
+    this.heart = new Text({
+      text: "LIFE",
+      style: this.styled(8, "600", theme.gameTheme.textMuted),
+    });
+    this.heart.anchor.set(0, 0.5);
+    this.life = new Text({ text: String(spec.life), style: this.textStyle(15) });
+    this.life.anchor.set(0, 0.5);
+    this.lifeFloat = new Text({ text: "", style: this.textStyle(16) });
+    this.lifeFloat.anchor.set(0.5);
+    this.lifeFloat.visible = false;
+    this.handCount = new Text({ text: "", style: this.textStyle(13) });
+    this.handCount.anchor.set(0, 0.5);
+    this.overflow = new Text({ text: "", style: this.textStyle(11, "600") });
+    this.emptyStateText = new Text({
+      text: "No active effects",
+      style: this.styled(9, "500", theme.gameTheme.textGhost),
+    });
+    this.emptyStateText.anchor.set(0, 0.5);
+    this.emptyStateText.visible = false;
+    this.emptyStateText.eventMode = "none";
+    this.overflow.anchor.set(0, 0.5);
+    this.overflow.eventMode = "none";
+    this.overflowHit.eventMode = "none";
+    this.handFan.eventMode = "none";
+    for (let i = 0; i < 3; i++) {
+      const back = new Sprite();
+      back.anchor.set(0.5, 1);
+      back.rotation = (i - 1) * 0.16;
+      this.handFan.addChild(back);
+      this.handBacks.push(back);
+      this.handFaceIds.push(null);
+    }
+    this.unsubscribeHandStyle = usePreferencesStore.subscribe((state, previous) => {
+      if (state.handCardStyle !== previous.handCardStyle) this.render();
+    });
+    this.unsubscribeLocale = useScryfallStore.subscribe((state, previous) => {
+      if (state.locale !== previous.locale) this.render();
+    });
+    loadCardBack()
+      .then((texture) => {
+        if (this.container.destroyed) return;
+        this.handBackTexture = texture;
+        this.handBacks.forEach((back, i) => {
+          if (this.handFaceIds[i] === null) back.texture = texture;
+        });
+        this.render();
+      })
+      .catch((error) => console.warn("[hud] hand card back load failed", error));
+
+    this.container.addChild(
+      this.bg,
+      this.boundsOutline,
+      this.manaTray,
+      this.stateTray,
+      this.avatarMask,
+      this.avatarPhoto,
+      this.avatarFx,
+      this.combatGlow,
+      this.damageWash,
+      this.targetRing,
+      this.flashRing,
+      this.promptReferenceRing,
+      this.bot,
+      this.initial,
+      this.skull,
+      this.offline,
+      this.avatarHit,
+      this.heart,
+      this.life,
+      this.handFan,
+      this.handCount,
+      this.emptyStateText,
+      this.overflow,
+      this.detailsIcon,
+      this.overflowHit,
+      this.manaLayer,
+      this.badgeLayer,
+      this.sparkles,
+      this.resourceFloatLayer,
+      this.lifeFloat,
+    );
+  }
+
+  private badgeTooltip(badge: PlayerHudSpec["badges"][number]): PlayerHudTooltipContent {
+    if (badge.id === "ring") {
+      const level = Math.min(badge.count ?? 0, RING_ABILITIES.length);
+      return {
+        title: `${badge.label} — ${level}/${RING_ABILITIES.length}`,
+        lines: RING_ABILITIES.map((text, i) => ({ text, active: i < level })),
+      };
+    }
+    return { title: badge.count === undefined ? badge.label : `${badge.label}: ${badge.count}` };
+  }
+
+  private emitHover(
+    content: PlayerHudTooltipContent,
+    localCx: number,
+    localTop: number,
+    localBottom: number,
+  ): void {
+    const sx = this.container.scale.x;
+    const sy = this.container.scale.y;
+    this.onHover(
+      content,
+      this.container.x + localCx * sx,
+      this.container.y + localTop * sy,
+      this.container.y + localBottom * sy,
+      this.spec.color,
+    );
+  }
+
+  setTheme(theme: Theme): void {
+    this.theme = theme;
+    this.lastSig = "";
+    this.render();
+  }
+
+  getAvatarCenter(): ScreenPos {
+    return this.container.toGlobal(new Point(this.avatarCx, this.avatarCy));
+  }
+
+  setPromptReference(color: string | null): void {
+    if (this.promptReferenceColor === color) return;
+    this.promptReferenceColor = color;
+    this.drawPromptReference();
+  }
+
+  getZoneAnchor(zoneKey: string): ScreenPos | null {
+    const id = zoneBadgeId(zoneKey);
+    const idx = this.spec.badges.findIndex((b) => b.id === id);
+    if (idx < 0) return null;
+    const chip = this.chips[idx];
+    if (!chip || !chip.sprite.visible) return null;
+    const p = this.container.toGlobal(
+      SCRATCH_A.set(chip.sprite.x + chip.sprite.width / 2, chip.sprite.y + chip.sprite.height / 2),
+      SCRATCH_A,
+    );
+    return { x: p.x, y: p.y };
+  }
+
+  setSpec(spec: PlayerHudSpec): void {
+    const sig = PlayerHudCapsule.signature(spec);
+    this.spec = spec;
+    this.updateAvatarTexture(spec.avatarUrl);
+    if (sig === this.lastSig) return;
+    this.lastSig = sig;
+    this.render();
+  }
+
+  private static signature(s: PlayerHudSpec): string {
+    return JSON.stringify([
+      s.isSelf,
+      s.life,
+      s.isActiveTurn,
+      s.isPriorityPlayer,
+      s.isTargetable,
+      s.isSelectedTarget,
+      s.targetingIntent,
+      s.isFlashing,
+      s.isEliminated,
+      s.isDisconnected,
+      s.inCombat,
+      s.combatLethal,
+      s.color,
+      s.name,
+      s.isBot,
+      s.manaPool,
+      s.badges,
+    ]);
+  }
+
+  setCompact(compact: boolean): void {
+    if (this.compact === compact) return;
+    this.compact = compact;
+    this.lastSig = "";
+    this.render();
+  }
+  setBoundsDebug(on: boolean): void {
+    if (this.boundsDebug === on) return;
+    this.boundsDebug = on;
+    this.drawBoundsDebug();
+  }
+
+  refreshMotion(): void {
+    const enabled = animationsEnabled();
+    if (enabled === this.motionEnabled) return;
+    this.motionEnabled = enabled;
+    this.combatPulse?.kill();
+    this.targetTween?.kill();
+    this.promptReferenceTween?.kill();
+    this.promptReferenceTween = null;
+    this.offlineTween?.kill();
+    this.flashTween?.kill();
+    this.lifeTween?.kill();
+    gsap.killTweensOf(this.life.scale);
+    gsap.killTweensOf(this.lifeFloat);
+    gsap.killTweensOf(this.damageWash);
+    this.life.scale.set(1);
+    this.lifeFloat.visible = false;
+    this.damageWash.visible = false;
+    this.flashRing.visible = false;
+    this.targetRing.alpha = 1;
+    this.offline.alpha = 1;
+    this.combatActive = false;
+    this.targetRingMode = "off";
+    this.offlineActive = false;
+    for (const chip of this.chips) {
+      gsap.killTweensOf(chip.sprite);
+      chip.sprite.alpha = 1;
+      chip.hit.alpha = 1;
+    }
+    for (const dot of this.sparkles.removeChildren()) {
+      gsap.killTweensOf(dot);
+      dot.destroy();
+    }
+    this.render();
+  }
+
+  setRect(x: number, y: number, width: number, height: number, column: boolean): void {
+    this.container.position.set(x, y);
+    if (this.width === width && this.height === height && this.column === column) return;
+    this.width = width;
+    this.height = height;
+    this.column = column;
+    this.container.hitArea = this.capsuleHitArea;
+    this.render();
+  }
+
+  private textStyle(size: number, weight: TextStyle["fontWeight"] = "700"): TextStyle {
+    return cachedTextStyle(size, weight, hexToNum(this.theme.gameTheme.textOnTinted));
+  }
+
+  private styled(size: number, weight: TextStyle["fontWeight"], fill: string): TextStyle {
+    return cachedTextStyle(size, weight, hexToNum(fill));
+  }
+
+  private updateAvatarTexture(url: string | undefined): void {
+    if (!url) {
+      this.avatarUrl = null;
+      if (this.avatarTex) {
+        this.avatarTex = null;
+        this.render();
+      }
+      return;
+    }
+    if (url === this.avatarUrl) return;
+    this.avatarUrl = url;
+    loadAvatarTexture(url)
+      .then((tex) => {
+        if (this.avatarUrl !== url || this.container.destroyed) return;
+        this.avatarTex = tex;
+        this.render();
+      })
+      .catch((err) => console.warn("[hud] avatar load failed", this.spec.name, err));
+  }
+
+  private iconTexture(name: string): Texture | null {
+    const cached = iconTextures.get(name);
+    if (cached) return cached;
+    gameIconTexture(name)
+      .then((tex) => {
+        iconTextures.set(name, tex);
+        if (!this.container.destroyed) this.render();
+      })
+      .catch(() => {});
+    return null;
+  }
+
+  private manaTexture(letter: string): Texture | null {
+    const cached = getManaSymbolTextureSync(letter);
+    if (cached) return cached;
+    loadManaSymbolTexture(letter)
+      .then(() => {
+        if (!this.container.destroyed) this.render();
+      })
+      .catch(() => {});
+    return null;
+  }
+
+  private drawAvatar(cx: number, cy: number, diameter: number, visible: boolean): void {
+    const gt = this.theme.gameTheme;
+    const r = diameter / 2;
+    const hasImage = !!this.avatarTex;
+    if (visible) {
+      this.bg.circle(cx, cy, r);
+      this.bg.fill({ color: hexToNum(gt.canvas.shadow), alpha: 0.65 });
+    }
+    this.avatarFx.clear();
+    this.avatarFx.visible = visible;
+    this.avatarPhoto.visible = hasImage && visible;
+    if (hasImage) {
+      const tex = this.avatarTex!;
+      const cover = diameter / Math.min(tex.width, tex.height);
+      this.avatarPhoto.texture = tex;
+      this.avatarPhoto.width = tex.width * cover;
+      this.avatarPhoto.height = tex.height * cover;
+      this.avatarPhoto.position.set(cx, cy);
+      this.avatarMask
+        .clear()
+        .circle(cx, cy, r)
+        .fill({ color: hexToNum(gt.textOnTinted) });
+    }
+    this.avatarFx.circle(cx, cy, r - 1);
+    this.avatarFx.stroke({ color: hexToNum(this.spec.color), width: 2, alpha: 0.95 });
+    this.bot.visible = visible && !hasImage && this.spec.isBot;
+    if (this.bot.visible) {
+      const tex = this.iconTexture(BOT_ICON_NAME);
+      if (tex) this.bot.texture = tex;
+      this.bot.tint = hexToNum(gt.textMuted);
+      this.bot.width = this.bot.height = diameter * 0.56;
+      this.bot.position.set(cx, cy);
+    }
+    this.initial.visible = visible && !hasImage && !this.spec.isBot;
+    if (this.initial.visible) {
+      this.initial.text = getInitials(this.spec.name);
+      this.initial.style = this.textStyle(Math.round(diameter * 0.36), "800");
+      this.initial.position.set(cx, cy);
+    }
+    this.skull.visible = visible && this.spec.isEliminated;
+    if (this.skull.visible) {
+      const tex = this.iconTexture(SKULL_ICON_NAME);
+      if (tex) this.skull.texture = tex;
+      this.skull.tint = hexToNum(gt.textOnTinted);
+      this.skull.width = this.skull.height = diameter * 0.6;
+      this.skull.position.set(cx, cy);
+    }
+    this.offline.visible = visible && this.spec.isDisconnected && !this.spec.isEliminated;
+    if (this.offline.visible) {
+      const tex = this.iconTexture(OFFLINE_ICON_NAME);
+      if (tex) this.offline.texture = tex;
+      this.offline.tint = hexToNum(gt.connection.disconnected);
+      this.offline.width = this.offline.height = diameter * 0.35;
+      this.offline.position.set(cx + r * 0.6, cy + r * 0.6);
+    }
+    this.avatarHit
+      .clear()
+      .rect(0, 0, this.identityWidth, this.identityHeight)
+      .fill({ color: hexToNum(gt.canvas.background), alpha: 0.001 });
+    this.avatarHit.cursor = "pointer";
+  }
+
+  private ensurePips(): void {
+    while (this.pips.length < MANA_LETTERS.length) {
+      const sprite = new Sprite();
+      const count = new Text({ text: "", style: this.textStyle(12) });
+      count.anchor.set(0, 0.5);
+      this.manaLayer.addChild(sprite, count);
+      this.pips.push({ sprite, count });
+    }
+  }
+
+  private ensureChips(): void {
+    while (this.chips.length < this.spec.badges.length) {
+      const sprite = new Sprite();
+      const count = new Text({ text: "", style: this.textStyle(12) });
+      const label = new Text({ text: "", style: this.textStyle(10, "500") });
+      const hit = new Graphics();
+      count.anchor.set(1, 0.5);
+      label.anchor.set(0, 0.5);
+      sprite.eventMode = count.eventMode = label.eventMode = "none";
+      hit.eventMode = "static";
+      hit.cursor = "pointer";
+      const chip: BadgeChip = {
+        sprite,
+        count,
+        label,
+        hit,
+        hitBounds: new Rectangle(),
+        content: { title: "" },
+      };
+      hit.on("pointerover", () =>
+        this.emitHover(chip.content, hit.x + hit.width / 2, hit.y, hit.y + hit.height),
+      );
+      hit.on("pointerout", () => this.onHover(null));
+      hit.on("pointertap", () => this.onHover(null));
+      this.badgeLayer.addChild(hit, sprite, label, count);
+      this.chips.push(chip);
+    }
+  }
+
+  private extendContent(x: number, y: number, w: number, h: number): void {
+    this.contentBounds.addFrame(x, y, x + w, y + h);
+  }
+
+  getKeepOutBounds(): ScreenBounds | null {
+    if (!this.contentBounds.isValid) return null;
+    const b = this.contentBounds;
+    const tl = this.container.toGlobal(SCRATCH_A.set(b.minX, b.minY), SCRATCH_A);
+    const br = this.container.toGlobal(SCRATCH_B.set(b.maxX, b.maxY), SCRATCH_B);
+    return { x: tl.x, y: tl.y, width: br.x - tl.x, height: br.y - tl.y };
+  }
+
+  private render(): void {
+    const { width: w, height: h } = this;
+    if (w <= 0 || h <= 0) return;
+    const hitWidth = Math.max(w + 8, getUiControlFloor());
+    const hitHeight = Math.max(h + 8, getUiControlFloor());
+    this.capsuleHitArea.x = (w - hitWidth) / 2;
+    this.capsuleHitArea.y = (h - hitHeight) / 2;
+    this.capsuleHitArea.width = hitWidth;
+    this.capsuleHitArea.height = hitHeight;
+    this.contentBounds.clear();
+    this.life.text = String(this.spec.life);
+    this.updateFilters();
+    this.applyOffline();
+
+    this.bg.clear();
+    this.handFan.visible = false;
+    this.manaTray.clear();
+    this.stateTray.clear();
+    this.detailsIcon.visible = false;
+    this.overflow.visible = false;
+    this.emptyStateText.visible = false;
+    this.overflowHit.clear();
+    this.overflowHit.visible = false;
+    for (const chip of this.chips) {
+      chip.sprite.visible = false;
+      chip.count.visible = false;
+      chip.label.visible = false;
+      chip.hit.visible = false;
+    }
+    for (const pip of this.pips) {
+      pip.sprite.visible = false;
+      pip.count.visible = false;
+    }
+    if (this.column) this.renderColumn(w, h);
+    else this.renderCapsule(w, h);
+    this.applyLifeAnim();
+    this.applyResourceAnimations();
+    this.applyCombatGlow();
+    this.applyTargetable();
+    this.applyFlash();
+    this.drawPromptReference();
+    this.checkBadgeSparkles();
+    this.drawBoundsDebug();
+  }
+
+  private applyOffline(): void {
+    const on = this.spec.isDisconnected && !this.spec.isEliminated;
+    if (on === this.offlineActive) return;
+    this.offlineActive = on;
+    if (!this.motionEnabled) {
+      this.offline.alpha = 1;
+      return;
+    }
+    if (on) {
+      this.offlineTween = gsap.fromTo(
+        this.offline,
+        { alpha: 1 },
+        { alpha: 0.35, duration: 0.7, ease: "sine.inOut", repeat: -1, yoyo: true },
+      );
+    } else {
+      this.offlineTween?.kill();
+      this.offlineTween = null;
+      this.offline.alpha = 1;
+    }
+  }
+
+  private updateFilters(): void {
+    const eliminated = this.spec.isEliminated;
+    // `null`, not `[]` — an empty filters array still routes the container
+    // through a filter render-pass in Pixi, which softens/blurs it.
+    this.container.filters = eliminated ? [this.greyscale] : null;
+    this.container.alpha = !eliminated && this.spec.isDisconnected ? 0.6 : 1;
+  }
+
+  private checkBadgeSparkles(): void {
+    const ids = new Set(this.spec.badges.map((b) => b.id));
+    for (const id of ["monarch", "initiative"]) {
+      if (this.motionEnabled && ids.has(id) && !this.prevBadgeIds.has(id)) {
+        const badge = this.spec.badges.find((b) => b.id === id);
+        this.burstSparkles(badge?.color ?? this.theme.gameTheme.textOnTinted);
+      }
+    }
+    this.prevBadgeIds = ids;
+  }
+
+  private burstSparkles(color: string): void {
+    const n = 10;
+    const tint = hexToNum(color);
+    const r = this.avatarDia / 2;
+    for (let i = 0; i < n; i++) {
+      const dot = new Graphics();
+      dot.circle(0, 0, Math.max(1.5, this.avatarDia * 0.04));
+      dot.fill({ color: tint, alpha: 1 });
+      dot.position.set(this.avatarCx, this.avatarCy);
+      this.sparkles.addChild(dot);
+      const ang = (i / n) * Math.PI * 2 + i * 0.3;
+      const dist = r * (0.9 + (i % 3) * 0.25);
+      gsap.to(dot, {
+        x: this.avatarCx + Math.cos(ang) * dist,
+        y: this.avatarCy + Math.sin(ang) * dist,
+        alpha: 0,
+        duration: 0.7,
+        ease: "power2.out",
+        onComplete: () => dot.destroy(),
+      });
+    }
+  }
+
+  private burstManaSplash(cx: number, cy: number, color: number, amount: number): void {
+    const ring = new Graphics().circle(0, 0, 5).stroke({ color, width: 1.5, alpha: 0.9 });
+    ring.eventMode = "none";
+    ring.position.set(cx, cy);
+    ring.scale.set(0.6);
+    this.sparkles.addChild(ring);
+    gsap.to(ring, {
+      alpha: 0,
+      pixi: { scale: Math.min(3, 2.1 + amount * 0.16) },
+      duration: 0.46,
+      ease: "power2.out",
+      onComplete: () => ring.destroy(),
+    });
+
+    const count = Math.min(10, 6 + amount);
+    for (let i = 0; i < count; i++) {
+      const radius = 1.25 + (i % 3) * 0.35;
+      const drop = new Graphics().circle(0, 0, radius).fill({ color, alpha: 0.95 });
+      const angle = -Math.PI * (0.15 + (i / Math.max(1, count - 1)) * 0.7);
+      const distance = 15 + (i % 4) * 4 + Math.min(amount, 4);
+      drop.eventMode = "none";
+      drop.position.set(cx, cy);
+      this.sparkles.addChild(drop);
+      gsap.to(drop, {
+        x: cx + Math.cos(angle) * distance,
+        y: cy + Math.sin(angle) * distance,
+        alpha: 0,
+        pixi: { scale: 0.25 },
+        duration: 0.42 + (i % 3) * 0.06,
+        ease: "power2.out",
+        onComplete: () => drop.destroy(),
+      });
+    }
+  }
+
+  private renderColumn(w: number, h: number): void {
+    const short = h < 290;
+    const pad = 8;
+    const hasMana = MANA_LETTERS.some((letter) => (this.spec.manaPool[letter] ?? 0) > 0);
+    this.panelHeight = Math.min(h, 352);
+    this.identityHeight = short ? 62 : 130;
+    this.identityWidth = w;
+    this.drawPlate(w, this.panelHeight);
+    this.avatarCx = w / 2;
+    this.avatarCy = 34;
+    this.avatarDia = AVATAR_DIAMETER;
+    this.drawAvatar(this.avatarCx, this.avatarCy, this.avatarDia, !short);
+    this.layoutLife(short ? w / 2 - 4 : w / 2, short ? 32 : 98, !short);
+    this.heart.visible = false;
+    const hand = this.makeHandItem(short ? 26 : 32);
+    hand.place(short ? w / 2 + 4 : (w - hand.w) / 2, short ? 32 : 146);
+    const resourceY = short ? 70 : 172;
+    const stateY = hasMana
+      ? this.layoutMana(pad, resourceY, w - pad * 2, 2, short ? 18 : 24) + 6
+      : resourceY;
+    this.layoutStates(pad, stateY, w - pad * 2, this.panelHeight - stateY - 4, 2);
+  }
+
+  private renderCompactCapsule(w: number, h: number): void {
+    const pad = this.compact ? 5 : PANEL_PADDING;
+    this.panelHeight = h;
+    this.identityHeight = h;
+    this.identityWidth = w;
+    this.drawPlate(w, h);
+    const avatarDia = Math.min(this.compact ? 32 : AVATAR_DIAMETER, h - (this.compact ? 8 : 14));
+    this.avatarCx = pad + avatarDia / 2;
+    this.avatarCy = h / 2;
+    this.avatarDia = avatarDia;
+    this.drawAvatar(this.avatarCx, this.avatarCy, avatarDia, true);
+    if (this.compact) {
+      const lifeX = pad + avatarDia + (w - pad - avatarDia) / 2;
+      this.layoutLife(lifeX, h / 2, true);
+      this.heart.visible = false;
+      return;
+    }
+    const lifeX = pad + avatarDia + 54;
+    this.layoutLife(lifeX, 29, false);
+    this.heart.visible = true;
+    this.heart.text = "LIFE";
+    this.heart.style = this.styled(8, "600", this.theme.gameTheme.textMuted);
+    this.heart.anchor.set(1, 0.5);
+    this.heart.position.set(lifeX, h - this.heart.height / 2 - 2);
+    this.life.y = Math.min(
+      this.life.y,
+      this.heart.y - this.heart.height / 2 - 2 - this.life.height / 2,
+    );
+    const handX = lifeX + 14;
+    const hand = this.makeHandItem(30);
+    hand.place(handX, 34);
+    const dividerX = handX + hand.w + 8;
+    const stateLeft = dividerX + 10;
+    const badgeRight = Math.max(stateLeft, w - (this.spec.isSelf ? 44 : PANEL_PADDING));
+    const visibleStates = this.layoutCompactStateIcons(stateLeft, 34, badgeRight - stateLeft);
+    if (visibleStates > 0) {
+      this.stateTray
+        .moveTo(dividerX, 15)
+        .lineTo(dividerX, 51)
+        .stroke({
+          color: hexToNum(this.theme.gameTheme.textGhost),
+          alpha: 0.3,
+          width: 1,
+        });
+    }
+    this.layoutFloatingMana(16, this.spec.isSelf ? -16 : h + 16);
+  }
+
+  private renderCapsule(w: number, h: number): void {
+    if (!this.column) {
+      this.renderCompactCapsule(w, h);
+      return;
+    }
+    const pad = PANEL_PADDING;
+    const shallow = h < 132;
+    const showAvatar = !shallow || h >= SHALLOW_AVATAR_MIN_HEIGHT;
+    this.panelHeight = h;
+    this.identityHeight = shallow ? h : 56;
+    this.identityWidth = shallow ? Math.min(w, showAvatar ? 200 : 132) : w;
+    this.drawPlate(w, h);
+    this.avatarCx = pad + AVATAR_DIAMETER / 2;
+    this.avatarCy = shallow && showAvatar ? Math.min(46, h / 2) : 32;
+    this.avatarDia = AVATAR_DIAMETER;
+    this.drawAvatar(this.avatarCx, this.avatarCy, this.avatarDia, showAvatar);
+    if (shallow) {
+      if (showAvatar) {
+        const contentX = pad + AVATAR_DIAMETER + 12;
+        this.layoutLife(contentX, this.avatarCy, false);
+        this.life.anchor.set(0, 0.5);
+        this.makeHandItem(30).place(contentX, h - 32);
+      } else {
+        const lifeX = this.identityWidth - 4;
+        this.layoutLife(lifeX, 32, false);
+        this.makeHandItem(30).place(pad, 32);
+      }
+      this.heart.visible = false;
+      const utilityTop = h - 28;
+      const utilityHeight = 20;
+      const detailsRect: LayoutRect = {
+        x: pad,
+        y: utilityTop,
+        width: AVATAR_DIAMETER,
+        height: utilityHeight,
+      };
+      const manaRight = w - SHALLOW_RESOURCE_RIGHT_INSET;
+      const manaX = showAvatar
+        ? this.identityWidth - SHALLOW_RESOURCE_IDENTITY_OVERLAP
+        : this.identityWidth;
+      const manaY = h < 80 ? 14 : 20;
+      this.layoutMana(manaX, manaY, Math.max(1, manaRight - manaX), 6, 20);
+      const stateBottom = h - 10;
+      const stateY = Math.max(h < 80 ? 24 : 36, stateBottom - SHALLOW_STATE_BLOCK_HEIGHT);
+      this.layoutStates(
+        manaX,
+        stateY,
+        Math.max(1, manaRight - manaX),
+        Math.max(1, stateBottom - stateY),
+        3,
+        detailsRect,
+      );
+      this.avatarHit
+        .clear()
+        .rect(0, 0, this.identityWidth, h)
+        .fill({ color: hexToNum(this.theme.gameTheme.canvas.background), alpha: 0.001 });
+      return;
+    }
+    const lifeX = pad + AVATAR_DIAMETER + 54;
+    this.layoutLife(lifeX, 29, false);
+    this.heart.visible = true;
+    this.heart.text = "LIFE";
+    this.heart.style = this.styled(8, "600", this.theme.gameTheme.textMuted);
+    this.heart.anchor.set(1, 0.5);
+    this.heart.position.set(lifeX, 49);
+    this.life.y = Math.min(
+      this.life.y,
+      this.heart.y - this.heart.height / 2 - 2 - this.life.height / 2,
+    );
+    this.makeHandItem(32).place(pad, this.compact ? 70 : 67);
+    const zones = this.spec.badges
+      .map((badge, index) => ({ badge, index }))
+      .filter(({ badge }) => badge.zone);
+    this.ensureChips();
+    const zoneWidth = (w - pad * 2 - 60) / Math.max(1, zones.length);
+    for (let i = 0; i < zones.length; i++) {
+      this.placeBadge(zones[i]!.index, pad + 60 + i * zoneWidth, 50, zoneWidth, 40, false);
+    }
+    this.layoutMana(pad, this.compact ? 103 : 90, w - pad * 2, 6, 24);
+    const stateY = this.compact ? 122 : 110;
+    this.layoutStates(pad, stateY, w - pad * 2, h - stateY - 6, 3);
+  }
+
+  private drawPlate(width: number, height: number): void {
+    this.extendContent(0, 0, width, height);
+  }
+  private drawBoundsDebug(): void {
+    this.boundsOutline.clear();
+    if (!this.boundsDebug || this.width <= 0 || this.height <= 0) return;
+    this.boundsOutline
+      .roundRect(0.5, 0.5, this.width - 1, this.height - 1, 8)
+      .fill({ color: hexToNum(this.theme.gameTheme.activeAction.active), alpha: 0.08 })
+      .stroke({
+        color: hexToNum(this.theme.gameTheme.activeAction.active),
+        alpha: 0.9,
+        width: 1,
+      });
+  }
+
+  private layoutLife(x: number, y: number, centered: boolean): void {
+    this.lifeFontSize = this.compact ? 24 : 32;
+    this.life.style = this.textStyle(this.lifeFontSize, "800");
+    this.life.anchor.set(centered ? 0.5 : 1, 0.5);
+    this.life.position.set(x, y);
+  }
+
+  private makeHandItem(unit: number): ContentItem {
+    const handBadge = this.spec.badges.find((badge) => badge.id === "hand");
+    const count = handBadge?.count ?? 0;
+    const revealed = handBadge?.revealedCards ?? [];
+    const height = Math.round(unit * 0.42);
+    const width = height * 0.71;
+    this.handCount.text = String(count);
+    this.handCount.style = this.styled(
+      Math.max(12, Math.round(unit * 0.28)),
+      "700",
+      this.theme.gameTheme.textOnTinted,
+    );
+    const fanWidth = width + 10;
+    for (let i = 0; i < this.handBacks.length; i++) {
+      const back = this.handBacks[i]!;
+      void this.applyHandFace(i, revealed[i], width, height);
+      back.width = width;
+      back.height = height;
+      back.visible = i < count;
+      back.position.set(width / 2 + i * 5, height / 2);
+    }
+    return {
+      w: fanWidth + 5 + this.handCount.width,
+      place: (x, y) => {
+        this.handFan.position.set(x, y);
+        this.handFan.visible = count > 0;
+        this.handCount.position.set(x + fanWidth + 5, y);
+      },
+    };
+  }
+
+  private async applyHandFace(
+    index: number,
+    card: CardDto | undefined,
+    width: number,
+    height: number,
+  ): Promise<void> {
+    const visible = card && !card.isFaceDown && !!card.identity.name;
+    const generated = usePreferencesStore.getState().handCardStyle === "rules";
+    const locale = useScryfallStore.getState().locale;
+    const tier = selectCardRenderTier(
+      width,
+      height,
+      Math.min(2, window.devicePixelRatio || 1),
+      this.handFaceTiers[index],
+    );
+    this.handFaceTiers[index] = tier;
+    const id = visible
+      ? JSON.stringify([
+          card.id,
+          card.identity.name,
+          card.identity.setCode,
+          card.identity.cardNumber,
+          gameCardFaceIndex(card),
+          generated,
+          locale,
+          tier,
+        ])
+      : null;
+    if (this.handFaceIds[index] === id && this.handFaceCards[index] === card) return;
+    const previousCard = this.handFaceCards[index];
+    const identityChanged =
+      previousCard?.id !== card?.id || previousCard?.identity.name !== card?.identity.name;
+    this.handFaceIds[index] = id;
+    this.handFaceCards[index] = card;
+    this.handFaceRequests[index]?.abort();
+    const controller = new AbortController();
+    this.handFaceRequests[index] = controller;
+    const sprite = this.handBacks[index]!;
+    if (!visible || identityChanged) {
+      sprite.texture = this.handBackTexture;
+      this.handFaceTextures[index]?.destroy(true);
+      this.handFaceTextures[index] = undefined;
+    }
+    if (!visible) {
+      return;
+    }
+    const deckCard = asGameDeckCard(useGameStore.getState().gameDecks, card);
+    const faceIndex = gameCardFaceIndex(card);
+    if (
+      generated &&
+      (sprite.texture === this.handBackTexture || sprite.texture === Texture.EMPTY)
+    ) {
+      void useScryfallStore
+        .getState()
+        .getCardTexture(deckCard, "full", faceIndex)
+        .then((scan) => {
+          if (
+            this.container.destroyed ||
+            controller.signal.aborted ||
+            (sprite.texture !== this.handBackTexture && sprite.texture !== Texture.EMPTY)
+          )
+            return;
+          sprite.texture = scan;
+          this.render();
+        })
+        .catch((error: unknown) => {
+          if (!this.container.destroyed && !controller.signal.aborted) {
+            console.warn("[hud] revealed hand scan load failed", card.identity.name, error);
+          }
+        });
+    }
+    let texture: Texture;
+    let owned = false;
+    try {
+      if (generated) {
+        const raster = await renderCard({ card, deckCard, faceIndex }, controller.signal, { tier });
+        try {
+          if (this.container.destroyed || controller.signal.aborted) return;
+          texture = createGeneratedCardTexture(raster);
+          owned = true;
+        } finally {
+          releaseCardRaster(raster);
+        }
+      } else {
+        texture = await useScryfallStore.getState().getCardTexture(deckCard, "full", faceIndex);
+      }
+    } catch (error) {
+      if (this.container.destroyed || controller.signal.aborted) return;
+      console.warn("[hud] revealed hand card render failed", card.identity.name, error);
+      return;
+    }
+    if (this.container.destroyed || controller.signal.aborted) {
+      if (owned) texture.destroy(true);
+      return;
+    }
+    const previous = this.handFaceTextures[index];
+    this.handFaceTextures[index] = owned ? texture : undefined;
+    sprite.texture = texture;
+    previous?.destroy(true);
+    this.render();
+  }
+
+  private layoutFloatingMana(x: number, cy: number): void {
+    this.ensurePips();
+    const gt = this.theme.gameTheme;
+    const size = 22;
+    const slotWidth = Math.max(40, size + getUiFontFloor("meta") * 2 + 8);
+    let slot = 0;
+    for (let i = 0; i < MANA_LETTERS.length; i++) {
+      const letter = MANA_LETTERS[i]!;
+      const pip = this.pips[i]!;
+      const value = this.spec.manaPool[letter] ?? 0;
+      const previous = pip.value;
+      pip.value = value;
+      if (value <= 0) continue;
+      const left = x + slot * slotWidth;
+      const texture = this.manaTexture(letter);
+      if (texture) pip.sprite.texture = texture;
+      pip.sprite.visible = pip.count.visible = true;
+      pip.sprite.width = pip.sprite.height = size;
+      pip.sprite.position.set(left, cy - size / 2);
+      pip.sprite.alpha = 1;
+      pip.count.text = String(value);
+      pip.count.style = this.styled(11, "700", gt.textOnTinted);
+      pip.count.alpha = 1;
+      pip.count.scale.set(1);
+      pip.count.position.set(left + size + 3, cy);
+      if (previous !== undefined && value > previous && this.motionEnabled) {
+        this.burstManaSplash(
+          left + size / 2,
+          cy,
+          manaColorFor(letter, this.theme, hexToNum(this.theme.appTheme.primary)),
+          value - previous,
+        );
+      }
+      slot++;
+    }
+  }
+
+  private layoutMana(
+    x: number,
+    y: number,
+    width: number,
+    columns: number,
+    rowHeight: number,
+  ): number {
+    this.ensurePips();
+    const gt = this.theme.gameTheme;
+    columns = Math.max(
+      1,
+      Math.min(columns, Math.floor(width / Math.max(32, getUiFontFloor("meta") + 24))),
+    );
+    rowHeight = Math.max(rowHeight, Math.ceil(getUiFontFloor("meta") * 1.4) + 4);
+    const cellWidth = width / columns;
+    const size = Math.min(18, rowHeight - 4);
+    const rows = Math.ceil(MANA_LETTERS.length / columns);
+    this.manaTray
+      .roundRect(
+        x - TRAY_HORIZONTAL_PADDING,
+        y - rowHeight / 2 - TRAY_VERTICAL_PADDING,
+        width + TRAY_HORIZONTAL_PADDING * 2,
+        rows * rowHeight + TRAY_VERTICAL_PADDING * 2,
+        TRAY_RADIUS,
+      )
+      .fill({ color: hexToNum(gt.canvas.shadow), alpha: 0.38 })
+      .stroke({ color: hexToNum(this.theme.appTheme.border), alpha: 0.65, width: 1 });
+    for (let i = 0; i < MANA_LETTERS.length; i++) {
+      const letter = MANA_LETTERS[i]!;
+      const pip = this.pips[i]!;
+      const value = this.spec.manaPool[letter] ?? 0;
+      const left = x + (i % columns) * cellWidth;
+      const cy = y + Math.floor(i / columns) * rowHeight;
+      const texture = this.manaTexture(letter);
+      if (texture) pip.sprite.texture = texture;
+      const active = value > 0;
+      pip.sprite.visible = pip.count.visible = true;
+      pip.sprite.width = pip.sprite.height = size;
+      pip.sprite.position.set(left, cy - size / 2);
+      pip.sprite.alpha = active ? 1 : 0.24;
+      pip.count.text = String(value);
+      pip.count.style = this.styled(12, "700", active ? gt.textOnTinted : gt.textGhost);
+      pip.count.alpha = active ? 1 : 0.65;
+      pip.count.scale.set(1);
+      while (
+        pip.count.width > cellWidth - size - 6 &&
+        pip.count.text.replace(/…$/, "").length > 1
+      ) {
+        pip.count.text = `${pip.count.text.replace(/…$/, "").slice(0, -1)}…`;
+      }
+      if (pip.count.width > cellWidth - size - 6) pip.count.text = "…";
+      pip.count.position.set(left + size + 4, cy);
+      if (pip.value !== undefined && value > pip.value && this.motionEnabled) {
+        this.burstManaSplash(
+          left + size / 2,
+          cy,
+          manaColorFor(letter, this.theme, hexToNum(this.theme.appTheme.primary)),
+          value - pip.value,
+        );
+      }
+      pip.value = value;
+    }
+    return y + (rows - 0.5) * rowHeight + TRAY_VERTICAL_PADDING;
+  }
+
+  private badgeIsUrgent(badge: PlayerHudSpec["badges"][number]): boolean {
+    return (
+      !!badge.lethal ||
+      badge.id === "extra-turn" ||
+      badge.id === "controlled-player" ||
+      badge.id === "damage-prevention" ||
+      (badge.id === "poison" && (badge.count ?? 0) >= 8) ||
+      (badge.id.startsWith("cmd-") && (badge.count ?? 0) >= 18)
+    );
+  }
+
+  private placeBadge(
+    index: number,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    showLabel: boolean,
+  ): void {
+    const gt = this.theme.gameTheme;
+    const badge = this.spec.badges[index]!;
+    const urgent = this.badgeIsUrgent(badge);
+    const chip = this.chips[index]!;
+    const size = 16;
+    const cy = y + height / 2;
+    const texture = this.iconTexture(badge.icon);
+    if (texture) chip.sprite.texture = texture;
+    chip.sprite.tint = hexToNum(badge.color);
+    chip.sprite.width = chip.sprite.height = size;
+    chip.sprite.position.set(x + 4, cy - size / 2);
+    chip.sprite.visible = chip.hit.visible = true;
+    chip.badgeId = badge.id;
+    chip.content = this.badgeTooltip(badge);
+    chip.hit
+      .clear()
+      .roundRect(0, 0, width - 3, height - 2, 4)
+      .fill({
+        color: hexToNum(urgent ? gt.pt.lethal : gt.textGhost),
+        alpha: urgent ? 0.16 : 0.04,
+      });
+    chip.hit.position.set(x, y + 1);
+    const hitWidth = Math.max(width - 3, getUiControlFloor());
+    const hitHeight = Math.max(height - 2, getUiControlFloor());
+    chip.hitBounds.x = (width - hitWidth) / 2;
+    chip.hitBounds.y = (height - hitHeight) / 2;
+    chip.hitBounds.width = hitWidth;
+    chip.hitBounds.height = hitHeight;
+    chip.hit.hitArea = chip.hitBounds;
+    chip.count.visible = badge.count !== undefined;
+    chip.count.text = badge.count === undefined ? "" : String(badge.count);
+    chip.count.style = this.styled(12, "700", urgent ? gt.pt.lethal : gt.textOnTinted);
+    chip.count.scale.set(1);
+    while (chip.count.width > width - size - 12 && chip.count.text.replace(/…$/, "").length > 1) {
+      chip.count.text = `${chip.count.text.replace(/…$/, "").slice(0, -1)}…`;
+    }
+    if (chip.count.width > width - size - 12) chip.count.text = "…";
+    chip.count.position.set(x + width - 8, cy);
+    const labelWidth = width - size - 14 - (chip.count.visible ? chip.count.width + 4 : 0);
+    chip.label.visible = showLabel && labelWidth >= 24;
+    if (chip.label.visible) {
+      chip.label.text = badge.id.startsWith("cmd-") ? "Cmd dmg" : badge.label;
+      chip.label.style = this.styled(10, "500", gt.textMuted);
+      while (chip.label.width > labelWidth && chip.label.text.length > 2) {
+        chip.label.text = `${chip.label.text.replace(/…$/, "").slice(0, -1)}…`;
+      }
+      chip.label.position.set(x + size + 8, cy);
+    }
+  }
+
+  private layoutCompactStateIcons(x: number, cy: number, width: number): number {
+    this.ensureChips();
+    const rank = (id: string) => {
+      const index = STATE_ORDER.indexOf(id.startsWith("cmd-") ? "commander" : id);
+      return index < 0 ? STATE_ORDER.length : index;
+    };
+    const states = this.spec.badges
+      .map((badge, index) => ({ badge, index }))
+      .filter(({ badge }) => badge.id !== "hand" && !badge.zone)
+      .sort(
+        (a, b) =>
+          Number(this.badgeIsUrgent(b.badge)) - Number(this.badgeIsUrgent(a.badge)) ||
+          rank(a.badge.id) - rank(b.badge.id) ||
+          a.badge.id.localeCompare(b.badge.id),
+      );
+    const slotWidth = Math.max(28, getUiControlFloor());
+    const visible = Math.min(states.length, Math.max(0, Math.floor(width / slotWidth)));
+    for (let i = 0; i < visible; i++) {
+      this.placeBadgeIcon(states[i]!.index, x + slotWidth / 2 + i * slotWidth, cy);
+    }
+    return visible;
+  }
+
+  private placeBadgeIcon(index: number, cx: number, cy: number): void {
+    const badge = this.spec.badges[index]!;
+    const chip = this.chips[index]!;
+    const size = 18;
+    const texture = this.iconTexture(badge.icon);
+    if (texture) chip.sprite.texture = texture;
+    chip.sprite.tint = hexToNum(badge.color);
+    chip.sprite.width = chip.sprite.height = size;
+    chip.sprite.position.set(cx - size / 2, cy - size / 2);
+    chip.sprite.visible = chip.hit.visible = true;
+    chip.count.visible = false;
+    chip.label.visible = false;
+    chip.badgeId = badge.id;
+    chip.content = this.badgeTooltip(badge);
+    chip.hit
+      .clear()
+      .circle(cx, cy, Math.max(12, getUiControlFloor() / 2))
+      .fill({ color: hexToNum(this.theme.gameTheme.canvas.background), alpha: 0.001 });
+    chip.hit.position.set(0, 0);
+    chip.hit.hitArea = null;
+  }
+
+  private layoutStates(
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    columns: number,
+    overflowRect?: LayoutRect,
+  ): void {
+    this.ensureChips();
+    const rowHeight = Math.max(
+      24,
+      getUiControlFloor(),
+      Math.ceil(getUiFontFloor("meta") * 1.4) + 8,
+    );
+    if (height < rowHeight) {
+      this.layoutCompactStateIcons(x, y + Math.max(0, height) / 2, width);
+      return;
+    }
+    columns = Math.max(1, Math.min(columns, Math.floor(width / Math.max(52, getUiControlFloor()))));
+    const rows = Math.max(1, Math.min(3, Math.floor(height / rowHeight)));
+    const cellHeight = rowHeight;
+    const cellWidth = width / columns;
+    this.stateTray
+      .roundRect(
+        x - TRAY_HORIZONTAL_PADDING,
+        y - TRAY_VERTICAL_PADDING,
+        width + TRAY_HORIZONTAL_PADDING * 2,
+        rows * cellHeight + TRAY_VERTICAL_PADDING * 2,
+        TRAY_RADIUS,
+      )
+      .fill({ color: hexToNum(this.theme.gameTheme.canvas.shadow), alpha: 0.26 })
+      .stroke({ color: hexToNum(this.theme.appTheme.border), alpha: 0.5, width: 1 });
+    const rank = (id: string) => {
+      const index = STATE_ORDER.indexOf(id.startsWith("cmd-") ? "commander" : id);
+      return index < 0 ? STATE_ORDER.length : index;
+    };
+    const allStates = this.spec.badges
+      .map((badge, index) => ({ badge, index }))
+      .filter(({ badge }) => badge.id !== "hand" && !badge.zone)
+      .sort(
+        (a, b) =>
+          Number(this.badgeIsUrgent(b.badge)) - Number(this.badgeIsUrgent(a.badge)) ||
+          rank(a.badge.id) - rank(b.badge.id) ||
+          a.badge.id.localeCompare(b.badge.id),
+      );
+    if (this.column && allStates.length === 0) {
+      this.stateTray.clear();
+      return;
+    }
+    const states = allStates;
+    this.emptyStateText.visible = allStates.length === 0 && width >= 160;
+    if (this.emptyStateText.visible) {
+      this.emptyStateText.style = this.styled(10, "500", this.theme.gameTheme.textMuted);
+      this.emptyStateText.position.set(x + 8, y + (rows * cellHeight) / 2);
+    }
+    const capacity = this.column ? rows * columns : rows * columns - (overflowRect ? 0 : 1);
+    const visible = Math.min(states.length, capacity);
+    for (let i = 0; i < visible; i++) {
+      this.placeBadge(
+        states[i]!.index,
+        x + (i % columns) * cellWidth,
+        y + Math.floor(i / columns) * cellHeight,
+        cellWidth,
+        cellHeight,
+        cellWidth >= 80,
+      );
+    }
+    if (this.column) return;
+    const hidden = allStates.length - visible;
+    const visibleIds = new Set(states.slice(0, visible).map(({ badge }) => badge.id));
+    const danger = allStates.some(
+      ({ badge }) => !visibleIds.has(badge.id) && this.badgeIsUrgent(badge),
+    );
+    const slot = this.column ? Math.min(rows * columns - 1, visible) : rows * columns - 1;
+    this.placeOverflow(
+      overflowRect ?? {
+        x: x + (slot % columns) * cellWidth,
+        y: y + Math.floor(slot / columns) * cellHeight,
+        width: cellWidth,
+        height: cellHeight,
+      },
+      hidden,
+      danger,
+    );
+  }
+
+  private placeOverflow(rect: LayoutRect, hidden: number, danger: boolean): void {
+    const compact = rect.width < 48;
+    const showIcon = hidden === 0 && compact;
+    this.detailsIcon.visible = showIcon;
+    if (showIcon) {
+      const texture = this.iconTexture(DETAILS_ICON_NAME);
+      if (texture) this.detailsIcon.texture = texture;
+      this.detailsIcon.tint = hexToNum(this.theme.gameTheme.textMuted);
+      this.detailsIcon.width = this.detailsIcon.height = 12;
+      this.detailsIcon.position.set(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    }
+    this.overflow.text =
+      hidden > 0 ? (rect.width < 96 ? `+${hidden}` : `+${hidden} states`) : "Details";
+    this.overflow.style = this.styled(
+      Math.max(10, getUiFontFloor("label")),
+      danger ? "700" : "500",
+      danger ? this.theme.gameTheme.pt.lethal : this.theme.gameTheme.textMuted,
+    );
+    this.overflow.position.set(
+      rect.x + (rect.width - this.overflow.width) / 2,
+      rect.y + rect.height / 2,
+    );
+    this.overflow.visible = !showIcon;
+    this.overflowHit.visible = true;
+    this.overflowHit.roundRect(rect.x, rect.y, rect.width, rect.height, 5).fill({
+      color: hexToNum(danger ? this.theme.gameTheme.pt.lethal : this.theme.gameTheme.textGhost),
+      alpha: danger ? 0.16 : 0.08,
+    });
+    const hitWidth = Math.max(rect.width, getUiControlFloor());
+    const hitHeight = Math.max(rect.height, getUiControlFloor());
+    this.overflowHitArea.x = rect.x + (rect.width - hitWidth) / 2;
+    this.overflowHitArea.y = rect.y + (rect.height - hitHeight) / 2;
+    this.overflowHitArea.width = hitWidth;
+    this.overflowHitArea.height = hitHeight;
+    this.overflowHit.hitArea = this.overflowHitArea;
+  }
+
+  private applyLifeAnim(): void {
+    const next = this.spec.life;
+    this.life.text = String(next);
+    if (this.column || !this.motionEnabled) {
+      this.lifeTween?.kill();
+      gsap.killTweensOf(this.life.scale);
+      this.life.scale.set(1);
+      this.renderedLife = next;
+      return;
+    }
+    if (this.renderedLife !== null && next !== this.renderedLife) {
+      const gt = this.theme.gameTheme;
+      const gained = next > this.renderedLife;
+      const delta = next - this.renderedLife;
+      const flash = gained ? gt.pt.buffed : gt.pt.lethal;
+      this.lifeTween?.kill();
+      const counter = { v: this.renderedLife };
+      this.lifeTween = gsap.to(counter, {
+        v: next,
+        duration: 0.5,
+        ease: "power1.out",
+        onUpdate: () => {
+          if (!this.life.destroyed) this.life.text = String(Math.round(counter.v));
+        },
+        onComplete: () => {
+          if (!this.life.destroyed) this.life.text = String(next);
+        },
+      });
+      this.life.style = this.styled(this.lifeFontSize, "800", flash);
+      gsap.killTweensOf(this.life.scale);
+      gsap.fromTo(
+        this.life.scale,
+        { x: 1.3, y: 1.3 },
+        { x: 1, y: 1, duration: 0.45, ease: "back.out(2)" },
+      );
+      gsap.delayedCall(0.55, () => {
+        if (!this.life.destroyed) this.life.style = this.textStyle(this.lifeFontSize, "800");
+      });
+      this.floatLifeDelta(delta, flash);
+      if (!gained) this.washDamage();
+    }
+    this.renderedLife = next;
+  }
+
+  private applyResourceAnimations(): void {
+    const badgeCounts = new Map(
+      this.spec.badges
+        .filter((badge) => badge.count !== undefined)
+        .map((badge) => [badge.id, badge.count ?? 0]),
+    );
+    const manaCounts = new Map(
+      MANA_LETTERS.map((letter) => [letter, this.spec.manaPool[letter] ?? 0]),
+    );
+    if (this.resourcesInitialized) {
+      this.spec.badges.forEach((badge, index) => {
+        if (badge.count === undefined) return;
+        const previous = this.renderedBadgeCounts.get(badge.id) ?? 0;
+        const delta = badge.count - previous;
+        const chip = this.chips[index];
+        if (delta !== 0 && chip) {
+          this.animateResourceCount(
+            chip.count,
+            delta,
+            chip.count.visible ? chip.count.x : this.avatarCx,
+            chip.count.visible ? chip.count.y : this.avatarCy,
+          );
+        }
+      });
+      MANA_LETTERS.forEach((letter, index) => {
+        const next = manaCounts.get(letter) ?? 0;
+        const delta = next - (this.renderedManaCounts.get(letter) ?? 0);
+        const pip = this.pips[index];
+        if (delta !== 0 && pip) {
+          this.animateResourceCount(
+            pip.count,
+            delta,
+            pip.count.visible ? pip.count.x : this.avatarCx,
+            pip.count.visible ? pip.count.y : this.avatarCy,
+          );
+        }
+      });
+    }
+    this.renderedBadgeCounts = badgeCounts;
+    this.renderedManaCounts = manaCounts;
+    this.resourcesInitialized = true;
+  }
+
+  private animateResourceCount(count: Text, delta: number, x: number, y: number): void {
+    const color = delta > 0 ? this.theme.gameTheme.pt.buffed : this.theme.gameTheme.pt.lethal;
+    if (this.motionEnabled && count.visible) {
+      gsap.killTweensOf(count.scale);
+      gsap.fromTo(
+        count.scale,
+        { x: 1.3, y: 1.3 },
+        { x: 1, y: 1, duration: 0.35, ease: "back.out(2)" },
+      );
+    }
+    const floater = new Text({
+      text: delta > 0 ? `+${delta}` : String(delta),
+      style: this.styled(13, "900", color),
+    });
+    floater.anchor.set(0.5);
+    floater.position.set(x, y);
+    this.resourceFloatLayer.addChild(floater);
+    this.resourceFloaters.add(floater);
+    const finish = () => {
+      this.resourceFloaters.delete(floater);
+      if (!floater.destroyed) floater.destroy();
+    };
+    if (!this.motionEnabled) {
+      gsap.delayedCall(0.7, finish);
+      return;
+    }
+    gsap.to(floater, {
+      alpha: 0,
+      y: y - 22,
+      duration: 0.8,
+      ease: "power1.out",
+      onComplete: finish,
+    });
+  }
+
+  private washDamage(): void {
+    const gt = this.theme.gameTheme;
+    const r = this.avatarDia / 2;
+    this.damageWash.clear();
+    this.damageWash.circle(this.avatarCx, this.avatarCy, r);
+    this.damageWash.fill({ color: hexToNum(gt.pt.lethal), alpha: 0.55 });
+    this.damageWash.visible = true;
+    gsap.killTweensOf(this.damageWash);
+    gsap.fromTo(
+      this.damageWash,
+      { alpha: 1 },
+      {
+        alpha: 0,
+        duration: 0.55,
+        ease: "power1.out",
+        onComplete: () => {
+          if (!this.damageWash.destroyed) this.damageWash.visible = false;
+        },
+      },
+    );
+  }
+
+  private applyTargetable(): void {
+    const actionableZone =
+      this.compact && this.spec.badges.some((badge) => badge.zone && badge.actionable);
+    const mode = this.spec.isSelectedTarget
+      ? "solid"
+      : this.spec.isTargetable || actionableZone
+        ? this.motionEnabled
+          ? "pulse"
+          : "solid"
+        : "off";
+    if (mode === this.targetRingMode) {
+      if (mode !== "off") this.drawTargetRing();
+      return;
+    }
+    this.targetRingMode = mode;
+    this.targetTween?.kill();
+    this.targetTween = null;
+    if (mode === "off") {
+      this.targetRing.visible = false;
+      this.targetRing.clear();
+      return;
+    }
+    this.drawTargetRing();
+    this.targetRing.visible = true;
+    if (mode === "solid") {
+      this.targetRing.alpha = 1;
+      return;
+    }
+    this.targetTween = gsap.fromTo(
+      this.targetRing,
+      { alpha: 0.55 },
+      { alpha: 1, duration: 0.75, ease: "sine.inOut", repeat: -1, yoyo: true },
+    );
+  }
+
+  private drawTargetRing(): void {
+    const actionableZone =
+      this.compact &&
+      !this.spec.isTargetable &&
+      !this.spec.isSelectedTarget &&
+      this.spec.badges.some((badge) => badge.zone && badge.actionable);
+    const intent = this.spec.targetingIntent;
+    const game = this.theme.gameTheme;
+    const color = actionableZone
+      ? game.cardRing
+      : intent === "attack"
+        ? game.promptAction.attackAction
+        : intent === "block"
+          ? game.promptAction.defenseAction
+          : intent
+            ? intentIsHostile(intent)
+              ? game.targeting.hostile
+              : game.targeting.friendly
+            : game.cardSelection;
+    this.targetRing.clear();
+    if (actionableZone) {
+      this.targetRing.circle(this.avatarCx, this.avatarCy, this.avatarDia / 2 + 4);
+      this.targetRing.stroke({
+        color: hexToNum(color),
+        width: 6,
+        alpha: 0.2,
+      });
+    }
+    this.targetRing.circle(this.avatarCx, this.avatarCy, this.avatarDia / 2 + 1);
+    this.targetRing.stroke({
+      color: hexToNum(color),
+      width: 2,
+      alpha: 1,
+    });
+  }
+
+  private applyFlash(): void {
+    const flashing = this.spec.isFlashing;
+    if (!this.motionEnabled) {
+      this.flashRing.clear();
+      this.flashRing.visible = flashing;
+      this.flashRing.alpha = 1;
+      if (flashing) {
+        this.flashRing.circle(this.avatarCx, this.avatarCy, this.avatarDia / 2 + 4);
+        this.flashRing.stroke({ color: hexToNum(this.spec.color), width: 2, alpha: 0.8 });
+      }
+      this.prevFlashing = flashing;
+      return;
+    }
+    if (flashing && !this.prevFlashing && this.motionEnabled) {
+      const r = this.avatarDia / 2;
+      this.flashRing.clear();
+      this.flashRing.circle(this.avatarCx, this.avatarCy, r);
+      this.flashRing.stroke({ color: hexToNum(this.spec.color), width: 3, alpha: 1 });
+      this.flashRing.visible = true;
+      this.flashTween?.kill();
+      this.flashTween = gsap.fromTo(
+        this.flashRing,
+        { alpha: 1 },
+        {
+          alpha: 0,
+          duration: 0.6,
+          ease: "power2.out",
+          repeat: 1,
+          yoyo: true,
+          onComplete: () => {
+            if (!this.flashRing.destroyed) this.flashRing.visible = false;
+          },
+        },
+      );
+    }
+    this.prevFlashing = flashing;
+  }
+
+  private floatLifeDelta(delta: number, color: string): void {
+    if (this.column) return;
+    this.lifeFloat.text = delta > 0 ? `+${delta}` : String(delta);
+    this.lifeFloat.style = this.styled(Math.round(this.avatarDia * 0.42), "900", color);
+    this.lifeFloat.visible = true;
+    gsap.killTweensOf(this.lifeFloat);
+    gsap.fromTo(
+      this.lifeFloat,
+      { alpha: 1, x: this.life.x - this.life.width * (this.life.anchor.x - 0.5), y: this.life.y },
+      {
+        alpha: 0,
+        y: this.life.y - this.avatarDia * 0.8,
+        duration: 0.9,
+        ease: "power1.out",
+        onComplete: () => {
+          if (!this.lifeFloat.destroyed) this.lifeFloat.visible = false;
+        },
+      },
+    );
+  }
+
+  private applyCombatGlow(): void {
+    const lethal = this.spec.combatLethal;
+    if (this.spec.inCombat === this.combatActive && lethal === this.combatLethalActive) {
+      if (this.combatActive) this.drawCombatGlow();
+      return;
+    }
+    this.combatActive = this.spec.inCombat;
+    this.combatLethalActive = lethal;
+    this.combatPulse?.kill();
+    this.combatPulse = null;
+    if (this.combatActive) {
+      this.drawCombatGlow();
+      this.combatGlow.visible = true;
+      this.combatGlow.alpha = 1;
+      if (!this.motionEnabled) return;
+      this.combatPulse = gsap.to(this.combatGlow, {
+        alpha: lethal ? 0.7 : 0.5,
+        duration: lethal ? 0.4 : 0.9,
+        ease: "sine.inOut",
+        repeat: -1,
+        yoyo: true,
+      });
+    } else {
+      this.combatGlow.visible = false;
+      this.combatGlow.clear();
+    }
+  }
+
+  private drawCombatGlow(): void {
+    this.combatGlow.clear();
+    const r = this.avatarDia / 2;
+    const red = hexToNum(this.theme.gameTheme.pt.lethal);
+    const layers = this.combatLethalActive
+      ? [
+          { rr: r + 8, w: 10, a: 0.25 },
+          { rr: r + 3, w: 6, a: 0.6 },
+          { rr: r, w: 3, a: 1 },
+        ]
+      : [
+          { rr: r + 5, w: 7, a: 0.18 },
+          { rr: r + 2, w: 4, a: 0.45 },
+          { rr: r, w: 2, a: 0.95 },
+        ];
+    for (const layer of layers) {
+      this.combatGlow.circle(this.avatarCx, this.avatarCy, layer.rr);
+      this.combatGlow.stroke({ color: red, width: layer.w, alpha: layer.a });
+    }
+  }
+
+  private drawPromptReference(): void {
+    this.promptReferenceTween?.kill();
+    this.promptReferenceTween = null;
+    this.promptReferenceRing.clear();
+    this.promptReferenceRing.alpha = 1;
+    this.promptReferenceRing.visible = this.promptReferenceColor != null;
+    if (!this.promptReferenceColor || this.avatarDia <= 0) return;
+    const color = hexToNum(this.promptReferenceColor);
+    const radius = this.avatarDia / 2;
+    this.promptReferenceRing
+      .circle(this.avatarCx, this.avatarCy, radius + 7)
+      .stroke({ color, width: 8, alpha: 0.2 });
+    this.promptReferenceRing
+      .circle(this.avatarCx, this.avatarCy, radius + 2)
+      .stroke({ color, width: 3, alpha: 0.95 });
+    if (this.motionEnabled) {
+      this.promptReferenceTween = gsap.fromTo(
+        this.promptReferenceRing,
+        { alpha: 0.62 },
+        { alpha: 1, duration: 0.65, ease: "sine.inOut", repeat: -1, yoyo: true },
+      );
+    }
+  }
+
+  destroy(): void {
+    this.unsubscribeHandStyle?.();
+    this.unsubscribeLocale?.();
+    for (const request of this.handFaceRequests) request?.abort();
+    for (const sprite of this.handBacks) sprite.texture = Texture.EMPTY;
+    for (const texture of this.handFaceTextures) texture?.destroy(true);
+    this.combatPulse?.kill();
+    this.targetTween?.kill();
+    this.flashTween?.kill();
+    this.promptReferenceTween?.kill();
+    this.lifeTween?.kill();
+    this.offlineTween?.kill();
+    gsap.killTweensOf(this.combatGlow);
+    gsap.killTweensOf(this.life.scale);
+    gsap.killTweensOf(this.lifeFloat);
+    gsap.killTweensOf(this.damageWash);
+    for (const chip of this.chips) gsap.killTweensOf(chip.sprite);
+    for (const dot of this.sparkles.children) gsap.killTweensOf(dot);
+    for (const floater of this.resourceFloaters) {
+      gsap.killTweensOf(floater);
+      floater.destroy();
+    }
+    this.resourceFloaters.clear();
+    this.onHover(null);
+    this.container.destroy({ children: true });
+  }
+}

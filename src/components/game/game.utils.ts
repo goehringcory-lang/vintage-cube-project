@@ -1,0 +1,240 @@
+import type {
+  CardChoiceDto,
+  CardDto,
+  CheckpointDto,
+  ManaColor,
+  StackObjectDto,
+} from "@/protocol/game";
+import type { CardRulesSummary } from "@/types/manabrew";
+import type { AvailableAction, PaymentAction } from "@/protocol/prompts/common";
+import type { ClientCardDto } from "@/stores/gameStore.types";
+import type { ManaAbilityActionInfo } from "@/components/game/manaUtils";
+import { GAME_CARD_DEFAULTS } from "@/lib/gameCard";
+import {
+  CARD_H,
+  CARD_W,
+  GAME_CARD_SIZES,
+  PHASES,
+  PROMPT_LABELS,
+  PROMPT_MODAL_VIEWPORT_MARGIN,
+} from "./game.constants";
+import { isHorizontalGameCard } from "@/lib/horizontalGameCard";
+
+const MANA_COLOR_LABEL: Record<ManaColor, string> = {
+  W: `White`,
+  U: `Blue`,
+  B: `Black`,
+  R: `Red`,
+  G: `Green`,
+  C: `Colorless`,
+};
+
+export function fitPromptCardDimensions(
+  availableWidth: number,
+  viewportHeight: number,
+  maxHeight = Number.POSITIVE_INFINITY,
+  maxWidth: number = GAME_CARD_SIZES.preview.width,
+): { width: number; height: number } {
+  const availableCardHeight = Math.max(1, viewportHeight - PROMPT_MODAL_VIEWPORT_MARGIN);
+  const width = Math.min(
+    maxWidth,
+    (availableCardHeight * CARD_W) / CARD_H,
+    (Math.max(1, maxHeight) * CARD_W) / CARD_H,
+    Math.max(1, availableWidth),
+  );
+  return { width, height: (width * CARD_H) / CARD_W };
+}
+
+export function centeredCardRowOffset(
+  availableWidth: number,
+  cardCount: number,
+  cardWidth: number,
+  gap: number,
+): number {
+  const rowWidth = cardCount * cardWidth + Math.max(0, cardCount - 1) * gap;
+  return Math.max(0, (availableWidth - rowWidth) / 2);
+}
+
+export function promptCardDisplayDimensions(
+  card: CardDto,
+  portraitWidth: number,
+  face: 0 | 1,
+  rotated: boolean,
+): { width: number; height: number } {
+  const horizontal = isHorizontalGameCard(card, undefined, face);
+  const landscape = horizontal && (card.isDoubleFaced || !rotated);
+  const scale = portraitWidth / CARD_W;
+  return landscape
+    ? { width: CARD_H * scale, height: CARD_W * scale }
+    : { width: CARD_W * scale, height: CARD_H * scale };
+}
+
+export function isPermanentSpellCard(card: Pick<CardDto, "types">): boolean {
+  return !card.types.includes("Instant") && !card.types.includes("Sorcery");
+}
+export function manaAbilityInfos(
+  actions: Array<AvailableAction | PaymentAction>,
+): ManaAbilityActionInfo[] {
+  return actions.flatMap((a) =>
+    a.type === "activateManaAbility" || (a.type === "activateAbility" && a.isManaAbility)
+      ? [
+          {
+            cardId: a.cardId,
+            abilityIndex: a.abilityIndex,
+            description: a.description,
+            isManaAbility: true,
+            levelUp: a.levelUp,
+            cost: a.cost,
+            producedMana: a.producedMana,
+            actionId: a.id,
+          },
+        ]
+      : [],
+  );
+}
+export function getInitials(name: string): string {
+  return name
+    .split(" ")
+    .map((w) => w[0] ?? "")
+    .join("")
+    .toUpperCase()
+    .slice(0, 2);
+}
+export function getPromptLabel(promptType?: string): string {
+  if (!promptType) return `Waiting for your next decision`;
+  return PROMPT_LABELS[promptType] ?? promptType;
+}
+export function isCreature(card: Pick<CardRulesSummary, "types">): boolean {
+  return card.types?.some((t) => t.toLowerCase() === "creature") ?? false;
+}
+export function isLethalDamage(card: CardDto, queuedDamage = 0): boolean {
+  if (!card.toughness) return false;
+  const total = (card.damage ?? 0) + queuedDamage;
+  if (total <= 0) return false;
+  const toughness = parseInt(card.toughness, 10);
+  return !isNaN(toughness) && total >= toughness;
+}
+export type ScryfallImageSize = "small" | "normal" | "large" | "png" | "border_crop" | "art_crop";
+export function stackObjectToCard(obj: StackObjectDto): ClientCardDto {
+  if (obj.sourceCard) {
+    return {
+      ...GAME_CARD_DEFAULTS,
+      ...obj.sourceCard,
+      id: obj.sourceId,
+      zoneId: "stack",
+    };
+  }
+  return {
+    ...GAME_CARD_DEFAULTS,
+    id: obj.sourceId,
+    identity: obj.identity ?? GAME_CARD_DEFAULTS.identity,
+    text: "",
+    controllerId: obj.controllerId,
+    ownerId: obj.ownerId,
+    zoneId: "stack",
+    isFaceDown: !obj.identity,
+  };
+}
+export function stackObjectAbilityText(obj: StackObjectDto): string {
+  const sourceAbilityText = obj.sourceAbilityText?.trim();
+  if (sourceAbilityText) return sourceAbilityText;
+  return obj.isPermanentSpell ? "" : obj.text.trim();
+}
+export function getPreviewActionShortcut(
+  index: number,
+  classLevelUpIndex: number | null,
+  classLevel: number | null,
+): number {
+  if (classLevel !== null && index === classLevelUpIndex) return classLevel;
+  const actionPosition =
+    index - (classLevelUpIndex !== null && classLevelUpIndex < index ? 1 : 0) + 1;
+  return classLevel !== null && actionPosition >= classLevel ? actionPosition + 1 : actionPosition;
+}
+export interface CardChoiceIndicator {
+  key: string;
+  kind: CardChoiceDto["kind"];
+  label: string;
+  description: string;
+  colors: ManaColor[];
+}
+export function deriveCardChoiceIndicators(card: Pick<CardDto, "choices">): CardChoiceIndicator[] {
+  return (card.choices ?? []).map((choice, index) => {
+    switch (choice.kind) {
+      case "color": {
+        const label = choice.colors.map((color) => MANA_COLOR_LABEL[color]).join(" / ");
+        return {
+          key: `color-${index}`,
+          kind: choice.kind,
+          label,
+          description: `Chosen color: ${label}`,
+          colors: choice.colors,
+        };
+      }
+      case "type": {
+        const label = choice.values.join(", ");
+        return {
+          key: `type-${index}`,
+          kind: choice.kind,
+          label,
+          description: `Chosen type: ${label}`,
+          colors: [],
+        };
+      }
+      case "namedCard": {
+        const label = choice.names.join(", ");
+        return {
+          key: `named-card-${index}`,
+          kind: choice.kind,
+          label,
+          description: `Named card: ${label}`,
+          colors: [],
+        };
+      }
+      case "chosenCard": {
+        const label = choice.count === 1 ? `one card` : `${choice.count} cards`;
+        return {
+          key: `chosen-card-${index}`,
+          kind: choice.kind,
+          label,
+          description: `Chosen cards: ${choice.count}`,
+          colors: [],
+        };
+      }
+      case "number":
+        return {
+          key: `number-${index}`,
+          kind: choice.kind,
+          label: `#${choice.value}`,
+          description: `Chosen number: ${choice.value}`,
+          colors: [],
+        };
+      case "mode":
+        return {
+          key: `mode-${index}`,
+          kind: choice.kind,
+          label: choice.value,
+          description: `Chosen mode: ${choice.value}`,
+          colors: [],
+        };
+      case "player":
+        return {
+          key: `player-${choice.playerId}`,
+          kind: choice.kind,
+          label: choice.name,
+          description: `Chosen player: ${choice.name}`,
+          colors: [],
+        };
+    }
+  });
+}
+
+export function stepLabel(step: CheckpointDto["step"]): string {
+  return PHASES.find((phase) => phase.id === step)?.label ?? step;
+}
+
+export function checkpointLabel(checkpoint: CheckpointDto): string {
+  if (checkpoint.decision) {
+    return `decision #${checkpoint.checkpointId}, ${checkpoint.decision.toLowerCase()} (turn ${checkpoint.turn}, ${stepLabel(checkpoint.step)})`;
+  }
+  return `turn ${checkpoint.turn}, ${stepLabel(checkpoint.step)}`;
+}

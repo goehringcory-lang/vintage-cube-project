@@ -1,0 +1,181 @@
+import {
+  createDirectiveLane,
+  createSeat,
+  pollSeat,
+  writeDirectiveLane,
+  writeSeatMessage,
+} from "./seat.js";
+
+const LOCAL_SEAT = "local";
+
+/**
+ * The engine, less the four things a runtime decides: where its files are, how
+ * a worker starts, how bytes are read, and whether the runtime can host it at
+ * all. `forge.js` binds the browser to it, `node.js` binds Node.
+ */
+export class ForgeEngine {
+  constructor(platform, options = {}) {
+    this.platform = platform;
+    this.options = options;
+    this.locations = platform.locations(options);
+    this.worker = null;
+    this.ready = null;
+    this.requestId = 0;
+    this.pending = new Map();
+    this.seats = new Map();
+    this.directiveLanes = null;
+    this.localSeatIndex = 0;
+  }
+
+  async init() {
+    if (this.ready) return this.ready;
+    this.ready = new Promise((resolve, reject) => {
+      const unsupported = this.platform.unsupported();
+      if (unsupported) {
+        reject(new Error(unsupported));
+        return;
+      }
+      this.worker = this.platform.spawnWorker(this.locations.worker);
+      this.worker.onError((error) => reject(error));
+      this.worker.onMessage((message) => {
+        if (message?.type === "response") {
+          const pending = this.pending.get(message.requestId);
+          if (!pending) return;
+          this.pending.delete(message.requestId);
+          if (message.error) pending.reject(new Error(String(message.error)));
+          else pending.resolve(message.payload);
+          return;
+        }
+        if (message?.type !== "event") return;
+        if (message.event === "worker:init" && message.payload?.stage === "ready") resolve();
+        if (message.event === "game:sab") this.attachSeat(LOCAL_SEAT, message.payload.buffer);
+        if (message.event === "game:remote_sab") {
+          this.attachSeat(message.payload.playerSlot, message.payload.buffer);
+        }
+        if (message.event === "game:directive_lanes") {
+          this.dropDirectiveLanes();
+          this.directiveLanes = message.payload.buffers.map(createDirectiveLane);
+          this.localSeatIndex = message.payload.localSeat;
+        }
+        if (message.event === "game:seat_state") {
+          const { seat, state } = message.payload;
+          this.dispatchMessage(
+            { kind: "state", state },
+            seat === this.localSeatIndex ? LOCAL_SEAT : `player-${seat}`,
+          );
+        }
+        if (message.event === "game:seat_directive") {
+          const { seat, directive } = message.payload;
+          this.dispatchMessage(
+            { kind: "engineDirective", directive },
+            seat === this.localSeatIndex ? LOCAL_SEAT : `player-${seat}`,
+          );
+        }
+        if (["game:over", "game:forced_end"].includes(message.event)) {
+          this.dropDirectiveLanes();
+          if (message.event === "game:forced_end") {
+            for (const seat of this.seats.values()) seat.cancelled = true;
+          }
+          for (const pending of this.pending.values())
+            pending.reject(new Error("Forge game ended."));
+          this.pending.clear();
+        }
+        this.options.onEvent?.(message.event, message.payload);
+      });
+    });
+    return this.ready;
+  }
+
+  async startGame(args) {
+    await this.init();
+    return this.command("start_game", this.runtimeArgs(args));
+  }
+
+  async startMultiplayerGame(args) {
+    await this.init();
+    return this.command("start_multiplayer_game", this.runtimeArgs(args));
+  }
+
+  runtimeArgs(args) {
+    return {
+      ...args,
+      forgeLauncherUrl: this.locations.launcher,
+      forgeWasmUrl: this.locations.wasm,
+    };
+  }
+
+  command(command, args) {
+    if (!this.worker) return Promise.reject(new Error("Forge worker is not initialised."));
+    const requestId = String(++this.requestId);
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject });
+      this.worker.postMessage({ type: "command", command, requestId, args });
+    });
+  }
+
+  attachSeat(playerSlot, buffer) {
+    const seat = createSeat(buffer);
+    const previous = this.seats.get(playerSlot);
+    if (previous) previous.cancelled = true;
+    this.seats.set(playerSlot, seat);
+    pollSeat(
+      seat,
+      (message) => this.dispatchMessage(message, playerSlot),
+      (error) => this.options.onError?.(error),
+    );
+  }
+
+  dispatchMessage(message, seatSlot) {
+    const playerSlot = seatSlot === LOCAL_SEAT ? undefined : seatSlot;
+    this.options.onMessage?.(message, playerSlot);
+    if (message?.kind === "state") this.options.onState?.(message.state, playerSlot);
+    if (message?.kind === "prompt") {
+      const seat = this.seats.get(seatSlot);
+      if (seat && message.prompt?.input?.type === "gameOver") seat.cancelled = true;
+      this.options.onPrompt?.(message.prompt, playerSlot);
+    }
+    if (message?.kind === "engineDirective") {
+      this.options.onDirective?.(message.directive, playerSlot);
+    }
+    if (message?.kind === "error") this.options.onError?.(message.error, playerSlot);
+  }
+
+  respond(promptId, action, playerSlot = LOCAL_SEAT) {
+    const seat = this.seat(playerSlot);
+    if (!seat.awaitingResponse) throw new Error(`Forge seat ${playerSlot} is not awaiting input.`);
+    writeSeatMessage(seat, { kind: "response", promptId, action });
+  }
+
+  /** Written to the seat's directive lane, which the engine reads while it waits on any prompt. */
+  directive(directive, playerSlot = LOCAL_SEAT) {
+    if (!this.directiveLanes) throw new Error("Forge engine has no game running.");
+    const seatIndex =
+      playerSlot === LOCAL_SEAT ? this.localSeatIndex : Number(playerSlot.slice("player-".length));
+    writeDirectiveLane(this.directiveLanes[seatIndex], directive);
+  }
+
+  seat(playerSlot) {
+    const seat = this.seats.get(playerSlot);
+    if (!seat) throw new Error(`Forge seat ${playerSlot} is not available.`);
+    return seat;
+  }
+
+  dropDirectiveLanes() {
+    for (const lane of this.directiveLanes ?? []) {
+      lane.cancelled = true;
+      lane.queue.length = 0;
+    }
+    this.directiveLanes = null;
+  }
+
+  dispose() {
+    this.dropDirectiveLanes();
+    for (const seat of this.seats.values()) seat.cancelled = true;
+    this.seats.clear();
+    this.worker?.terminate();
+    this.worker = null;
+    for (const pending of this.pending.values())
+      pending.reject(new Error("Forge engine disposed."));
+    this.pending.clear();
+  }
+}

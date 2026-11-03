@@ -1,0 +1,342 @@
+import { useState } from "react";
+import { CardsInHandIcon } from "@/components/game/panels/CardsInHandIcon";
+import { HandCardStrip } from "@/components/game/panels/HandCardStrip";
+import { DialogCardInspector } from "@/components/game/modals/DialogCardInspector";
+import { useCardInspection } from "@/components/game/modals/cardInspection";
+import { GameIcon } from "@/components/game/GameIcon";
+import { ManaSymbols } from "@/components/game/ManaSymbols";
+import { Modal } from "@/components/game/modals/Modal";
+import { RING_ABILITIES } from "@/components/game/game.constants";
+import { useTheme } from "@/hooks/useTheme";
+import { cn } from "@/lib/utils";
+import { MANA_LETTERS, readableTextColor, withAlpha } from "@/themes/gameTheme";
+import type { GameIconName } from "@/components/game/GameIcon";
+import { PlayerRuleFacts } from "@/components/game/panels/PlayerRuleFacts";
+import type { PlayerHudBadge, PlayerHudSpec } from "@/pixi/hud/playerHud.types";
+import type { CardDto } from "@/protocol/game";
+
+interface PlayerSheetModalProps {
+  spec: PlayerHudSpec;
+  onClose: () => void;
+}
+
+export function PlayerSheetModal({ spec, onClose }: PlayerSheetModalProps) {
+  const theme = useTheme().gameTheme;
+  const playerTextColor = readableTextColor(spec.color, theme.canvas.shadow, theme.textOnTinted);
+  const [inspectedId, setInspectedId] = useState<string | null>(null);
+  const inspection = useCardInspection();
+  const inspected = spec.badges.find((badge) => badge.id === inspectedId)?.referenceCard;
+  const hand = spec.badges.find((badge) => badge.id === "hand");
+  const zones = spec.badges.filter((badge) => badge.zone);
+  const commanderDamage = spec.badges.filter((badge) => badge.id.startsWith("cmd-"));
+  const states = spec.badges.filter(
+    (badge) => badge.id !== "hand" && !badge.zone && !badge.id.startsWith("cmd-"),
+  );
+
+  return (
+    <Modal onClose={onClose} maxWidth="max-w-2xl">
+      <Modal.Header onClose={onClose} className="shrink-0">
+        <div className="flex items-center gap-3">
+          <span
+            aria-hidden="true"
+            className="relative flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full font-bold"
+            style={{ backgroundColor: spec.color, color: playerTextColor }}
+          >
+            {spec.avatarUrl ? (
+              <img
+                src={spec.avatarUrl}
+                crossOrigin="anonymous"
+                alt=""
+                className="absolute inset-0 h-full w-full object-cover"
+              />
+            ) : (
+              spec.name.slice(0, 1).toUpperCase()
+            )}
+          </span>
+          <div className="min-w-0 flex-1">
+            <h2 className="break-words text-lg font-semibold">{spec.name}</h2>
+            <p className="text-ui-meta text-muted-foreground">
+              {spec.isSelf ? "You" : spec.isBot ? "Bot player" : "Player details"}
+            </p>
+          </div>
+          <div className="shrink-0 text-right" style={{ color: theme.life }}>
+            <div className="text-3xl font-bold leading-none tabular-nums lining-nums">
+              {spec.life}
+            </div>
+            <div className="mt-1 text-ui-meta font-semibold uppercase tracking-wide">Life</div>
+          </div>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-1.5 text-ui-meta font-semibold">
+          {spec.isActiveTurn && (
+            <span className="rounded-full border border-active-action-active/30 bg-active-action-active/10 px-2 py-1 text-active-action-active">
+              Active turn
+            </span>
+          )}
+          {spec.isPriorityPlayer && (
+            <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-1 text-primary">
+              Has priority
+            </span>
+          )}
+          {spec.isDisconnected && (
+            <span className="rounded-full border border-border bg-muted/40 px-2 py-1 text-muted-foreground">
+              Disconnected
+            </span>
+          )}
+          {spec.isEliminated && (
+            <span className="rounded-full border border-pt-lethal/30 bg-pt-lethal/10 px-2 py-1 text-pt-lethal">
+              Eliminated
+            </span>
+          )}
+          {spec.inCombat && (
+            <span
+              className={cn(
+                "rounded-full border px-2 py-1",
+                spec.combatLethal
+                  ? "border-pt-lethal/30 bg-pt-lethal/10 text-pt-lethal"
+                  : "border-border bg-muted/40 text-muted-foreground",
+              )}
+            >
+              {spec.combatLethal ? "Potential lethal combat damage" : "In combat"}
+            </span>
+          )}
+        </div>
+      </Modal.Header>
+
+      <Modal.Body className="space-y-6">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,17rem),1fr))] gap-5">
+          <section aria-label="Cards and zones">
+            <h3 className="mb-2 text-ui-meta font-semibold text-muted-foreground">
+              Cards and zones
+            </h3>
+            <div className="grid grid-cols-[repeat(2,minmax(0,1fr))] gap-2">
+              <HandSummary
+                count={hand?.count ?? 0}
+                revealedCards={hand?.revealedCards ?? []}
+                onView={hand?.onTap}
+                actionable={hand?.actionable ?? false}
+                actionColor={hand?.color}
+              />
+              {zones.map((badge) => (
+                <ResourceTile key={badge.id} badge={badge} />
+              ))}
+            </div>
+          </section>
+
+          <section aria-label="Floating mana">
+            <h3 className="mb-2 text-ui-meta font-semibold text-muted-foreground">Floating mana</h3>
+            <dl className="grid grid-cols-3 gap-1.5">
+              {MANA_LETTERS.map((letter) => {
+                const count = spec.manaPool[letter] ?? 0;
+                return (
+                  <div
+                    key={letter}
+                    className={cn(
+                      "flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/25 px-2 py-2",
+                      count === 0 && "text-muted-foreground",
+                    )}
+                  >
+                    <dt className={cn("flex items-center", count === 0 && "opacity-45")}>
+                      <ManaSymbols cost={letter} size="lg" className="mx-0" />
+                    </dt>
+                    <dd className="text-ui-meta font-semibold tabular-nums lining-nums">{count}</dd>
+                  </div>
+                );
+              })}
+            </dl>
+          </section>
+        </div>
+
+        <PlayerRuleFacts facts={spec.ruleFacts} />
+
+        {states.length > 0 && <BadgeSection title="Player states" badges={states} />}
+
+        {commanderDamage.length > 0 && (
+          <BadgeSection
+            title="Commander damage by source"
+            badges={commanderDamage.map((badge) =>
+              badge.referenceCard ? { ...badge, onTap: () => setInspectedId(badge.id) } : badge,
+            )}
+          />
+        )}
+      </Modal.Body>
+      {inspected && (
+        <Modal onClose={() => setInspectedId(null)} maxWidth="max-w-md">
+          <Modal.Header onClose={() => setInspectedId(null)}>
+            <h2 className="text-base font-semibold">Commander source</h2>
+          </Modal.Header>
+          <Modal.Body>
+            <DialogCardInspector
+              card={inspected}
+              state={inspection.stateFor(inspected)}
+              onChange={(state) => inspection.change(inspected.id, state)}
+            />
+          </Modal.Body>
+        </Modal>
+      )}
+    </Modal>
+  );
+}
+
+function HandSummary({
+  count,
+  revealedCards,
+  onView,
+  actionable,
+  actionColor,
+}: {
+  count: number;
+  revealedCards: CardDto[];
+  onView?: () => void;
+  actionable: boolean;
+  actionColor?: string;
+}) {
+  const visibleCards = Math.min(3, count);
+  const Element = onView ? "button" : "div";
+  return (
+    <Element
+      onClick={onView}
+      aria-label={onView ? "View hand" : "Cards in hand"}
+      className={cn(
+        "col-span-2 flex min-h-16 items-center gap-3 rounded-md border bg-muted/25 px-3 py-2 text-left",
+        onView &&
+          "hover:border-card-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-card-ring motion-safe:transition-[scale,border-color,background-color] active:scale-[0.98]",
+      )}
+      style={
+        actionable && actionColor
+          ? {
+              borderColor: actionColor,
+              backgroundColor: withAlpha(actionColor, 0.12),
+              boxShadow: `0 0 14px ${withAlpha(actionColor, 0.45)}`,
+            }
+          : undefined
+      }
+    >
+      {revealedCards.length > 0 ? (
+        <HandCardStrip cards={revealedCards} count={count} />
+      ) : (
+        <CardsInHandIcon count={visibleCards} className="h-12 w-16" />
+      )}
+      <div className="min-w-0">
+        <p className="text-ui-meta text-muted-foreground">Cards in hand</p>
+        <p className="text-xl font-bold tabular-nums lining-nums">{count}</p>
+        {onView && <span className="text-ui-label text-muted-foreground">View</span>}
+      </div>
+    </Element>
+  );
+}
+
+function ResourceTile({ badge }: { badge: PlayerHudBadge }) {
+  const content = (
+    <>
+      <GameIcon
+        name={badge.icon as GameIconName}
+        className="h-4 w-4 shrink-0"
+        style={{ color: badge.color }}
+      />
+      <span className="min-w-0 flex-1 break-words text-ui-label">{badge.label}</span>
+      <span className="text-ui-meta font-bold tabular-nums lining-nums">{badge.count ?? 0}</span>
+      {badge.onTap && <span className="text-ui-label text-muted-foreground">View</span>}
+    </>
+  );
+  const actionStyle = badge.actionable
+    ? {
+        borderColor: badge.color,
+        backgroundColor: withAlpha(badge.color, 0.12),
+        boxShadow: `0 0 14px ${withAlpha(badge.color, 0.45)}`,
+      }
+    : undefined;
+  const className =
+    "flex min-h-11 touch:min-w-11 w-full flex-wrap items-center gap-2 rounded-md border bg-muted/25 px-2.5 py-2 text-left";
+
+  return badge.onTap ? (
+    <button
+      type="button"
+      className={cn(
+        className,
+        "hover:border-card-ring hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-card-ring motion-safe:transition-[scale,border-color,background-color] active:scale-[0.98]",
+      )}
+      style={actionStyle}
+      onClick={badge.onTap}
+    >
+      {content}
+    </button>
+  ) : (
+    <div className={className} style={actionStyle}>
+      {content}
+    </div>
+  );
+}
+
+function BadgeSection({ title, badges }: { title: string; badges: PlayerHudBadge[] }) {
+  return (
+    <section aria-label={title}>
+      <h3 className="mb-2 text-ui-meta font-semibold text-muted-foreground">{title}</h3>
+      <ul className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,15rem),1fr))] gap-1.5">
+        {badges.map((badge) => (
+          <li key={badge.id} className={cn(badge.id === "ring" && "col-span-full")}>
+            <BadgeRow badge={badge} />
+            {badge.id === "ring" && (
+              <ol className="mb-2 ml-8 mt-2 list-decimal space-y-2 pl-4 text-ui-body">
+                {RING_ABILITIES.map((ability, index) => {
+                  const active = index < (badge.count ?? 0);
+                  return (
+                    <li key={ability} className={cn(!active && "text-muted-foreground")}>
+                      <span className="font-semibold">{active ? "Active: " : "Not gained: "}</span>
+                      {ability}
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function BadgeRow({ badge }: { badge: PlayerHudBadge }) {
+  const content = (
+    <>
+      <GameIcon
+        name={badge.icon as GameIconName}
+        className="h-4 w-4 shrink-0"
+        style={{ color: badge.color }}
+      />
+      <span className="min-w-0 flex-1 break-words">{badge.label}</span>
+      {badge.lethal && (
+        <span className="shrink-0 text-ui-meta font-semibold text-pt-lethal">Lethal</span>
+      )}
+      {badge.count !== undefined && (
+        <span
+          className={cn(
+            "shrink-0 text-ui-meta font-bold tabular-nums lining-nums",
+            badge.lethal && "text-pt-lethal",
+          )}
+        >
+          {badge.count}
+        </span>
+      )}
+      {badge.onTap && <span className="shrink-0 text-ui-label text-muted-foreground">View</span>}
+    </>
+  );
+  const className = cn(
+    "flex min-h-11 touch:min-w-11 w-full flex-wrap items-center gap-2 rounded-md px-2.5 py-2 text-left text-ui-label",
+    badge.lethal ? "bg-pt-lethal/10" : "bg-muted/20",
+  );
+
+  return badge.onTap ? (
+    <button
+      type="button"
+      className={cn(
+        className,
+        "hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-card-ring motion-safe:transition-[scale,background-color] active:scale-[0.98]",
+      )}
+      onClick={badge.onTap}
+    >
+      {content}
+    </button>
+  ) : (
+    <div className={className}>{content}</div>
+  );
+}

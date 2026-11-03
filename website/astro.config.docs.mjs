@@ -1,0 +1,132 @@
+// @ts-check
+import { defineConfig } from "astro/config";
+import starlight from "@astrojs/starlight";
+
+// Docs site — served at the root of docs.manabrew.app. The landing page is a
+// separate build (astro.config.mjs, srcDir src-landing/).
+export default defineConfig({
+  site: "https://docs.manabrew.app",
+  outDir: "./dist/docs",
+  vite: {
+    server: {
+      fs: { allow: [".."] },
+    },
+  },
+  integrations: [
+    starlight({
+      title: "Manabrew",
+      description:
+        "An open-source Magic: The Gathering client and rules engine, built around Forge compatibility.",
+      favicon: "/favicon.svg",
+      head: [
+        {
+          tag: "link",
+          attrs: { rel: "icon", href: "/favicon.ico", sizes: "16x16 32x32 48x48" },
+        },
+        {
+          tag: "link",
+          attrs: {
+            rel: "icon",
+            href: "/favicon-32x32.png",
+            type: "image/png",
+            sizes: "32x32",
+          },
+        },
+        {
+          tag: "link",
+          attrs: { rel: "apple-touch-icon", href: "/apple-touch-icon.png" },
+        },
+      ],
+      social: [
+        {
+          icon: "github",
+          label: "GitHub",
+          href: "https://github.com/witchesofthehill/manabrew",
+        },
+        {
+          icon: "discord",
+          label: "Discord",
+          href: "https://discord.gg/NqrKpbhtcd",
+        },
+      ],
+      sidebar: [
+        {
+          label: "Start here",
+          items: [
+            { label: "What is Manabrew?", link: "/" },
+            "getting-started",
+            "download-windows",
+            "download-macos",
+            "download-ios",
+          ],
+        },
+        { label: "Playing", items: ["playing", "formats", "faq"] },
+        {
+          label: "Protocol",
+          items: [
+            "protocol",
+            "protocol/game-view",
+            {
+              label: "Prompts",
+              items: [
+                {
+                  label: "Choices",
+                  items: [
+                    "protocol/choose-number",
+                    "protocol/choose-cards",
+                    "protocol/choose-color",
+                    "protocol/choose-boolean",
+                    "protocol/choose-from-selection",
+                    "protocol/reveal-cards",
+                    "protocol/scry",
+                    "protocol/reorder",
+                    "protocol/dice-rolled",
+                  ],
+                },
+                {
+                  label: "Priority & costs",
+                  items: ["protocol/choose-action", "protocol/pay-mana-cost"],
+                },
+                {
+                  label: "Mulligan",
+                  items: ["protocol/mulligan", "protocol/mulligan-put-back"],
+                },
+                {
+                  label: "Combat & targeting",
+                  items: [
+                    "protocol/choose-attackers",
+                    "protocol/choose-blockers",
+                    "protocol/choose-damage-assignment-order",
+                    "protocol/choose-combat-damage-assignment",
+                    "protocol/choose-board-targets",
+                  ],
+                },
+                { label: "End", items: ["protocol/game-over"] },
+              ],
+            },
+            "protocol/shared-types",
+            "protocol/deck",
+          ],
+        },
+        {
+          label: "Hosting",
+          items: ["hosting-relay", "hosting-web-client", "hosting-full-stack", "self-hosting"],
+        },
+        { label: "Project", items: ["contributing", "releases", "terms", "privacy"] },
+      ],
+      editLink: {
+        baseUrl: "https://github.com/witchesofthehill/manabrew/edit/main/website/",
+      },
+      components: {
+        Head: "./src/components/Head.astro",
+        SiteTitle: "./src/components/SiteTitle.astro",
+      },
+      customCss: [
+        "@fontsource/alegreya-sans/700.css",
+        "@fontsource-variable/source-sans-3",
+        "@fontsource-variable/source-sans-3/wght-italic.css",
+        "./src/styles/starlight.css",
+      ],
+    }),
+  ],
+});

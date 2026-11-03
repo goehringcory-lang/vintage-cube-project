@@ -1,0 +1,96 @@
+import { SHORT_SCREEN_MAX_HEIGHT_PX } from "@/lib/responsive";
+import type {
+  PromptLayerPresentation,
+  ScryPromptHint,
+  ScryPromptLayout,
+} from "./PromptLayerPresentation";
+
+export class MobilePromptLayerPresentation implements PromptLayerPresentation {
+  readonly actionStyle = "minimal";
+  readonly selectionRowHeight = 64;
+  readonly selectionRowPitch = 70;
+  readonly scryHint: ScryPromptHint = {
+    centerOffsetY: 4,
+    deckSize: 32,
+    deckOffsetX: 3,
+    cardScale: 0.72,
+    arrowSize: 20,
+    arrowOffsetX: 13,
+    arrowOffsetY: 18,
+    iconSize: 32,
+    textOffsetY: 22,
+  };
+
+  cardLayout(viewportHeight: number): "grid" | "horizontal-scroll" {
+    return viewportHeight > SHORT_SCREEN_MAX_HEIGHT_PX ? "grid" : "horizontal-scroll";
+  }
+
+  modalHeight(viewportHeight: number, _requestedHeight: number, viewportMargin: number): number {
+    return viewportHeight - viewportMargin;
+  }
+
+  modalPromptWidth(
+    viewportWidth: number,
+    _maxWidth: number,
+    sourceWidth: number,
+    sourceGap: number,
+    hasSource: boolean,
+  ): number {
+    return hasSource && viewportWidth - sourceWidth - sourceGap >= 280
+      ? viewportWidth - sourceWidth - sourceGap
+      : viewportWidth;
+  }
+
+  selectionColumns(_allSingleChoice: boolean): number {
+    return 1;
+  }
+
+  cardMaxHeight(viewportHeight: number): number {
+    return Math.max(1, viewportHeight - 180);
+  }
+
+  reorderCardMaxHeight(viewportHeight: number, verticalReserve: number): number {
+    return Math.max(1, viewportHeight - verticalReserve);
+  }
+
+  colorChoiceLayout(
+    colorCount: number,
+    availableWidth: number,
+    gap: number,
+  ): { columns: number; buttonWidth: number; buttonHeight: number; grid: boolean } {
+    const columns = Math.min(3, colorCount);
+    return {
+      columns,
+      buttonWidth: (availableWidth - gap * (columns - 1)) / Math.max(1, columns),
+      buttonHeight: 52,
+      grid: true,
+    };
+  }
+
+  numberControlLayout(): {
+    gap: number;
+    edgeWidth: number;
+    stepWidth: number;
+    minimumValueWidth: number;
+  } {
+    return { gap: 6, edgeWidth: 44, stepWidth: 40, minimumValueWidth: 52 };
+  }
+
+  scryLayout(
+    viewportHeight: number,
+    cardCount: number,
+    battlefieldCardWidth: number,
+  ): ScryPromptLayout {
+    return {
+      stackDepth: Math.min(16, Math.max(0, cardCount - 1) * 16),
+      footerHeight: 52,
+      cardMaxHeight: Math.max(1, viewportHeight - 280),
+      destinationPortraitWidth: Math.min(42, battlefieldCardWidth),
+      cardHints: false,
+      overlapPoolCards: true,
+      zoneGap: 28,
+      destinationVerticalPadding: 10,
+      hint: this.scryHint,
+    };
+  }
+}

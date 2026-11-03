@@ -1,0 +1,257 @@
+import { useState, type Dispatch, type SetStateAction } from "react";
+import { Button } from "@/components/ui/button";
+import { AppSelect, AppSelectOption } from "@/components/ui/AppSelect";
+import { PHASES } from "@/components/game/game.constants";
+import {
+  PLAYGROUND_SCENARIOS,
+  type PlaygroundScenarioId,
+  type PlaygroundTable,
+} from "@/components/dev/boardPlayground.data";
+import type { StepKind } from "@/protocol/game";
+import { MANA_LETTERS, type ManaLetter } from "@/themes/gameTheme";
+
+interface BoardPlaygroundControlsProps {
+  table: PlaygroundTable;
+  setTable: Dispatch<SetStateAction<PlaygroundTable>>;
+  loadScenario: (scenario: PlaygroundScenarioId) => void;
+  overview: boolean;
+  setOverview: (overview: boolean) => void;
+  focusedPlayerId: string;
+  setFocusedPlayerId: (id: string) => void;
+}
+
+const SELECT_CLASS = "max-w-full rounded-md border border-input bg-background px-2 text-foreground";
+
+export function BoardPlaygroundControls({
+  table,
+  setTable,
+  loadScenario,
+  overview,
+  setOverview,
+  focusedPlayerId,
+  setFocusedPlayerId,
+}: BoardPlaygroundControlsProps) {
+  const [manaExpanded, setManaExpanded] = useState(table.scenario === "player-panels");
+  const changeMana = (playerId: string, letter: ManaLetter, delta: number) =>
+    setTable((current) => ({
+      ...current,
+      manaPools: {
+        ...current.manaPools,
+        [playerId]: {
+          ...current.manaPools[playerId],
+          [letter]: Math.max(0, (current.manaPools[playerId]?.[letter] ?? 0) + delta),
+        },
+      },
+    }));
+  return (
+    <div className="space-y-3 rounded-lg border border-border bg-card p-3">
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="grid min-w-0 gap-1 text-ui-label text-muted-foreground">
+          Scenario
+          <AppSelect
+            className={SELECT_CLASS}
+            value={table.scenario}
+            onValueChange={(value) => loadScenario(value as PlaygroundScenarioId)}
+          >
+            {PLAYGROUND_SCENARIOS.map((scenario) => (
+              <AppSelectOption key={scenario.id} value={scenario.id}>
+                {scenario.label}
+              </AppSelectOption>
+            ))}
+          </AppSelect>
+        </label>
+        <Button variant="outline" size="sm" onClick={() => loadScenario(table.scenario)}>
+          Reset scenario
+        </Button>
+        <Button
+          variant={overview ? "selected" : "outline"}
+          size="sm"
+          aria-pressed={overview}
+          onClick={() => setOverview(!overview)}
+        >
+          {overview ? "Overview" : "Focused table"}
+        </Button>
+        <label className="grid min-w-0 gap-1 text-ui-label text-muted-foreground">
+          Focus seat
+          <AppSelect
+            className={SELECT_CLASS}
+            value={focusedPlayerId}
+            onValueChange={setFocusedPlayerId}
+          >
+            {table.players.slice(1).map((player) => (
+              <AppSelectOption key={player.id} value={player.id}>
+                {player.name}
+              </AppSelectOption>
+            ))}
+          </AppSelect>
+        </label>
+      </div>
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="grid min-w-0 gap-1 text-ui-label text-muted-foreground">
+          Turn {table.turn}
+          <AppSelect
+            className={SELECT_CLASS}
+            value={table.activePlayerId}
+            onValueChange={(value) =>
+              setTable((current) => ({ ...current, activePlayerId: value }))
+            }
+          >
+            {table.players.map((player) => (
+              <AppSelectOption key={player.id} value={player.id}>
+                {player.name}
+              </AppSelectOption>
+            ))}
+          </AppSelect>
+        </label>
+        <label className="grid min-w-0 gap-1 text-ui-label text-muted-foreground">
+          Priority
+          <AppSelect
+            className={SELECT_CLASS}
+            value={table.priorityPlayerId}
+            onValueChange={(value) =>
+              setTable((current) => ({ ...current, priorityPlayerId: value }))
+            }
+          >
+            {table.players.map((player) => (
+              <AppSelectOption key={player.id} value={player.id}>
+                {player.name}
+              </AppSelectOption>
+            ))}
+          </AppSelect>
+        </label>
+        <label className="grid min-w-0 gap-1 text-ui-label text-muted-foreground">
+          Step
+          <AppSelect
+            className={SELECT_CLASS}
+            value={table.step}
+            onValueChange={(value) =>
+              setTable((current) => ({ ...current, step: value as StepKind }))
+            }
+          >
+            {PHASES.map((phase) => (
+              <AppSelectOption key={phase.id} value={phase.id}>
+                {phase.label}
+              </AppSelectOption>
+            ))}
+          </AppSelect>
+        </label>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() =>
+            setTable((current) => {
+              const next =
+                current.players[
+                  (current.players.findIndex((player) => player.id === current.activePlayerId) +
+                    1) %
+                    current.players.length
+                ]!;
+              return {
+                ...current,
+                activePlayerId: next.id,
+                priorityPlayerId: next.id,
+                turn: current.turn + 1,
+                step: "untap",
+                blocks: [],
+                cards: current.cards.map((card) => ({
+                  ...card,
+                  isAttacking: false,
+                  attackingPlayerId: undefined,
+                  attackTargetId: undefined,
+                  tapped: card.controllerId === next.id ? false : card.tapped,
+                })),
+              };
+            })
+          }
+        >
+          Next turn
+        </Button>
+        {table.players.map((player) => (
+          <label key={player.id} className="grid gap-1 text-ui-label text-muted-foreground">
+            {player.name.split(" · ")[0]} life
+            <input
+              className="h-8 touch:min-h-11 w-24 rounded-md border border-input bg-background px-2 text-ui-input text-foreground"
+              type="number"
+              value={table.life[player.id]}
+              onChange={(event) => {
+                const life = event.target.valueAsNumber;
+                if (Number.isFinite(life))
+                  setTable((current) => ({
+                    ...current,
+                    life: { ...current.life, [player.id]: life },
+                  }));
+              }}
+            />
+          </label>
+        ))}
+      </div>
+      <details open={manaExpanded} onToggle={(event) => setManaExpanded(event.currentTarget.open)}>
+        <summary className="min-h-8 touch:min-h-11 cursor-pointer text-ui-label font-medium text-foreground">
+          Floating mana
+        </summary>
+        <p className="mt-2 text-ui-body text-muted-foreground">
+          Add, spend, or clear mana without changing turn, priority, or focus.
+        </p>
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          {table.players.map((player) => (
+            <fieldset key={player.id} className="min-w-0 rounded-md border border-border p-2">
+              <legend className="px-1 text-ui-label font-medium text-foreground">
+                {player.name}
+              </legend>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(2.75rem,1fr))] gap-1">
+                {MANA_LETTERS.map((letter) => {
+                  const amount = table.manaPools[player.id]?.[letter] ?? 0;
+                  return (
+                    <div key={letter} className="grid justify-items-center gap-1">
+                      <span className="text-ui-label font-medium text-muted-foreground">
+                        {letter}
+                      </span>
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="h-8 w-8 touch:min-h-11 touch:min-w-11"
+                        aria-label={`Add ${letter} mana to ${player.name}`}
+                        onClick={() => changeMana(player.id, letter, 1)}
+                      >
+                        +
+                      </Button>
+                      <output
+                        className="text-ui-label tabular-nums text-foreground"
+                        aria-label={`${player.name} ${letter} mana`}
+                      >
+                        {amount}
+                      </output>
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="h-8 w-8 touch:min-h-11 touch:min-w-11"
+                        aria-label={`Spend ${letter} mana from ${player.name}`}
+                        disabled={amount === 0}
+                        onClick={() => changeMana(player.id, letter, -1)}
+                      >
+                        -
+                      </Button>
+                    </div>
+                  );
+                })}
+              </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="mt-2"
+                onClick={() =>
+                  setTable((current) => ({
+                    ...current,
+                    manaPools: { ...current.manaPools, [player.id]: {} },
+                  }))
+                }
+              >
+                Clear pool
+              </Button>
+            </fieldset>
+          ))}
+        </div>
+      </details>
+    </div>
+  );
+}

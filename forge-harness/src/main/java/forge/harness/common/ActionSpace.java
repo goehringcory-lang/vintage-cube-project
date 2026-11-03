@@ -1,0 +1,977 @@
+package forge.harness.common;
+
+import forge.ai.ComputerUtilMana;
+import forge.card.MagicColor;
+import forge.card.mana.ManaAtom;
+import forge.card.mana.ManaCost;
+import forge.card.mana.ManaCostShard;
+import forge.game.Game;
+import forge.game.GameActionUtil;
+import forge.game.GameEntity;
+import forge.game.GameObject;
+import forge.game.ability.AbilityUtils;
+import forge.game.card.Card;
+import forge.game.card.CardCollection;
+import forge.game.card.CardCollectionView;
+import forge.game.card.CardCopyService;
+import forge.game.card.CardLists;
+import forge.game.card.CardPredicates;
+import forge.game.mana.ManaCostBeingPaid;
+import forge.game.player.Player;
+import forge.game.spellability.AbilityManaPart;
+import forge.game.spellability.AlternativeCost;
+import forge.game.spellability.SpellAbility;
+import forge.game.spellability.SpellAbilityStackInstance;
+import forge.game.spellability.TargetRestrictions;
+import forge.game.staticability.StaticAbility;
+import forge.game.staticability.StaticAbilityLayer;
+import forge.game.staticability.StaticAbilityMode;
+import forge.game.cost.Cost;
+import forge.game.cost.CostAdjustment;
+import forge.game.cost.CostPart;
+import forge.game.cost.CostPartMana;
+import forge.game.cost.CostPayment;
+import forge.game.cost.CostSacrifice;
+import forge.game.zone.Zone;
+import forge.game.zone.ZoneType;
+import org.apache.commons.lang3.tuple.ImmutablePair;
+import org.apache.commons.lang3.tuple.Pair;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+public final class ActionSpace {
+    private static final String SPEND_ONLY_COLORED_ON_X =
+            "Spend only colored mana on X. No more than one mana of each color may be spent this way.";
+    private static final Pattern X_COMPARISON = Pattern.compile("(EQ|NE|LT|LE|GT|GE)X(?![A-Za-z0-9])");
+
+
+
+    private ActionSpace() {}
+
+    private static String actionBaseLabel(final SpellAbility sa) {
+        final String kind = sa.isCycling() ? "CYCLE"
+                : (sa.isLandAbility() ? "LAND"
+                : (sa.isSpell() ? "SPELL" : (sa.isManaAbility() ? "MANA" : "AB")));
+        final AlternativeCost altCost = sa.getAlternativeCost();
+        final String altTag = altCost == null ? "" : "#" + altCost.name();
+        final String hostName = sa.getHostCard().getName();
+        final String faceName = sa.getCardState() == null ? hostName : sa.getCardState().getName();
+        final String name = faceName == null || faceName.isBlank() || faceName.equals(hostName)
+                ? hostName
+                : hostName + "|" + faceName;
+        return kind + ":" + name + altTag;
+    }
+
+    public static List<String> buildMainActionLabels(final List<SpellAbility> actions) {
+        final List<String> baseLabels = new ArrayList<>(actions.size());
+        for (final SpellAbility sa : actions) {
+            baseLabels.add(actionBaseLabel(sa));
+        }
+
+        final Map<String, Integer> totals = new HashMap<>();
+        for (int i = 0; i < actions.size(); i++) {
+            final SpellAbility sa = actions.get(i);
+            final String key = baseLabels.get(i) + "|" + ParityCardMap.parityId(sa.getHostCard());
+            totals.put(key, totals.getOrDefault(key, 0) + 1);
+        }
+
+        final Map<String, Integer> seen = new HashMap<>();
+        final List<String> out = new ArrayList<>(actions.size());
+        for (int i = 0; i < actions.size(); i++) {
+            final SpellAbility sa = actions.get(i);
+            final String base = baseLabels.get(i);
+            final String key = base + "|" + ParityCardMap.parityId(sa.getHostCard());
+            final int total = totals.getOrDefault(key, 1);
+            final String withCostSuffix;
+            if (total <= 1) {
+                withCostSuffix = base;
+            } else {
+                final int idx = seen.getOrDefault(key, 0) + 1;
+                seen.put(key, idx);
+                withCostSuffix = base + "$" + idx;
+            }
+            out.add(withCostSuffix + "@" + ParityCardMap.parityId(sa.getHostCard()));
+        }
+        return out;
+    }
+
+    public static List<SpellAbility> getPossibleActions(final Player player, final boolean includeManaAbilities) {
+        return getPossibleActions(player, includeManaAbilities, false);
+    }
+
+    public static List<SpellAbility> getPossibleActions(
+            final Player player,
+            final boolean includeManaAbilities,
+            final boolean lifePaymentFallback
+    ) {
+        final Game game = player.getGame();
+        final Set<Card> candidates = new LinkedHashSet<>();
+
+        candidates.addAll(player.getCardsIn(ZoneType.Hand));
+        candidates.addAll(player.getCardsIn(ZoneType.Battlefield));
+        candidates.addAll(player.getCardsIn(ZoneType.Graveyard));
+        candidates.addAll(player.getCardsIn(ZoneType.Exile));
+        candidates.addAll(player.getCardsIn(ZoneType.Command));
+
+        candidates.addAll(game.getCardsIn(ZoneType.Battlefield));
+        candidates.addAll(game.getCardsIn(ZoneType.Exile));
+        candidates.addAll(game.getCardsIn(ZoneType.Command));
+
+        for (final Player p : game.getPlayers()) {
+            final CardCollectionView lib = p.getCardsIn(ZoneType.Library);
+            if (!lib.isEmpty()) {
+                candidates.add(lib.get(0));
+            }
+            if (p != player) {
+                p.getZone(ZoneType.Graveyard)
+                        .getCardsPlayerCanActivate(player)
+                        .forEach(candidates::add);
+            }
+        }
+
+        final List<SpellAbility> actions = new ArrayList<>();
+        final Map<Card, Card> spellHosts = new IdentityHashMap<>();
+        final MaybePay maybePay = new MaybePay(player);
+        boolean stackStatics = false;
+        try {
+        final List<SpellAbility> possible = new ArrayList<>();
+        for (final Card c : candidates) {
+            for (final SpellAbility sa : c.getAllPossibleAbilities(player, true)) {
+                sa.setActivatingPlayer(player);
+                possible.add(sa);
+                spellHost(sa, game, spellHosts);
+            }
+        }
+        if (!spellHosts.isEmpty()
+                && game.getAction().hasStaticAbilityAffectingZone(ZoneType.Stack, StaticAbilityLayer.ABILITIES)) {
+            stackStatics = true;
+            applyStackStatics(game, spellHosts.values());
+        }
+        for (final SpellAbility sa : possible) {
+            final Cost payCosts = sa.getPayCosts();
+            if (payCosts != null && payCosts.hasManaCost()) {
+                final Card probeHost = stackStatics ? spellHosts.get(sa.getHostCard()) : null;
+                if (!canPayMana(sa, player, lifePaymentFallback, probeHost, maybePay)) {
+                    continue;
+                }
+            }
+            if (!includeManaAbilities && sa.isManaAbility()) {
+                continue;
+            }
+            if (!targetsDependOnAnnouncedX(sa) && !hasValidTargets(sa)) {
+                continue;
+            }
+            if (!sa.checkRestrictions(spellHost(sa, game, spellHosts), player)) {
+                continue;
+            }
+            actions.add(sa);
+        }
+        } finally {
+            game.getAction().setHoldCheckingStaticAbilities(false);
+            game.getAction().checkStaticAbilities(false);
+            if (stackStatics) {
+                game.getTracker().clearDelayed();
+                game.getTracker().unfreeze();
+            }
+        }
+        return actions;
+    }
+
+    private static boolean canPayMana(
+            final SpellAbility sa,
+            final Player player,
+            final boolean lifePaymentFallback,
+            final Card probeHost,
+            final MaybePay maybePay
+    ) {
+        final Set<Card> reservedSacrifices = getFixedReservedSacrifices(sa);
+        final Card host = sa.getHostCard();
+        if (probeHost != null) {
+            sa.setHostCard(probeHost);
+        }
+        try {
+            if (canPayCurrentManaCost(sa, player, lifePaymentFallback, reservedSacrifices)
+                    || canMaybePay(sa, player, maybePay)) {
+                return true;
+            }
+            if (!lifePaymentFallback) {
+                return false;
+            }
+            if (canPayManaWithAnnouncedX(sa, player, reservedSacrifices)) {
+                return true;
+            }
+            if (costDependsOnTargets(sa)) {
+                return canPayManaWithTargets(sa, sa, player, reservedSacrifices);
+            }
+            return false;
+        } finally {
+            if (probeHost != null) {
+                sa.setHostCard(host);
+            }
+        }
+    }
+
+    private static boolean canPayCurrentManaCost(
+            final SpellAbility sa,
+            final Player player,
+            final boolean lifePaymentFallback,
+            final Set<Card> reservedSacrifices
+    ) {
+        return lifePaymentFallback
+                ? canPayManaCostWithLifeFallback(sa, player, reservedSacrifices)
+                : (reservedSacrifices.isEmpty()
+                ? ComputerUtilMana.canPayManaCost(sa, player, 0, false)
+                : canPayManaCostWithReservedSacrifices(sa, player, reservedSacrifices));
+    }
+
+    private static boolean canMaybePay(final SpellAbility sa, final Player player, final MaybePay maybePay) {
+        return maybePay.canPay(probeManaCost(sa.getPayCosts(), sa, player, false), sa);
+    }
+
+    private static boolean canPayManaWithAnnouncedX(
+            final SpellAbility sa,
+            final Player player,
+            final Set<Card> reservedSacrifices
+    ) {
+        if (sa.getXManaCostPaid() != null) {
+            return false;
+        }
+        int max = Integer.MAX_VALUE;
+        boolean hasVariableAmount = false;
+        for (final CostPart part : sa.getPayCosts().getCostParts()) {
+            if (!"X".equals(part.getAmount())) {
+                continue;
+            }
+            final Integer partMax = part.getMaxAmountX(sa, player, false);
+            if (partMax != null) {
+                max = Math.min(max, partMax);
+                hasVariableAmount = true;
+            }
+        }
+        if (!hasVariableAmount) {
+            return false;
+        }
+        try {
+            for (int amount = 1; amount <= max; amount++) {
+                sa.setXManaCostPaid(amount);
+                if (canPayCurrentManaCost(sa, player, true, reservedSacrifices)) {
+                    return true;
+                }
+            }
+        } finally {
+            sa.setXManaCostPaid(null);
+        }
+        return false;
+    }
+
+    private static boolean targetsDependOnAnnouncedX(final SpellAbility sa) {
+        if (sa.getXManaCostPaid() != null || sa.getPayCosts() == null || !sa.getPayCosts().hasXInAnyCostPart()) {
+            return false;
+        }
+        final String sVar = sa.getParamOrDefault("XAlternative", sa.getSVar("X"));
+        if (!"Count$xPaid".equals(sVar) && !sVar.isEmpty()) {
+            return false;
+        }
+        for (SpellAbility current = sa; current != null; current = current.getSubAbility()) {
+            if (!current.usesTargeting()) {
+                continue;
+            }
+            for (final String valid : current.getTargetRestrictions().getValidTgts()) {
+                if (X_COMPARISON.matcher(valid).find()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean costDependsOnTargets(final SpellAbility sa) {
+        if (sa.hasParam("ReduceCost")) {
+            return true;
+        }
+        final Card host = sa.getHostCard();
+        final Game game = host.getGame();
+        final CardCollection cards = new CardCollection(game.getCardsIn(ZoneType.Battlefield));
+        cards.addAll(game.getCardsIn(ZoneType.Stack));
+        cards.addAll(game.getCardsIn(ZoneType.Command));
+        cards.add(host);
+        for (final Card card : cards) {
+            for (final StaticAbility st : card.getStaticAbilities()) {
+                if (!st.matchesValidParam("ValidCard", host)) {
+                    continue;
+                }
+                if ((st.checkMode(StaticAbilityMode.ReduceCost) || st.checkMode(StaticAbilityMode.RaiseCost))
+                        && st.hasParam("ValidTarget")) {
+                    return true;
+                }
+                if (st.checkMode(StaticAbilityMode.ReduceCost) && st.hasParam("Relative")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean canPayManaWithTargets(
+            final SpellAbility sa,
+            final SpellAbility current,
+            final Player player,
+            final Set<Card> reservedSacrifices
+    ) {
+        if (current == null) {
+            return canPayCurrentManaCost(sa, player, true, reservedSacrifices);
+        }
+        if (!current.usesTargeting()) {
+            return canPayManaWithTargets(sa, current.getSubAbility(), player, reservedSacrifices);
+        }
+        if (current.getMaxTargets() > 1) {
+            return true;
+        }
+        current.resetTargets();
+        final List<GameObject> candidates = new ArrayList<>(
+                current.getTargetRestrictions().getAllCandidates(current, false));
+        for (final Pair<GameEntity, GameObject> stackCandidate : getStackTargetCandidates(current)) {
+            candidates.add(stackCandidate.getRight());
+        }
+        try {
+            return canPayManaWithTargetChoices(sa, current, player, reservedSacrifices, candidates, 0);
+        } finally {
+            current.resetTargets();
+        }
+    }
+
+    private static boolean canPayManaWithTargetChoices(
+            final SpellAbility sa,
+            final SpellAbility current,
+            final Player player,
+            final Set<Card> reservedSacrifices,
+            final List<GameObject> candidates,
+            final int firstCandidate
+    ) {
+        final int count = current.getTargets().size();
+        if (count >= current.getMinTargets()
+                && canPayManaWithTargets(sa, current.getSubAbility(), player, reservedSacrifices)) {
+            return true;
+        }
+        if (count >= current.getMaxTargets()) {
+            return false;
+        }
+        for (int i = firstCandidate; i < candidates.size(); i++) {
+            final GameObject candidate = candidates.get(i);
+            if (current.getTargets().contains(candidate) || !current.canTarget(candidate)) {
+                continue;
+            }
+            current.getTargets().add(candidate);
+            if (canPayManaWithTargetChoices(sa, current, player, reservedSacrifices, candidates, i + 1)) {
+                return true;
+            }
+            current.getTargets().remove(candidate);
+        }
+        return false;
+    }
+
+    private static void applyStackStatics(final Game game, final Collection<Card> spellHosts) {
+        game.getTracker().freeze();
+        final CardCollection preList = new CardCollection(spellHosts);
+        for (final Card host : preList) {
+            host.clearStaticChangedCardKeywords(false);
+        }
+        game.getAction().setHoldCheckingStaticAbilities(false);
+        game.getAction().checkStaticAbilities(false, new HashSet<>(preList), preList);
+        game.getAction().setHoldCheckingStaticAbilities(true);
+    }
+
+    private static Card spellHost(final SpellAbility sa, final Game game, final Map<Card, Card> cache) {
+        final Card card = sa.getHostCard();
+        if (!sa.isSpell()) {
+            return card;
+        }
+        final Card cached = cache.get(card);
+        if (cached != null) {
+            return cached;
+        }
+        // Mirrors AiController.canPlaySa: CantBeCast statics are normally evaluated after
+        // moveToStack, so a pre-cast probe has to supply the stack zone and origin itself.
+        final Card spellHost = CardCopyService.getLKICopy(card);
+        spellHost.setLKICMC(-1);
+        spellHost.setLastKnownZone(game.getStackZone());
+        spellHost.setCastFrom(card.getZone());
+        spellHost.setCastSA(sa);
+        cache.put(card, spellHost);
+        return spellHost;
+    }
+
+    public static List<Pair<GameEntity, GameObject>> getStackTargetCandidates(final SpellAbility sa) {
+        final List<Pair<GameEntity, GameObject>> valid = new ArrayList<>();
+        final TargetRestrictions tr = sa.getTargetRestrictions();
+        if (tr == null || !tr.getZone().contains(ZoneType.Stack)) {
+            return valid;
+        }
+
+        for (final SpellAbilityStackInstance si : sa.getHostCard().getGame().getStack()) {
+            final SpellAbility stackSa = si.getSpellAbility();
+            // CR 115.5: a spell or ability on the stack can't target itself.
+            if (stackSa == sa || stackSa.getId() == sa.getId()) {
+                continue;
+            }
+            if (!sa.canTarget(stackSa)) {
+                continue;
+            }
+            final Card sourceCard = si.getSourceCard();
+            if (sourceCard != null) {
+                valid.add(ImmutablePair.of(sourceCard, stackSa));
+            }
+        }
+        return valid;
+    }
+
+    private static Set<Card> getFixedReservedSacrifices(final SpellAbility sa) {
+        final Set<Card> reserved = new LinkedHashSet<>();
+        final Cost payCosts = sa.getPayCosts();
+        if (payCosts == null) {
+            return reserved;
+        }
+
+        for (final CostPart part : payCosts.getCostParts()) {
+            if (!(part instanceof CostSacrifice)) {
+                continue;
+            }
+            final CostSacrifice sacrifice = (CostSacrifice) part;
+            if (sacrifice.payCostFromSource()) {
+                reserved.add(sa.getHostCard());
+            } else if ("OriginalHost".equals(sacrifice.getType()) && sa.getOriginalHost() != null) {
+                reserved.add(sa.getOriginalHost());
+            }
+        }
+        return reserved;
+    }
+
+    private static boolean canPayManaCostWithReservedSacrifices(
+            final SpellAbility sa,
+            final Player player,
+            final Set<Card> reservedSacrifices
+    ) {
+        final ManaCost manaCost = sa.getPayCosts().getTotalMana();
+        return canPayManaCostFromCurrentSources(manaCost, sa, player, reservedSacrifices);
+    }
+
+    static boolean canPayManaCostWithLifeFallback(final SpellAbility sa, final Player player) {
+        return canPayManaCostWithLifeFallback(sa, player, getFixedReservedSacrifices(sa));
+    }
+
+    public static boolean canPayCost(
+            final Cost cost, final SpellAbility sa, final Player player, final boolean effect) {
+        return ComputerUtilMana.canPayManaCost(probeManaCost(cost, sa, player, effect), sa, player, effect)
+                && CostPayment.canPayAdditionalCosts(cost, sa, effect, player);
+    }
+
+    private static boolean canPayManaCostWithLifeFallback(
+            final SpellAbility sa,
+            final Player player,
+            final Set<Card> reservedSacrifices
+    ) {
+        final ManaCostBeingPaid base = probeManaCost(sa.getPayCosts(), sa, player, false);
+        if (reservedSacrifices.isEmpty()) {
+            if (ComputerUtilMana.canPayManaCost(base, sa, player, false)) {
+                return true;
+            }
+            // The fallback only ever spends life on a shard canPayShardWithLife accepts, and
+            // canPayManaOnly is strictly stricter than the check above, so without such a shard
+            // the whole search is a second probe with a foregone answer.
+            if (!hasLifePayableShard(base, player)) {
+                return false;
+            }
+        }
+        return canPayManaCostWithLifeFallback(
+                base, sa, player, false, reservedSacrifices, 0, new HashSet<>());
+    }
+
+    private static boolean hasLifePayableShard(final ManaCostBeingPaid cost, final Player player) {
+        final boolean lifeForBlack =
+                player.hasKeyword("PayLifeInsteadOf:B") && cost.hasAnyKind(ManaAtom.BLACK);
+        for (final ManaCostShard shard : ManaCostShard.values()) {
+            if (cost.getUnpaidShards(shard) > 0 && canPayShardWithLife(shard, lifeForBlack)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static ManaCostBeingPaid probeManaCost(
+            final Cost cost, final SpellAbility sa, final Player payer, final boolean effect) {
+        final Card host = sa.getHostCard();
+        Zone castFromBackup = null;
+        if (sa.isSpell() && !host.isInZone(ZoneType.Stack)) {
+            castFromBackup = host.getCastFrom();
+            host.setCastFrom(host.getZone());
+        }
+
+        final Cost payCosts = CostAdjustment.adjust(cost, sa, effect);
+        final CostPartMana manaPart = payCosts != null ? payCosts.getCostMana() : null;
+        final ManaCost mana = payCosts == null
+                ? ManaCost.NO_COST
+                : (manaPart == null ? ManaCost.ZERO : manaPart.getManaCostFor(sa));
+
+        final ManaCostBeingPaid manaCost = new ManaCostBeingPaid(mana);
+        final int xCounter = manaCost.getXcounter();
+        if (xCounter > 0) {
+            int manaToAdd = AbilityUtils.calculateAmount(
+                    host, sa.getParamOrDefault("XAlternative", "X"), sa) * xCounter;
+            if (manaToAdd < 1 && manaPart != null && manaPart.getXMin() > 0) {
+                manaToAdd = 1;
+            }
+            String xColor = sa.getXColor() == null ? "1" : sa.getXColor();
+            if (host.hasKeyword(SPEND_ONLY_COLORED_ON_X)) {
+                xColor = "WUBRGX";
+            }
+            manaCost.setXManaCostPaid(manaToAdd / xCounter, xColor);
+        }
+
+        CostAdjustment.adjust(manaCost, sa, payer, null, true, effect);
+
+        if (sa.isSpell() && !host.isInZone(ZoneType.Stack)) {
+            host.setCastFrom(castFromBackup);
+        }
+        return manaCost;
+    }
+
+    public static ManaCostShard chooseLifePaymentShard(
+            final ManaCostBeingPaid cost,
+            final SpellAbility sa,
+            final Player player,
+            final boolean effect
+    ) {
+        final boolean lifeForBlack =
+                player.hasKeyword("PayLifeInsteadOf:B") && cost.hasAnyKind(ManaAtom.BLACK);
+        ManaCostShard first = null;
+        for (final ManaCostShard shard : ManaCostShard.values()) {
+            if (cost.getUnpaidShards(shard) == 0 || !canPayShardWithLife(shard, lifeForBlack)) {
+                continue;
+            }
+            if (first == null) {
+                first = shard;
+            }
+            final ManaCostBeingPaid reduced = new ManaCostBeingPaid(cost);
+            reduced.decreaseShard(shard, 1);
+            if (canPayManaCostWithLifeFallback(
+                    reduced, sa, player, effect, getFixedReservedSacrifices(sa), 1, new HashSet<>())) {
+                return shard;
+            }
+        }
+        return first;
+    }
+
+    private static boolean canPayManaCostWithLifeFallback(
+            final ManaCostBeingPaid cost,
+            final SpellAbility sa,
+            final Player player,
+            final boolean effect,
+            final Set<Card> reservedSacrifices,
+            final int committedLifePayments,
+            final Set<String> failedStates
+    ) {
+        if (canPayManaOnly(cost, sa, player, effect, reservedSacrifices)) {
+            return true;
+        }
+        final int nextLifePayments = committedLifePayments + 1;
+        if (!player.canPayLife(2 * nextLifePayments, effect, sa)) {
+            return false;
+        }
+        final String state = committedLifePayments + ":" + cost;
+        if (!failedStates.add(state)) {
+            return false;
+        }
+        final boolean lifeForBlack =
+                player.hasKeyword("PayLifeInsteadOf:B") && cost.hasAnyKind(ManaAtom.BLACK);
+        for (final ManaCostShard shard : ManaCostShard.values()) {
+            if (cost.getUnpaidShards(shard) == 0 || !canPayShardWithLife(shard, lifeForBlack)) {
+                continue;
+            }
+            final ManaCostBeingPaid reduced = new ManaCostBeingPaid(cost);
+            reduced.decreaseShard(shard, 1);
+            if (canPayManaCostWithLifeFallback(
+                    reduced, sa, player, effect, reservedSacrifices, nextLifePayments, failedStates)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean canPayShardWithLife(final ManaCostShard shard, final boolean lifeForBlack) {
+        return shard.isPhyrexian() || (lifeForBlack && shard == ManaCostShard.BLACK);
+    }
+
+    private static boolean canPayManaOnly(
+            final ManaCostBeingPaid cost,
+            final SpellAbility sa,
+            final Player player,
+            final boolean effect,
+            final Set<Card> reservedSacrifices
+    ) {
+        if (!reservedSacrifices.isEmpty()) {
+            return canPayManaCostFromCurrentSources(cost.toManaCost(), sa, player, reservedSacrifices);
+        }
+        final boolean hadPolicy = sa.hasParam("AIPhyrexianPayment");
+        final String policy = sa.getParam("AIPhyrexianPayment");
+        sa.putParam("AIPhyrexianPayment", "Never");
+        try {
+            return ComputerUtilMana.canPayManaCost(cost, sa, player, effect);
+        } finally {
+            if (hadPolicy) {
+                sa.putParam("AIPhyrexianPayment", policy);
+            } else {
+                sa.removeParam("AIPhyrexianPayment");
+            }
+        }
+    }
+
+    public static boolean canPayManaCostFromCurrentSources(
+            final ManaCost manaCost,
+            final SpellAbility sa,
+            final Player player,
+            final Set<Card> reservedSacrifices
+    ) {
+        final List<Integer> sourceMasks = new ArrayList<>();
+
+        addFloatingManaSources(player, sourceMasks);
+        addBattlefieldManaSources(sa, player, reservedSacrifices == null ? Set.of() : reservedSacrifices, sourceMasks);
+
+        return canPayManaCostFromSources(manaCost, sourceMasks);
+    }
+
+    static void addFloatingManaSources(final Player player, final List<Integer> sourceMasks) {
+        for (int i = 0; i < player.getManaPool().getAmountOfColor(MagicColor.WHITE); i++) {
+            sourceMasks.add((int) ManaAtom.WHITE);
+        }
+        for (int i = 0; i < player.getManaPool().getAmountOfColor(MagicColor.BLUE); i++) {
+            sourceMasks.add((int) ManaAtom.BLUE);
+        }
+        for (int i = 0; i < player.getManaPool().getAmountOfColor(MagicColor.BLACK); i++) {
+            sourceMasks.add((int) ManaAtom.BLACK);
+        }
+        for (int i = 0; i < player.getManaPool().getAmountOfColor(MagicColor.RED); i++) {
+            sourceMasks.add((int) ManaAtom.RED);
+        }
+        for (int i = 0; i < player.getManaPool().getAmountOfColor(MagicColor.GREEN); i++) {
+            sourceMasks.add((int) ManaAtom.GREEN);
+        }
+        for (int i = 0; i < player.getManaPool().getAmountOfColor(MagicColor.COLORLESS); i++) {
+            sourceMasks.add(ManaAtom.COLORLESS);
+        }
+    }
+
+    private static void addBattlefieldManaSources(
+            final SpellAbility saBeingPaid,
+            final Player player,
+            final Set<Card> reservedSacrifices,
+            final List<Integer> sourceMasks
+    ) {
+        final Card excludedSource = (!saBeingPaid.isSpell() && saBeingPaid.getHostCard() != null
+                && saBeingPaid.getHostCard().isInPlay())
+                ? saBeingPaid.getHostCard()
+                : null;
+
+        for (final Card card : player.getCardsIn(ZoneType.Battlefield)) {
+            if (card == excludedSource) {
+                continue;
+            }
+
+            List<Integer> cardSourceMasks = new ArrayList<>();
+            for (final SpellAbility manaAbility : card.getManaAbilities()) {
+                if (!manaAbility.isManaAbility()) {
+                    continue;
+                }
+                if (manaAbility.getPayCosts() != null && manaAbility.getPayCosts().hasManaCost()) {
+                    continue;
+                }
+                manaAbility.setActivatingPlayer(player);
+                if (!manaAbility.canPlay() || !manaAbility.checkRestrictions(player)) {
+                    continue;
+                }
+                final AbilityManaPart manaPart = manaAbility.getManaPart();
+                if (manaPart == null || !manaPart.meetsManaRestrictions(saBeingPaid)) {
+                    continue;
+                }
+                if (manaAbility.getPayCosts() != null
+                        && !forge.game.cost.CostPayment.canPayAdditionalCosts(
+                        manaAbility.getPayCosts(),
+                        manaAbility,
+                        false,
+                        player
+                )) {
+                    continue;
+                }
+                if (!canPayWithReservedSacrifices(manaAbility, player, reservedSacrifices)) {
+                    continue;
+                }
+                cardSourceMasks = mergeAlternativeManaAbility(cardSourceMasks, producedManaMasks(manaAbility));
+            }
+
+            if (!cardSourceMasks.isEmpty()) {
+                sourceMasks.addAll(cardSourceMasks);
+                continue;
+            }
+
+            if (card.isLand() && !card.isTapped()) {
+                final int implicitMask = implicitLandManaMask(card);
+                if (implicitMask != 0) {
+                    sourceMasks.add(implicitMask);
+                }
+            }
+        }
+    }
+
+    static List<Integer> mergeAlternativeManaAbility(
+            final List<Integer> current,
+            final List<Integer> candidate
+    ) {
+        if (candidate.isEmpty()) {
+            return current;
+        }
+        if (current.isEmpty() || candidate.size() > current.size()) {
+            return new ArrayList<>(candidate);
+        }
+        if (candidate.size() < current.size()) {
+            return current;
+        }
+
+        final List<Integer> merged = new ArrayList<>(current.size());
+        for (int i = 0; i < current.size(); i++) {
+            merged.add(current.get(i) | candidate.get(i));
+        }
+        return merged;
+    }
+
+    private static boolean canPayWithReservedSacrifices(
+            final SpellAbility manaAbility,
+            final Player payer,
+            final Set<Card> reserved
+    ) {
+        final Cost payCosts = manaAbility.getPayCosts();
+        if (payCosts == null || reserved.isEmpty()) {
+            return true;
+        }
+
+        final Card source = manaAbility.getHostCard();
+        for (final CostPart part : payCosts.getCostParts()) {
+            if (!(part instanceof CostSacrifice)) {
+                continue;
+            }
+            final CostSacrifice sacrifice = (CostSacrifice) part;
+
+            if (sacrifice.payCostFromSource()) {
+                if (reserved.contains(source)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if ("OriginalHost".equals(sacrifice.getType())) {
+                final Card originalHost = manaAbility.getOriginalHost();
+                if (originalHost != null && reserved.contains(originalHost)) {
+                    return false;
+                }
+                continue;
+            }
+
+            final int amount = sacrifice.getAbilityAmount(manaAbility);
+            if ("All".equalsIgnoreCase(sacrifice.getAmount())) {
+                continue;
+            }
+
+            final CardCollectionView valid = CardLists.filter(
+                    CardLists.getValidCards(
+                            payer.getCardsIn(ZoneType.Battlefield),
+                            sacrifice.getType().split(";"),
+                            payer,
+                            source,
+                            manaAbility
+                    ),
+                    CardPredicates.canBeSacrificedBy(manaAbility, false)
+            );
+            int available = 0;
+            for (final Card card : valid) {
+                if (!reserved.contains(card)) {
+                    available++;
+                }
+            }
+            if (available < amount) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    static List<Integer> producedManaMasks(final SpellAbility manaAbility) {
+        final List<Integer> masks = new ArrayList<>();
+        final AbilityManaPart manaPart = manaAbility.getManaPart();
+        if (manaPart == null) {
+            return masks;
+        }
+
+        if (manaAbility.getApi() == forge.game.ability.ApiType.ManaReflected) {
+            int mask = 0;
+            for (final String colorName : forge.game.card.CardUtil.getReflectableManaColors(manaAbility)) {
+                mask |= ManaAtom.fromName(colorName);
+            }
+            for (int i = 0; i < manaAbility.amountOfManaGenerated(false) && mask != 0; i++) {
+                masks.add(mask);
+            }
+            return masks;
+        }
+
+        final String produced = manaPart.isComboMana()
+                ? manaPart.mana(manaAbility)
+                : GameActionUtil.generatedTotalMana(manaAbility);
+        int comboMask = 0;
+        for (final String token : produced.split(" ")) {
+            final String t = token.trim();
+            if (t.isEmpty()) {
+                continue;
+            }
+            final int tokenMask;
+            if ("Any".equalsIgnoreCase(t)) {
+                tokenMask = ManaAtom.WHITE | ManaAtom.BLUE | ManaAtom.BLACK | ManaAtom.RED | ManaAtom.GREEN;
+            } else {
+                tokenMask = ManaAtom.fromName(t);
+            }
+            if (tokenMask == 0) {
+                continue;
+            }
+            if (manaPart.isComboMana()) {
+                comboMask |= tokenMask;
+            } else {
+                masks.add(tokenMask);
+            }
+        }
+        for (int i = 0; i < manaAbility.amountOfManaGenerated(false) && comboMask != 0; i++) {
+            masks.add(comboMask);
+        }
+        return masks;
+    }
+
+    static int implicitLandManaMask(final Card card) {
+        int mask = 0;
+        if (card.getType().hasSubtype("Plains")) {
+            mask |= ManaAtom.WHITE;
+        }
+        if (card.getType().hasSubtype("Island")) {
+            mask |= ManaAtom.BLUE;
+        }
+        if (card.getType().hasSubtype("Swamp")) {
+            mask |= ManaAtom.BLACK;
+        }
+        if (card.getType().hasSubtype("Mountain")) {
+            mask |= ManaAtom.RED;
+        }
+        if (card.getType().hasSubtype("Forest")) {
+            mask |= ManaAtom.GREEN;
+        }
+        return mask;
+    }
+
+    private static boolean canPayManaCostFromSources(final ManaCost cost, final List<Integer> sourceMasks) {
+        final List<Integer> requirements = new ArrayList<>();
+        for (final ManaCostShard shard : cost) {
+            if (shard == ManaCostShard.X) {
+                continue;
+            }
+            final int colorMask = shard.getColorMask();
+            if (colorMask != 0) {
+                requirements.add(colorMask);
+            }
+        }
+        final int genericCount = cost.getGenericCost();
+        if (sourceMasks.size() < requirements.size() + genericCount) {
+            return false;
+        }
+
+        requirements.sort((a, b) -> {
+            final long countA = sourceMasks.stream().filter(src -> (src & a) != 0).count();
+            final long countB = sourceMasks.stream().filter(src -> (src & b) != 0).count();
+            if (countA != countB) {
+                return Long.compare(countA, countB);
+            }
+            return Integer.compare(a, b);
+        });
+
+        final Set<Integer> committed = new HashSet<>();
+        for (final int requirement : requirements) {
+            int bestIndex = -1;
+            int bestPop = Integer.MAX_VALUE;
+            int bestMask = Integer.MAX_VALUE;
+            for (int i = 0; i < sourceMasks.size(); i++) {
+                if (committed.contains(i)) {
+                    continue;
+                }
+                final int sourceMask = sourceMasks.get(i);
+                if ((sourceMask & requirement) == 0) {
+                    continue;
+                }
+                final int pop = Integer.bitCount(sourceMask);
+                if (pop < bestPop || (pop == bestPop && sourceMask < bestMask)) {
+                    bestIndex = i;
+                    bestPop = pop;
+                    bestMask = sourceMask;
+                }
+            }
+            if (bestIndex < 0) {
+                return false;
+            }
+            committed.add(bestIndex);
+        }
+
+        return sourceMasks.size() - committed.size() >= genericCount;
+    }
+
+    private static boolean hasValidTargets(final SpellAbility sa) {
+        SpellAbility current = sa;
+        while (current != null) {
+            if (current.usesTargeting()) {
+                // canTarget consults the already-chosen targets, so a selection left over from an
+                // earlier cast would shrink the candidate count. Clearing it here is safe because
+                // the real cast path re-runs SpellAbility.setupTargets, which clears them anyway.
+                current.resetTargets();
+                final TargetRestrictions tr = current.getTargetRestrictions();
+                if (tr == null) {
+                    return false;
+                }
+                final int minTargets = current.getMinTargets();
+                if (minTargets > 0) {
+                    final List<GameEntity> candidates = tr.getAllCandidates(current, false);
+                    final List<Pair<GameEntity, GameObject>> stackCandidates = getStackTargetCandidates(current);
+                    boolean hasEnoughCandidates = candidates.size() + stackCandidates.size() >= minTargets;
+                    if (tr.isDifferentControllers() || tr.isForEachPlayer()) {
+                        final Set<Player> controllers = new HashSet<>();
+                        for (final GameEntity candidate : candidates) {
+                            if (candidate instanceof Card) {
+                                controllers.add(((Card) candidate).getController());
+                            }
+                        }
+                        for (final Pair<GameEntity, GameObject> candidate : stackCandidates) {
+                            if (candidate.getLeft() instanceof Card) {
+                                controllers.add(((Card) candidate.getLeft()).getController());
+                            }
+                        }
+                        hasEnoughCandidates &= controllers.size() >= minTargets;
+                    }
+                    if (!hasEnoughCandidates) {
+                        return false;
+                    }
+                }
+            }
+            current = current.getSubAbility();
+        }
+        return true;
+    }
+}

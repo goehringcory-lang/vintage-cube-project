@@ -1,0 +1,581 @@
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+use crate::{prompts::common::TargetRef, TokenScript};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "game/index.ts")]
+pub enum ManaColor {
+    #[serde(rename = "W")]
+    White,
+    #[serde(rename = "U")]
+    Blue,
+    #[serde(rename = "B")]
+    Black,
+    #[serde(rename = "R")]
+    Red,
+    #[serde(rename = "G")]
+    Green,
+    #[serde(rename = "C")]
+    Colorless,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export, export_to = "game/index.ts")]
+pub enum CardChoiceDto {
+    Color { colors: Vec<ManaColor> },
+    Type { values: Vec<String> },
+    NamedCard { names: Vec<String> },
+    ChosenCard { count: usize },
+    Number { value: i32 },
+    Mode { value: String },
+    Player { player_id: String, name: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct Mana {
+    pub color: ManaColor,
+    pub amount: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub enum PlayerCounterKind {
+    Poison,
+    Energy,
+    Experience,
+    Radiation,
+    Ticket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub enum ZoneKind {
+    Battlefield,
+    Hand,
+    Library,
+    Graveyard,
+    Exile,
+    Command,
+    Attractions,
+    Junkyard,
+    Sideboard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub enum StepKind {
+    #[default]
+    Untap,
+    Upkeep,
+    Draw,
+    Main1,
+    CombatBegin,
+    CombatDeclareAttackers,
+    CombatDeclareBlockers,
+    CombatFirstStrikeDamage,
+    CombatDamage,
+    CombatEnd,
+    Main2,
+    EndOfTurn,
+    Cleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub enum DayTime {
+    #[default]
+    Neither,
+    Day,
+    Night,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "visibility",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export, export_to = "game/index.ts")]
+pub enum CardView {
+    Visible(CardDto),
+    Hidden { id: String },
+}
+
+// One entry per (zone, owner) pair; battlefield cards are bucketed by controller.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct ZoneDto {
+    pub zone: ZoneKind,
+    pub owner_id: String,
+    // Ordered top-first where order is public knowledge
+    // count can be > cards.len if hidden cards are present (library)
+    pub cards: Vec<CardView>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct GameViewDto {
+    pub game_id: String,
+    pub turn: u32,
+    pub step: StepKind,
+    pub combat_assignments: Vec<CombatAssignmentDto>,
+    pub active_player_id: String,
+    pub priority_player_id: String,
+    pub players: Vec<PlayerDto>,
+    pub zones: Vec<ZoneDto>,
+    pub stack: Vec<StackObjectDto>,
+    pub game_over: bool,
+    pub winner_id: Option<String>,
+    pub monarch_id: Option<String>,
+    pub initiative_holder_id: Option<String>,
+    pub day_time: DayTime,
+    #[ts(optional)]
+    pub active_plane_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointDto>,
+    #[serde(default)]
+    pub restore_vote: Option<RestoreVoteDto>,
+    #[serde(default)]
+    pub snapshot_recording: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub decision_history: Option<DecisionHistoryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct DecisionHistoryDto {
+    pub rewinding: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct RestoreVoteDto {
+    pub vote_id: u32,
+    pub checkpoint: CheckpointDto,
+    pub requested_by_player_id: String,
+    pub awaiting_player_ids: Vec<String>,
+    pub status: RestoreVoteStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export, export_to = "game/index.ts")]
+pub enum RestoreVoteStatus {
+    Pending,
+    Approved,
+    Declined { player_id: String },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct CheckpointDto {
+    pub checkpoint_id: u32,
+    pub turn: u32,
+    pub step: StepKind,
+    pub active_player_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub deciding_player_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct CombatAssignmentDto {
+    pub blocker_id: String,
+    pub attacker_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub enum PlayerStatus {
+    #[default]
+    Playing,
+    Lost,
+    Conceded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct DungeonStateDto {
+    pub name: String,
+    pub room: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct PlayerDto {
+    pub id: String,
+    pub name: String,
+    pub status: PlayerStatus,
+    pub is_human: bool,
+    pub life: i32,
+    #[serde(default)]
+    pub max_hand_size: i32,
+    #[serde(default)]
+    pub unlimited_hand_size: bool,
+    #[serde(default)]
+    pub lands_played_this_turn: i32,
+    #[serde(default)]
+    pub max_land_plays_per_turn: i32,
+    #[serde(default)]
+    pub unlimited_land_plays: bool,
+    #[serde(default)]
+    pub cards_drawn_this_turn: i32,
+    #[serde(default)]
+    pub damage_prevention: i32,
+    #[serde(default)]
+    pub is_extra_turn: bool,
+    #[serde(default)]
+    pub extra_turn_count: u32,
+    #[ts(optional)]
+    pub controlled_by: Option<String>,
+    #[serde(default)]
+    pub player_keywords: Vec<String>,
+    #[serde(default)]
+    #[ts(type = "Record<string, number>")]
+    pub commander_casts: HashMap<String, u32>,
+    #[ts(optional)]
+    pub dungeon_state: Option<DungeonStateDto>,
+    #[ts(optional)]
+    pub active_scheme_names: Option<Vec<String>>,
+    #[ts(optional)]
+    pub team_number: Option<i32>,
+    pub counters: BTreeMap<PlayerCounterKind, u32>,
+    pub mana_pool: BTreeMap<ManaColor, u32>,
+    #[ts(type = "Record<string, number>")]
+    pub commander_damage: HashMap<String, i32>,
+    pub has_city_blessing: bool,
+    pub has_enduring_story: bool,
+    pub ring_level: i32,
+    pub speed: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export, export_to = "game/index.ts")]
+pub struct CardIdentity {
+    pub name: String,
+    pub set_code: String,
+    pub card_number: String,
+    pub is_token: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub token_script: Option<TokenScript>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub enum RoomDoor {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export, export_to = "game/index.ts")]
+pub struct ClassLevelDto {
+    pub level: i32,
+    pub oracle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cost: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export, export_to = "game/index.ts")]
+pub struct SagaChapterDto {
+    pub chapters: Vec<i32>,
+    pub oracle: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export, export_to = "game/index.ts")]
+pub struct CardDto {
+    pub id: String,
+    pub identity: CardIdentity,
+    #[serde(
+        default,
+        deserialize_with = "crate::deck_dto::CardCosmetics::deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub cosmetics: Option<crate::deck_dto::CardCosmetics>,
+    pub color: String,
+    pub mana_cost: String,
+    pub cmc: i32,
+    pub types: Vec<String>,
+    pub subtypes: Vec<String>,
+    pub supertypes: Vec<String>,
+    pub power: Option<String>,
+    pub toughness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub base_power: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub base_toughness: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub final_chapter: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub class_level: Option<i32>,
+    pub class_levels: Vec<ClassLevelDto>,
+    pub saga_chapters: Vec<SagaChapterDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub unlocked_doors: Option<Vec<RoomDoor>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub is_solved: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub is_suspended: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub is_on_adventure: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub is_prototyped: Option<bool>,
+    pub text: String,
+    #[serde(default)]
+    pub choices: Vec<CardChoiceDto>,
+    pub controller_id: String,
+    pub owner_id: String,
+    pub tapped: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_crewed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_attacking: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attacking_player_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attack_target_id: Option<String>,
+    pub keywords: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub keyword_labels: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_keywords: Vec<String>,
+    // Keyed by the engine's canonical `CounterType` display form ("P1P1",
+    // "Loyalty", one-off counter names uppercase); both producers must match it.
+    #[ts(type = "Record<string, number>")]
+    pub counters: BTreeMap<String, u32>,
+    pub damage: i32,
+    pub summoning_sick: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_copy: bool,
+    pub is_double_faced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub face_index: Option<u8>,
+    pub is_transformed: bool,
+    pub is_face_down: bool,
+    pub is_bestowed: bool,
+    pub phased_out: bool,
+    pub exerted: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_ring_bearer: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attached_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_ids: Vec<String>,
+    // Mutate pile: the card ids merged under this top card.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_card_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub flashback_cost: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub kicker_cost: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub effective_mana_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub commander_tax: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub madness_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_madness_exiled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_plotted: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_warp_exiled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub foil: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub would_die_in_combat: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub zone: Option<ZoneKind>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export, export_to = "game/index.ts")]
+pub struct StackObjectDto {
+    pub id: String,
+    pub source_id: String,
+    pub controller_id: String,
+    pub owner_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub identity: Option<CardIdentity>,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_ability_text: Option<String>,
+    pub is_permanent_spell: bool,
+    pub is_casting: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_card: Option<CardDto>,
+    pub targets: Vec<TargetRef>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS, strum_macros::Display,
+)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub enum TargetingIntent {
+    #[default]
+    Damage,
+    Destroy,
+    Sacrifice,
+    Exile,
+    Bounce,
+    Mill,
+    Discard,
+    Counter,
+    Tap,
+    Untap,
+    Copy,
+    Buff,
+    Debuff,
+    Heal,
+    LoseLife,
+    Reveal,
+    Draw,
+    Fetch,
+    GainControl,
+    Fight,
+    Attach,
+    Attack,
+    Block,
+    Hostile,
+    Friendly,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "game/index.ts")]
+pub struct PlaymatSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub opacity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub texture: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub border_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub border_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub fit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub offset_x: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub offset_y: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub zoom: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub blur: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub brightness: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export, export_to = "game/index.ts")]
+pub enum GameFormat {
+    Any,
+    Standard,
+    Pioneer,
+    Modern,
+    Legacy,
+    Vintage,
+    Pauper,
+    Premodern,
+    Commander,
+    PauperCommander,
+    Brawl,
+    Oathbreaker,
+    Draft,
+    Sealed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[ts(export, export_to = "game/index.ts")]
+pub enum EngineKind {
+    #[default]
+    Manabrew,
+    Forge,
+    Ironsmith,
+}

@@ -1,0 +1,491 @@
+import { create } from "zustand";
+import { persist, devtools } from "zustand/middleware";
+import { getServerConnectionDefaults } from "@/config/webRuntimeConfig";
+import { STORAGE_KEYS } from "@/lib/constants";
+import { ensureUsernameTag, hasUsernameTag } from "@/lib/username";
+import type { AiOpponentRef } from "@/lib/aiOpponent";
+import type { KnownRelay } from "@/config/knownRelays";
+import type { PlaymatSettings } from "@/protocol/game";
+import type { AiController, GameFormat } from "@/types/server";
+import type { HandOrderMode } from "@/lib/handOrder";
+import { APP_LOCALES, type AppLanguagePreference } from "@/i18n/locales";
+import { DEFAULT_BOARD_BACKGROUND_ID, type BoardBackgroundId } from "@/pixi/board/boardBackgrounds";
+import type { ThemeColors } from "@/themes/appTheme";
+import type { ThemeMode } from "@/themes/themeDocument";
+
+export type ZonePanelItem = "library" | "graveyard" | "exile";
+export type CardPreviewMode = "hover" | "right-click";
+export type BattlefieldCardStyle = "realistic" | "art" | "frame";
+export type InGameCardPreviewStyle = "printed" | "rules";
+export type InGameCardPreviewSize = "small" | "medium" | "large";
+export type InlineCardStyle = "printed" | "rules";
+export type OpponentHandFanMode = "always" | "revealed" | "never";
+
+const CARD_VIEW_DEFAULTS = {
+  battlefieldCardStyle: "realistic",
+  inGameCardPreviewStyle: "printed",
+  handCardStyle: "printed",
+  stackCardStyle: "rules",
+  promptCardStyle: "printed",
+} as const;
+
+export interface LastRoomSetup {
+  kind: "match" | "limited";
+  limitedKind: "draft" | "sealed" | "winston" | "cube";
+  format: GameFormat;
+  players: number | null;
+}
+
+export const CARD_SIZE_MULTIPLIER_MIN = 0.75;
+// Under the 2-rows-minimum battlefield rule, a 2-row fill is only ~1.35-1.5x
+// the classic 3-row size on ANY display — a knob past 150% would be a lie
+// (the old 300% top was one: everything saturated around 150%).
+export const CARD_SIZE_MULTIPLIER_MAX = 1.5;
+
+export const SOUND_VOLUME_MIN = 0;
+export const SOUND_VOLUME_MAX = 1;
+export const SOUND_VOLUME_STEP = 0.05;
+const DEFAULT_SOUND_VOLUME = 0.5;
+
+export interface PreferencesState {
+  personalThemeName: string | null;
+  appLanguage: AppLanguagePreference;
+  setAppLanguage: (language: AppLanguagePreference) => void;
+
+  flashDurationMs: number;
+  setFlashDurationMs: (ms: number) => void;
+
+  soundMuted: boolean;
+  soundVolume: number;
+  toggleSoundMuted: () => void;
+  setSoundVolume: (volume: number) => void;
+
+  serverHost: string;
+  serverPort: number;
+  serverUsername: string;
+  serverPassword: string;
+  setServerHost: (host: string) => void;
+  setServerPort: (port: number) => void;
+  setServerUsername: (username: string) => void;
+  setServerPassword: (password: string) => void;
+
+  savedServers: KnownRelay[];
+  addSavedServer: (server: KnownRelay) => void;
+  removeSavedServer: (name: string) => void;
+
+  defaultPlaymatAssetId?: string;
+  defaultPlaymatSettings?: PlaymatSettings;
+  setDefaultPlaymatAssetId: (assetId: string | undefined) => void;
+  setDefaultPlaymatSettings: (settings: PlaymatSettings | undefined) => void;
+
+  zonePanelOrder: ZonePanelItem[];
+  setZonePanelOrder: (order: ZonePanelItem[]) => void;
+
+  battlefieldAutoSort: boolean;
+  setBattlefieldAutoSort: (value: boolean) => void;
+  handOrderMode: HandOrderMode;
+  setHandOrderMode: (mode: HandOrderMode) => void;
+  opponentLayout: "focused" | "overview";
+  setOpponentLayout: (layout: "focused" | "overview") => void;
+  opponentHandFan: OpponentHandFanMode;
+  setOpponentHandFan: (mode: OpponentHandFanMode) => void;
+
+  // One knob for card size: battlefield cards on ALL fields plus the hand
+  // fan. 1 = the classic 3-row board; 1.5 = the 2-row fill that is the
+  // geometric max under the 2-rows-minimum rule (a 1-row board is
+  // unplayable). Each field clamps against its own height; the hand
+  // (viewport-scaled, following the slider at half rate — useHandScale)
+  // grows past the battlefield's cap, up to a fraction of the field height
+  // (BoardCanvas.reconfigure).
+  cardSizeMultiplier: number;
+  setCardSizeMultiplier: (multiplier: number) => void;
+
+  // Freezes the deck/graveyard/exile/command tiles in place so a drag can't
+  // accidentally reposition them; tap-to-open keeps working.
+  lockZoneTiles: boolean;
+  setLockZoneTiles: (value: boolean) => void;
+
+  // Only the Pixi battlefield reads this; hand, stack, and modals always use
+  // the image.
+  battlefieldCardStyle: BattlefieldCardStyle;
+  setBattlefieldCardStyle: (style: BattlefieldCardStyle) => void;
+
+  boardBackgroundId: BoardBackgroundId;
+  setBoardBackgroundId: (id: BoardBackgroundId) => void;
+
+  // Perf escape hatch for weaker hardware; the board still functions when off
+  // (cards move, state indicators stay).
+  inGameAnimations: boolean;
+  setInGameAnimations: (value: boolean) => void;
+
+  preloadCardImages: boolean;
+  setPreloadCardImages: (value: boolean) => void;
+
+  chooseOrderOnMultipleTriggers: boolean;
+  setChooseOrderOnMultipleTriggers: (value: boolean) => void;
+
+  // Opt-in for the experimental Ironsmith trusted engine. Off by default so the
+  // engine ships dark in prod; the runtime registry and lobby tile also gate on
+  // the compile flag + `IRONSMITH_WASM_AVAILABLE`, so this only surfaces it
+  // where the real wasm is bundled.
+  ironsmithRuntimeEnabled: boolean;
+  setIronsmithRuntimeEnabled: (value: boolean) => void;
+
+  // P2P game traffic. Every player must opt in or the room stays on the relay.
+  directTransport: boolean;
+  setDirectTransport: (value: boolean) => void;
+
+  aiController: AiController;
+  setAiController: (controller: AiController) => void;
+
+  hideAccountSaveNudge: boolean;
+  setHideAccountSaveNudge: (value: boolean) => void;
+
+  cardPreviewMode: CardPreviewMode;
+  setCardPreviewMode: (mode: CardPreviewMode) => void;
+
+  cardHoverDelayMs: number;
+  setCardHoverDelayMs: (ms: number) => void;
+  inGameCardPreviewStyle: InGameCardPreviewStyle;
+  setInGameCardPreviewStyle: (style: InGameCardPreviewStyle) => void;
+  inGameCardPreviewSize: InGameCardPreviewSize;
+  setInGameCardPreviewSize: (size: InGameCardPreviewSize) => void;
+  handCardStyle: InlineCardStyle;
+  setHandCardStyle: (style: InlineCardStyle) => void;
+  stackCardStyle: InlineCardStyle;
+  setStackCardStyle: (style: InlineCardStyle) => void;
+  promptCardStyle: InlineCardStyle;
+  setPromptCardStyle: (style: InlineCardStyle) => void;
+
+  appThemeColorOverrides: Record<ThemeMode, Partial<ThemeColors>>;
+  setAppThemeColorOverride: (mode: ThemeMode, key: keyof ThemeColors, color: string) => void;
+  resetAppThemeColorOverrides: (mode: ThemeMode) => void;
+
+  gameThemeColorOverrides: Record<string, string>;
+  setGameThemeColorOverride: (path: string, color: string) => void;
+  resetGameThemeColorOverrides: () => void;
+
+  lastPlayedDeckId: string | null;
+  lastPlayedAtByDeck: Record<string, number>;
+  setLastPlayedDeckId: (id: string | null) => void;
+
+  lastOfflineFormatId: string | null;
+  setLastOfflineFormatId: (formatId: string) => void;
+
+  lastAiOpponent: AiOpponentRef | null;
+  setLastAiOpponent: (opponent: AiOpponentRef) => void;
+
+  lastRoomSetup: LastRoomSetup | null;
+  setLastRoomSetup: (setup: LastRoomSetup) => void;
+  tableBackground: BoardBackgroundId;
+  mobileHandedness: "right" | "left";
+  setTableBackground: (background: BoardBackgroundId) => void;
+  hapticFeedback: boolean;
+  setHapticFeedback: (enabled: boolean) => void;
+  setMobileHandedness: (handedness: "right" | "left") => void;
+}
+
+const PERSISTED_PREFERENCE_KEYS = [
+  "personalThemeName",
+  "appLanguage",
+  "flashDurationMs",
+  "soundMuted",
+  "soundVolume",
+  "serverHost",
+  "serverPort",
+  "serverUsername",
+  "serverPassword",
+  "savedServers",
+  "defaultPlaymatAssetId",
+  "defaultPlaymatSettings",
+  "zonePanelOrder",
+  "battlefieldAutoSort",
+  "handOrderMode",
+  "opponentLayout",
+  "opponentHandFan",
+  "cardSizeMultiplier",
+  "lockZoneTiles",
+  "battlefieldCardStyle",
+  "boardBackgroundId",
+  "inGameAnimations",
+  "mobileHandedness",
+  "hapticFeedback",
+  "preloadCardImages",
+  "chooseOrderOnMultipleTriggers",
+  "ironsmithRuntimeEnabled",
+  "directTransport",
+  "aiController",
+  "hideAccountSaveNudge",
+  "cardPreviewMode",
+  "cardHoverDelayMs",
+  "inGameCardPreviewStyle",
+  "inGameCardPreviewSize",
+  "handCardStyle",
+  "stackCardStyle",
+  "promptCardStyle",
+  "appThemeColorOverrides",
+  "gameThemeColorOverrides",
+  "lastPlayedDeckId",
+  "lastPlayedAtByDeck",
+  "lastOfflineFormatId",
+  "lastAiOpponent",
+  "lastRoomSetup",
+  "tableBackground",
+] as const satisfies readonly (keyof PreferencesState)[];
+
+function pickPersistedPreferences(persistedState: unknown): Partial<PreferencesState> {
+  if (!persistedState || typeof persistedState !== "object") return {};
+  const persisted = persistedState as Record<string, unknown>;
+  const next: Record<string, unknown> = {};
+  for (const key of PERSISTED_PREFERENCE_KEYS) {
+    if (key in persisted) next[key] = persisted[key];
+  }
+  const appOverrides = next.appThemeColorOverrides;
+  if (appOverrides && typeof appOverrides === "object" && !Array.isArray(appOverrides)) {
+    const overrides = appOverrides as Record<string, unknown>;
+    if (!("light" in overrides) && !("dark" in overrides)) {
+      next.appThemeColorOverrides = { light: { ...overrides }, dark: { ...overrides } };
+    } else {
+      next.appThemeColorOverrides = {
+        light: overrides.light ?? {},
+        dark: overrides.dark ?? {},
+      };
+    }
+  } else {
+    delete next.appThemeColorOverrides;
+  }
+  // Treat a persisted empty username as "unset" so the auto-generated default
+  // wins on rehydrate. Without this, users who once had the empty default
+  // saved would never get a generated name.
+  if (next.serverUsername === "") delete next.serverUsername;
+  if (next.cardPreviewMode === "click") delete next.cardPreviewMode;
+  // Values saved while the slider still went to 300% clamp to the new max.
+  if (typeof next.cardSizeMultiplier === "number") {
+    next.cardSizeMultiplier = Math.max(
+      CARD_SIZE_MULTIPLIER_MIN,
+      Math.min(CARD_SIZE_MULTIPLIER_MAX, next.cardSizeMultiplier),
+    );
+  }
+  if (typeof next.soundVolume === "number" && Number.isFinite(next.soundVolume)) {
+    if (next.soundVolume <= SOUND_VOLUME_MIN) {
+      next.soundMuted = true;
+      next.soundVolume = DEFAULT_SOUND_VOLUME;
+    } else {
+      next.soundVolume = Math.max(SOUND_VOLUME_STEP, Math.min(SOUND_VOLUME_MAX, next.soundVolume));
+    }
+  } else {
+    delete next.soundVolume;
+  }
+  if (typeof next.soundMuted !== "boolean") delete next.soundMuted;
+  if (next.cardPreviewMode !== "hover" && next.cardPreviewMode !== "right-click") {
+    next.cardPreviewMode = "hover";
+  }
+  if (
+    next.appLanguage !== "system" &&
+    (typeof next.appLanguage !== "string" || !(next.appLanguage in APP_LOCALES))
+  ) {
+    delete next.appLanguage;
+  }
+  return next as Partial<PreferencesState>;
+}
+
+function generateGuestUsername(): string {
+  return `player-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export const usePreferencesStore = create<PreferencesState>()(
+  devtools(
+    persist(
+      (set) => {
+        const serverDefaults = getServerConnectionDefaults();
+        return {
+          ...CARD_VIEW_DEFAULTS,
+          personalThemeName: null,
+          appLanguage: "system",
+          setAppLanguage: (appLanguage) => set({ appLanguage }),
+
+          flashDurationMs: 1000,
+          setFlashDurationMs: (ms) => set({ flashDurationMs: ms }),
+
+          soundMuted: false,
+          soundVolume: DEFAULT_SOUND_VOLUME,
+          toggleSoundMuted: () => set((state) => ({ soundMuted: !state.soundMuted })),
+          setSoundVolume: (volume) =>
+            set(
+              volume <= SOUND_VOLUME_MIN
+                ? { soundMuted: true }
+                : {
+                    soundMuted: false,
+                    soundVolume: Math.max(SOUND_VOLUME_STEP, Math.min(SOUND_VOLUME_MAX, volume)),
+                  },
+            ),
+
+          serverHost: serverDefaults.host,
+          serverPort: serverDefaults.port,
+          serverUsername: ensureUsernameTag(serverDefaults.username || generateGuestUsername()),
+          serverPassword: serverDefaults.password,
+          setServerHost: (serverHost) => set({ serverHost }),
+          setServerPort: (serverPort) => set({ serverPort }),
+          setServerUsername: (serverUsername) =>
+            set((state) => ({
+              serverUsername: ensureUsernameTag(serverUsername, state.serverUsername),
+            })),
+          setServerPassword: (serverPassword) => set({ serverPassword }),
+
+          savedServers: [],
+          addSavedServer: (server) =>
+            set((state) => ({
+              savedServers: [...state.savedServers.filter((s) => s.name !== server.name), server],
+            })),
+          removeSavedServer: (name) =>
+            set((state) => ({
+              savedServers: state.savedServers.filter((s) => s.name !== name),
+            })),
+
+          defaultPlaymatAssetId: undefined,
+          defaultPlaymatSettings: undefined,
+          setDefaultPlaymatAssetId: (defaultPlaymatAssetId) => set({ defaultPlaymatAssetId }),
+          setDefaultPlaymatSettings: (defaultPlaymatSettings) => set({ defaultPlaymatSettings }),
+
+          zonePanelOrder: ["library", "graveyard", "exile"],
+          setZonePanelOrder: (zonePanelOrder) => set({ zonePanelOrder }),
+
+          battlefieldAutoSort: false,
+          setBattlefieldAutoSort: (battlefieldAutoSort) => set({ battlefieldAutoSort }),
+          handOrderMode: "manual",
+          setHandOrderMode: (handOrderMode) => set({ handOrderMode }),
+
+          cardSizeMultiplier: 1,
+          setCardSizeMultiplier: (cardSizeMultiplier) =>
+            set({
+              cardSizeMultiplier: Math.max(
+                CARD_SIZE_MULTIPLIER_MIN,
+                Math.min(CARD_SIZE_MULTIPLIER_MAX, cardSizeMultiplier),
+              ),
+            }),
+
+          lockZoneTiles: false,
+          setLockZoneTiles: (lockZoneTiles) => set({ lockZoneTiles }),
+
+          setBattlefieldCardStyle: (battlefieldCardStyle) => set({ battlefieldCardStyle }),
+
+          boardBackgroundId: DEFAULT_BOARD_BACKGROUND_ID,
+          setBoardBackgroundId: (boardBackgroundId) => set({ boardBackgroundId }),
+
+          inGameAnimations: true,
+          setInGameAnimations: (inGameAnimations) => set({ inGameAnimations }),
+          preloadCardImages: true,
+          setPreloadCardImages: (preloadCardImages) => set({ preloadCardImages }),
+
+          chooseOrderOnMultipleTriggers: true,
+          setChooseOrderOnMultipleTriggers: (chooseOrderOnMultipleTriggers) =>
+            set({ chooseOrderOnMultipleTriggers }),
+
+          ironsmithRuntimeEnabled: false,
+          setIronsmithRuntimeEnabled: (ironsmithRuntimeEnabled) => set({ ironsmithRuntimeEnabled }),
+
+          directTransport: false,
+          setDirectTransport: (directTransport) => set({ directTransport }),
+
+          aiController: "forge",
+          setAiController: (aiController) => set({ aiController }),
+
+          hideAccountSaveNudge: false,
+          setHideAccountSaveNudge: (hideAccountSaveNudge) => set({ hideAccountSaveNudge }),
+
+          cardPreviewMode: "hover",
+          setCardPreviewMode: (cardPreviewMode) => set({ cardPreviewMode }),
+
+          opponentLayout: "focused",
+          setOpponentLayout: (opponentLayout) => set({ opponentLayout }),
+
+          opponentHandFan: "revealed",
+          setOpponentHandFan: (opponentHandFan) => set({ opponentHandFan }),
+
+          hapticFeedback: true,
+          setHapticFeedback: (hapticFeedback) => set({ hapticFeedback }),
+
+          mobileHandedness: "right",
+          setMobileHandedness: (mobileHandedness) => set({ mobileHandedness }),
+
+          cardHoverDelayMs: 350,
+          setCardHoverDelayMs: (ms) => set({ cardHoverDelayMs: ms }),
+          setInGameCardPreviewStyle: (inGameCardPreviewStyle) => set({ inGameCardPreviewStyle }),
+          inGameCardPreviewSize: "medium",
+          setInGameCardPreviewSize: (inGameCardPreviewSize) => set({ inGameCardPreviewSize }),
+          setHandCardStyle: (handCardStyle) => set({ handCardStyle }),
+          setStackCardStyle: (stackCardStyle) => set({ stackCardStyle }),
+          setPromptCardStyle: (promptCardStyle) => set({ promptCardStyle }),
+
+          appThemeColorOverrides: { light: {}, dark: {} },
+          setAppThemeColorOverride: (mode, key, color) =>
+            set((state) => ({
+              appThemeColorOverrides: {
+                ...state.appThemeColorOverrides,
+                [mode]: { ...state.appThemeColorOverrides[mode], [key]: color },
+              },
+            })),
+          resetAppThemeColorOverrides: (mode) =>
+            set((state) => ({
+              appThemeColorOverrides: { ...state.appThemeColorOverrides, [mode]: {} },
+            })),
+
+          gameThemeColorOverrides: {},
+          setGameThemeColorOverride: (path, color) =>
+            set((state) => ({
+              gameThemeColorOverrides: {
+                ...state.gameThemeColorOverrides,
+                [path]: color,
+              },
+            })),
+          resetGameThemeColorOverrides: () => set({ gameThemeColorOverrides: {} }),
+
+          lastPlayedDeckId: null,
+          lastPlayedAtByDeck: {},
+          setLastPlayedDeckId: (lastPlayedDeckId) =>
+            set((state) => ({
+              lastPlayedDeckId,
+              lastPlayedAtByDeck: lastPlayedDeckId
+                ? { ...state.lastPlayedAtByDeck, [lastPlayedDeckId]: Date.now() }
+                : state.lastPlayedAtByDeck,
+            })),
+
+          lastOfflineFormatId: null,
+          setLastOfflineFormatId: (lastOfflineFormatId) => set({ lastOfflineFormatId }),
+
+          lastAiOpponent: null,
+          setLastAiOpponent: (lastAiOpponent) => set({ lastAiOpponent }),
+
+          lastRoomSetup: null,
+          setLastRoomSetup: (lastRoomSetup) => set({ lastRoomSetup }),
+          tableBackground: DEFAULT_BOARD_BACKGROUND_ID,
+          setTableBackground: (tableBackground) => set({ tableBackground }),
+        };
+      },
+      {
+        name: STORAGE_KEYS.PREFERENCES,
+        version: 6,
+        migrate: (persistedState, version) => {
+          if (!persistedState || typeof persistedState !== "object") return {};
+          let persisted = persistedState as Record<string, unknown>;
+          if (version < 4) persisted = { ...persisted, ...CARD_VIEW_DEFAULTS };
+          if (version < 6) persisted = { ...persisted, aiController: "forge" };
+          return pickPersistedPreferences(persisted);
+        },
+        merge: (persistedState, currentState) => ({
+          ...currentState,
+          ...pickPersistedPreferences(persistedState),
+        }),
+        // Usernames persisted before the @NNNN tag scheme get tagged once on
+        // load, through the setter so the tagged name is written back and
+        // stays stable across refreshes.
+        onRehydrateStorage: () => (state) => {
+          if (state && state.serverUsername && !hasUsernameTag(state.serverUsername)) {
+            state.setServerUsername(state.serverUsername);
+          }
+        },
+      },
+    ),
+    { name: "preferences", enabled: import.meta.env.DEV },
+  ),
+);

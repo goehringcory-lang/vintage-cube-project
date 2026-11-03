@@ -1,0 +1,195 @@
+import { useEffect, useState } from "react";
+import { CircleUserRound, LogIn, Maximize2, Minimize2, Settings } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { isFeatureEnabled } from "@/featureFlags";
+import { ROUTES } from "@/lib/constants";
+import { cn } from "@/lib/utils";
+import { stripUsernameTag } from "@/lib/username";
+import { useAuthStore } from "@/stores/useAuthStore";
+import { usePreferencesStore } from "@/stores/usePreferencesStore";
+import { useSignInDialog } from "@/stores/useSignInDialogStore";
+import { getMoreDestinations } from "./navDestinations";
+
+interface AccountMenuProps {
+  disabled?: boolean;
+}
+
+const MENU_ITEM_CLASS =
+  "my-0.5 min-h-8 touch:min-h-11 gap-2.5 whitespace-normal rounded-md bg-transparent px-2.5 py-2 text-ui-label focus:bg-muted focus:text-foreground touch:py-2.5";
+
+export function AccountMenu({ disabled = false }: AccountMenuProps) {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const account = useAuthStore((s) => s.account);
+  const status = useAuthStore((s) => s.status);
+  const showSignIn = useSignInDialog((s) => s.show);
+  const customAvatar = useAuthStore((s) => s.account?.avatarUrl);
+  const serverUsername = usePreferencesStore((s) => s.serverUsername);
+  const signedInAccount = status === "signedIn" ? account : null;
+  const accountsEnabled = isFeatureEnabled("accounts");
+  const [isFullscreen, setIsFullscreen] = useState(
+    typeof document !== "undefined" && document.fullscreenElement !== null,
+  );
+
+  useEffect(() => {
+    const sync = () => setIsFullscreen(document.fullscreenElement !== null);
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => undefined);
+    } else {
+      void document.documentElement.requestFullscreen().catch(() => undefined);
+    }
+  }
+
+  const displayName = signedInAccount
+    ? `@${signedInAccount.handle}`
+    : stripUsernameTag(serverUsername);
+  const initial = (signedInAccount ? signedInAccount.handle : stripUsernameTag(serverUsername))
+    .charAt(0)
+    .toUpperCase();
+  const isSettingsRoute =
+    location.pathname === ROUTES.SETTINGS || location.pathname.startsWith(`${ROUTES.SETTINGS}/`);
+
+  function renderAvatar(initialClass: string) {
+    if (customAvatar) {
+      return (
+        <img src={customAvatar} crossOrigin="anonymous" alt="" className="size-full object-cover" />
+      );
+    }
+    if (initial) {
+      return (
+        <span
+          aria-hidden
+          className={cn(
+            "flex size-full items-center justify-center bg-primary/15 font-semibold text-primary",
+            initialClass,
+          )}
+        >
+          {initial}
+        </span>
+      );
+    }
+    return <CircleUserRound className="h-5 w-5 text-muted-foreground" />;
+  }
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          disabled={disabled}
+          aria-label={signedInAccount ? `Account: @${signedInAccount.handle}` : `Account menu`}
+          title={signedInAccount ? `@${signedInAccount.handle}` : displayName || `Account`}
+          className={cn(
+            "relative flex min-h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border/70 bg-muted touch:min-h-11 touch:w-11 touch:min-h-11 touch:min-w-11 text-ui-label whitespace-normal",
+            "motion-safe:transition-[border-color,box-shadow] hover:border-primary/40 hover:shadow-sm",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            "data-[state=open]:border-primary/50 data-[state=open]:ring-2 data-[state=open]:ring-ring",
+            isSettingsRoute && "border-primary/50",
+          )}
+        >
+          {renderAvatar("text-ui-label")}
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        sideOffset={8}
+        className="w-64 rounded-xl border-border/70 bg-background/80 p-2 backdrop-blur-md"
+        onCloseAutoFocus={(event) => event.preventDefault()}
+      >
+        <div className="flex items-center gap-3 px-2 pb-2.5 pt-1.5">
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border/70 bg-muted">
+            {renderAvatar("text-ui-body")}
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="break-words text-ui-label font-semibold leading-tight">
+              {displayName || `Guest`}
+            </p>
+            <p className="break-words text-ui-meta text-muted-foreground">
+              {signedInAccount ? `Signed in` : `Playing as a guest`}
+            </p>
+          </div>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-8 shrink-0 touch:min-h-11 touch:min-w-11"
+            onClick={toggleFullscreen}
+            aria-label={isFullscreen ? `Exit fullscreen` : `Fullscreen`}
+            title={isFullscreen ? `Exit fullscreen` : `Fullscreen`}
+          >
+            {isFullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+          </Button>
+        </div>
+        <DropdownMenuSeparator />
+        {accountsEnabled && signedInAccount && (
+          <DropdownMenuItem
+            className={MENU_ITEM_CLASS}
+            disabled={disabled}
+            onSelect={() => navigate(ROUTES.SETTINGS, { state: { settingsTab: "account" } })}
+          >
+            <CircleUserRound />
+            {`Account`}
+          </DropdownMenuItem>
+        )}
+        {accountsEnabled && !signedInAccount && (
+          <DropdownMenuItem
+            className={MENU_ITEM_CLASS}
+            disabled={disabled}
+            onSelect={() => showSignIn()}
+          >
+            <LogIn />
+            {`Sign in`}
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem
+          className={MENU_ITEM_CLASS}
+          disabled={disabled}
+          onSelect={() => navigate(ROUTES.SETTINGS)}
+        >
+          <Settings />
+          {`Preferences`}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        {getMoreDestinations().map(({ to, label, icon: ItemIcon, external }) =>
+          external ? (
+            <DropdownMenuItem key={to} asChild className={MENU_ITEM_CLASS}>
+              <a
+                href={to}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(event) => {
+                  if (disabled) event.preventDefault();
+                }}
+              >
+                <ItemIcon />
+                {label}
+              </a>
+            </DropdownMenuItem>
+          ) : (
+            <DropdownMenuItem
+              key={to}
+              className={MENU_ITEM_CLASS}
+              disabled={disabled}
+              onSelect={() => navigate(to)}
+            >
+              <ItemIcon />
+              {label}
+            </DropdownMenuItem>
+          ),
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}

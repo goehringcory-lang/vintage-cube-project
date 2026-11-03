@@ -1,0 +1,105 @@
+import { useState } from "react";
+import { Menu, Swords } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { ROUTES } from "@/lib/constants";
+import { cn } from "@/lib/utils";
+import {
+  getMoreDestinations,
+  getTopBarNav,
+  isNavDestinationActive,
+  type NavDestination,
+} from "./navDestinations";
+import { useAuthStore } from "@/stores/useAuthStore";
+
+interface NavSheetProps {
+  disabled?: boolean;
+}
+
+export function NavSheet({ disabled = false }: NavSheetProps) {
+  const [open, setOpen] = useState(false);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const signedIn = useAuthStore((state) => state.status === "signedIn");
+  const direct = getTopBarNav(signedIn);
+  const more = getMoreDestinations();
+
+  function isActive(to: string) {
+    return isNavDestinationActive(to, location.pathname);
+  }
+
+  function go(to: string) {
+    if (disabled) return;
+    setOpen(false);
+    navigate(to);
+  }
+
+  function renderRow({ to, label, icon: Icon, external }: NavDestination) {
+    const className = cn(
+      "flex min-h-11 w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2 text-left text-ui-label transition-colors",
+      !external && isActive(to)
+        ? "border-selection-border bg-selection font-medium text-selection-foreground"
+        : "text-foreground/85 hover:bg-muted/60",
+    );
+    if (external) {
+      return (
+        <a
+          key={to}
+          href={to}
+          target="_blank"
+          rel="noreferrer"
+          className={className}
+          onClick={(event) => {
+            if (disabled) event.preventDefault();
+          }}
+        >
+          <Icon className="h-4 w-4 shrink-0" />
+          {label}
+        </a>
+      );
+    }
+    return (
+      <button
+        key={to}
+        type="button"
+        aria-current={isActive(to) ? "page" : undefined}
+        disabled={disabled}
+        onClick={() => go(to)}
+        className={className}
+      >
+        <Icon className="h-4 w-4 shrink-0" />
+        {label}
+      </button>
+    );
+  }
+
+  return (
+    <Sheet open={!disabled && open} onOpenChange={setOpen}>
+      <Button
+        size="icon"
+        variant="ghost"
+        className="min-h-10 w-10 md:pointer-fine:hidden touch:min-h-11 touch:min-w-11"
+        disabled={disabled}
+        onClick={() => setOpen(true)}
+        title={`Menu`}
+      >
+        <Menu className="h-5 w-5" />
+        <span className="sr-only">{`Menu`}</span>
+      </Button>
+      <SheetContent side="bottom" className="overflow-y-auto rounded-t-2xl px-3 pb-6">
+        <SheetTitle className="sr-only">{`Menu`}</SheetTitle>
+        <div className="pt-2">
+          {renderRow({ to: ROUTES.PLAY, label: `Play`, icon: Swords })}
+          {direct.map(renderRow)}
+          <div className="pt-3">
+            <p className="px-3 pb-1 text-ui-meta font-semibold uppercase tracking-wider text-muted-foreground">
+              {`More`}
+            </p>
+            {more.map(renderRow)}
+          </div>
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}

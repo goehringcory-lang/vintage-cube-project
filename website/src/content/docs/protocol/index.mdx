@@ -1,0 +1,180 @@
+---
+title: The Manabrew Protocol
+description: How a Manabrew engine talks to a client - the prompt protocol for implementers.
+---
+
+{/* SPDX-License-Identifier: CC-BY-4.0 - see the License section below. */}
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+import ProtocolType from "../../../components/ProtocolType.astro";
+
+Manabrew separates the **engine** (the rules) from the **client** (the UI). Any
+engine that speaks this protocol can drive the a Manabrew client, and any client
+that implements it can host a Manabrew compatible engine.
+
+> What we hope to achieve by putting effort and love into the spec, is that more people and projects start adopting it.
+> We see huge potential in a truly open-standard for online card gaming, and we dream of a day where UIs and Engines for all sorts of games will be able to be inter-changed for a superior community driven ecosystem.
+>
+> _- Witches of the Hill_
+
+## The protocol ensures:
+
+- A **transport-agnostic JSON message format** - a client written against this
+  spec can talk to any conforming engine.
+- **Complete enough to drive interactive play**: priority, targeting, combat,
+  cost payment, library manipulation, dice, and the opening-hand procedure.
+
+Enforcing the rules is up to the particular engine implementing the protocol.
+
+## Message families
+
+The engine → client channel carries **four separate kinds of message**:
+
+<CardGrid>
+  <Card title="state" icon="seti:db">
+    A `StateUpdate` carrying authoritative game state. This may contain a full
+    [`gameView`](/protocol/game-view/)⁠, or a [`patch`](/protocol/game-view/#state-patches) against
+    the client’s current view. StateUpdate is the **only** carrier of authoritative game state; the
+    client applies updates in order and renders from the resulting view.
+  </Card>
+  <Card title="prompt" icon="comment">
+    An `AgentPrompt` - a **call to action**. The engine has paused and needs a decision from a
+    specific player.
+  </Card>
+  <Card title="engineDirective" icon="information">
+    An `EngineDirective` - an **out-of-band notice** for one player, never paired with a prompt and
+    never part of the game state. It reports the player's action recording and an open vote to
+    repeat recorded actions. Each directive is the complete current status of its kind, so the
+    client keeps only the latest one.
+  </Card>
+  <Card title="error" icon="warning">
+    A `ProtocolError` - the engine **rejected** the last response. See [Errors](#errors).
+  </Card>
+</CardGrid>
+
+The client → engine channel carries **two**:
+
+<CardGrid>
+  <Card title="response" icon="approve-check">
+    A `PromptOutput` answering the open prompt, echoing its `promptId`. Strictly paired: one
+    response per prompt. See [Answering a prompt](#answering-a-prompt).
+  </Card>
+  <Card title="directive" icon="right-arrow">
+    A `DirectiveInput` - **out-of-band and fire-and-forget**, never paired with a prompt: `concede`
+    (legal at any time), `startRecording` and `stopRecording` (legal while the player holds priority
+    with an empty stack), `requestRepeat` (asks to repeat the recorded actions `iterations` times,
+    under the same condition), and `repeatVote` (answers an open repeat vote).
+  </Card>
+</CardGrid>
+
+Prompts deliberately carry no `gameView`: the client already has the latest
+state from the most recent `StateUpdate` message.
+
+## The prompt envelope
+
+Every prompt is wrapped in an `AgentPrompt`:
+
+```ts
+interface AgentPrompt {
+  promptId: number; // correlate the response back to this prompt
+  decidingPlayerId: string; // who must answer
+  sourceCard?: CardDto; // the complete card that caused this prompt, if any
+  input: PromptInput; // each prompt type defines the shape of its input
+}
+```
+
+## Answering a prompt
+
+```ts
+type ClientToServerMessage =
+  | { kind: "response"; promptId: number; action: PromptOutput }
+  | { kind: "directive"; directive: DirectiveInput }; // out-of-band, never paired with a prompt
+```
+
+It is important `promptId` is always the same as the last `promptId` emitted by the engine.
+
+```ts
+// engine → client
+{ "promptId": 7, "decidingPlayerId": "player-0", "input": { "type": "chooseNumber", ... } }
+
+// client → engine
+{ "kind": "response", "promptId": 7,
+  "action": { "type": "chooseNumber", "output": { "type": "numberDecision", "chosenNumber": 3 } } }
+```
+
+## Errors
+
+```ts
+type ProtocolError = { code: ProtocolErrorCode; message: string; promptId?: number };
+
+type ProtocolErrorCode =
+  | "stalePrompt"
+  | "wrongPlayer"
+  | "wrongPromptType"
+  | "unknownActionId"
+  | "invalidShape";
+```
+
+## Display events
+
+`DisplayEvent` is retained in the Rust and TypeScript protocol packages for
+independent implementations. The reference runtime does not currently emit it,
+and the active `StateUpdate` transport does not carry display events.
+
+<ProtocolType type="DisplayEvent" />
+
+## The prompt catalogue
+
+:::note[Careful about the type blocks]
+For language convenience, we show the type blocks in multiple languages.
+Be mindful that the correct protocol on the wire is **camelCase**.
+Follow the **TypeScript** type definitions for the exact protocol.
+:::
+
+Every prompt the engine can send. Each links to its arguments, response shape,
+and a wire example.
+
+**Choices & information**
+
+- [chooseNumber](/protocol/choose-number/) - pick a number in a range.
+- [chooseCards](/protocol/choose-cards/) - select cards from a set.
+- [chooseColor](/protocol/choose-color/) - choose one or more colors.
+- [chooseBoolean](/protocol/choose-boolean/) - a yes/no decision.
+- [chooseFromSelection](/protocol/choose-from-selection/) - pick spell modes.
+- [revealCards](/protocol/reveal-cards/) - acknowledge revealed cards.
+- [scry](/protocol/scry/) - sort cards into destination zones.
+- [reorder](/protocol/reorder/) - put cards in a chosen order.
+- [diceRolled](/protocol/dice-rolled/) - acknowledge a dice roll.
+
+**Priority & costs**
+
+- [chooseAction](/protocol/choose-action/) - take an action or pass priority.
+- [payManaCost](/protocol/pay-mana-cost/) - pay a mana cost interactively.
+
+**Mulligan**
+
+- [mulligan](/protocol/mulligan/) - keep or mulligan the opening hand.
+- [mulliganPutBack](/protocol/mulligan-put-back/) - London-mulligan put-back.
+
+**Combat & targeting**
+
+- [chooseAttackers](/protocol/choose-attackers/) - declare attackers.
+- [chooseBlockers](/protocol/choose-blockers/) - declare blockers.
+- [chooseDamageAssignmentOrder](/protocol/choose-damage-assignment-order/) - order multiple blockers.
+- [chooseCombatDamageAssignment](/protocol/choose-combat-damage-assignment/) - assign combat damage.
+- [chooseBoardTargets](/protocol/choose-board-targets/) - choose targets on the board.
+
+**End**
+
+- [gameOver](/protocol/game-over/) - the game has ended.
+
+## License
+
+This protocol specification - every page under **/protocol/** - is licensed
+**[Creative Commons Attribution 4.0 International (CC-BY-4.0)](https://creativecommons.org/licenses/by/4.0/)**,
+deliberately separate from the reference implementation, so that anyone may
+describe or implement the same wire format without depending on this repository.
+
+The reference implementation (the rest of the project) is **AGPL-3.0-or-later**.
+Independent re-implementations of this protocol under any license are explicitly
+invited.

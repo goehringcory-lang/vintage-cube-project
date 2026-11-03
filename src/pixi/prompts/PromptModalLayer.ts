@@ -1,0 +1,4016 @@
+import {
+  getUiControlFloor,
+  getUiControlHeight,
+  getUiFontFloor,
+  getUiFontSize,
+  isTouchUi,
+} from "@/themes/typography";
+import {
+  Container,
+  type FederatedWheelEvent,
+  FederatedPointerEvent,
+  Graphics,
+  Rectangle,
+} from "pixi.js";
+import { OPPONENT_SEATS } from "@/components/game/game.types";
+import { hexToNum } from "@/pixi/colorUtils";
+import { CardSprite } from "@/pixi/CardSprite";
+import { loadManaSymbolTexture } from "@/pixi/manaSymbolCache";
+import { ensureTextContrast, readableTextColor } from "@/themes/gameTheme";
+import { TOUCH_MOVE_SLOP_PX } from "@/lib/responsive";
+import {
+  CARD_H,
+  CARD_RADIUS,
+  CARD_W,
+  GAME_CARD_SIZES,
+  PROMPT_CARD_GAP,
+  PROMPT_CARD_MODAL_MAX_WIDTH,
+  PROMPT_CARD_ROW_GAP,
+  PROMPT_MODAL_VIEWPORT_MARGIN,
+} from "@/components/game/game.constants";
+import type {
+  CardDto,
+  ChooseCombatDamageAssignmentInput,
+  PromptPresentation,
+  ReorderItem,
+  ScryDestination,
+  SelectionOption,
+  TargetRef,
+} from "@/protocol";
+import { animationsEnabled } from "@/pixi/effects/enabled";
+import { gsap } from "@/pixi/effects/gsap";
+import { createRollToken, setRollTokenValue } from "./dice/DiceGeometry";
+import {
+  ROLL_IMPACT_MS,
+  ROLL_SETTLE_MS,
+  rollingDieValue,
+  rollSeed,
+  rollTrajectory,
+} from "./dice/DiceAnimation";
+import {
+  CARD_ASPECT_RATIO,
+  CARD_TILE_EDGE_INSET,
+  MODAL_BODY_BOTTOM_PADDING,
+  MODAL_MIN_HEIGHT,
+  MODAL_SCROLL_LINE_HEIGHT,
+  MODAL_SCROLL_MAX_STEP,
+  MODAL_SCROLL_SCALE,
+  PANEL_PADDING,
+  REORDER_CARD_INSET,
+  REORDER_LAYOUT_SETTLE_SECONDS,
+  REORDER_MODAL_VERTICAL_RESERVE,
+  REORDER_ORDER_ZONE_ID,
+  REORDER_PREVIEW_SECONDS,
+  ROW_GAP,
+  type RollDisplayEntry,
+  SCRY_LAYOUT_SETTLE_SECONDS,
+  SOURCE_CARD_GAP,
+  parseCombatNumber,
+  promptRichText,
+  promptText,
+  PromptLayerBase,
+} from "./PromptLayerBase";
+import { promptCardSections } from "./promptCardSections";
+
+const CHOICE_MODAL_WIDTH = 560;
+const CARD_PROMPT_MIN_WIDTH = 360;
+const CHOICE_SEARCH_HEIGHT = 52;
+const CHOICE_SEARCH_COUNT_MIN_WIDTH = 240;
+const CARD_SECTION_HEADER_HEIGHT = 46;
+const SCRY_POOL_DRAG_SCALE = 0.5;
+const MODAL_SCROLL_HALF_LIFE_MS = 28;
+const MODAL_SCROLL_SNAP_PIXELS = 0.5;
+type PromptModalHeaderLayout = "stacked" | "inline-guidance";
+
+export abstract class PromptModalLayer extends PromptLayerBase {
+  private get successForeground(): string {
+    return ensureTextContrast(
+      this.theme.gameTheme.success,
+      this.theme.appTheme.muted,
+      this.theme.appTheme.foreground,
+      4.5,
+    );
+  }
+
+  protected renderModal(): void {
+    const input = this.spec!.currentPrompt!.input;
+    const boardContext =
+      input.type === "chooseCombatDamageAssignment" ||
+      input.type === "chooseDamageAssignmentOrder" ||
+      (input.type === "chooseBoolean" && input.presentation.targets.length > 0);
+    const backdrop = new Graphics().rect(0, 0, this.viewportWidth, this.viewportHeight).fill({
+      color: hexToNum(this.theme.appTheme.overlay),
+      alpha: boardContext ? 0.38 : 0.76,
+    });
+    backdrop.eventMode = "static";
+    backdrop.on("pointerdown", () => this.setSelectionFilterFocused(false));
+    backdrop.hitArea = new Rectangle(0, 0, this.viewportWidth, this.viewportHeight);
+    this.container.addChild(backdrop);
+    switch (input.type) {
+      case "chooseBoolean":
+        this.renderBoolean(input.presentation, input.denyLabel, input.confirmLabel);
+        break;
+      case "chooseFromSelection":
+        this.renderSelection(input.presentation, input.options, input.minTotal, input.maxTotal);
+        break;
+      case "revealCards":
+        this.renderCards(input.presentation, input.cards, 0, 0, true);
+        break;
+      case "chooseCards":
+        this.renderCards(input.presentation, input.cards, input.min, input.max, false);
+        break;
+      case "chooseColor":
+        this.renderColors(input.presentation, input.validColors, input.amount, input.repeatAllowed);
+        break;
+      case "chooseNumber":
+        this.renderNumber(input.presentation, input.min, input.max);
+        break;
+      case "reorder":
+        this.renderReorder(input.presentation, input.items);
+        break;
+      case "scry":
+        this.renderScry(input.presentation, input.cards, input.zones);
+        break;
+      case "chooseCombatDamageAssignment":
+        this.renderCombatDamage(input);
+        break;
+      case "chooseDamageAssignmentOrder":
+        this.renderDamageOrder();
+        break;
+      case "diceRolled":
+        this.renderDice(input.presentation, input.sides, input.rolls);
+        break;
+    }
+    this.finalizeModalScroll();
+    this.animateReorderLayout();
+    this.animateScryLayout();
+  }
+
+  protected createModalShell(
+    width: number,
+    height: number,
+    presentation: PromptPresentation,
+    minimizable = true,
+    footerHeight = 0,
+    footerContentHeight = 36,
+    cardHints = false,
+    headerLayout: PromptModalHeaderLayout = "stacked",
+    titleStyle: { size: number; color: string } | null = null,
+  ): {
+    panel: Container;
+    body: Container;
+    bodyTop: number;
+    footer: Container;
+    footerHintWidth: number;
+  } {
+    const sourceCard = this.spec?.gameOver ? null : this.promptSourceCard();
+    footerContentHeight = Math.max(footerContentHeight, getUiControlFloor());
+    if (footerHeight > 0) footerHeight = Math.max(footerHeight, footerContentHeight + 16);
+    const modalHeight = this.layerPresentation.modalHeight(
+      this.viewportHeight,
+      height,
+      PROMPT_MODAL_VIEWPORT_MARGIN,
+    );
+    const sourceSize = this.promptSourceCardDisplayDimensions();
+    const clusterWidth = width + SOURCE_CARD_GAP + sourceSize.width;
+    const externalSource =
+      !!sourceCard &&
+      sourceSize.width > 0 &&
+      clusterWidth <= this.layoutWidth - 24 &&
+      sourceSize.height <= this.viewportHeight - PROMPT_MODAL_VIEWPORT_MARGIN;
+    const x = externalSource
+      ? Math.round((this.layoutWidth - clusterWidth) / 2)
+      : Math.round((this.layoutWidth - width) / 2);
+    const clusterHeight = externalSource ? Math.max(modalHeight, sourceSize.height) : modalHeight;
+    const y = Math.round((this.viewportHeight - clusterHeight) / 2);
+    const sourceLeft = width + SOURCE_CARD_GAP;
+    const panel = this.panel(width, modalHeight, x, y, 12);
+    const panelBackground = panel.children[0] as Graphics;
+    panel.eventMode = "static";
+    panel.on("pointerdowncapture", (event: FederatedPointerEvent) => {
+      const filter = this.selectionFilterView;
+      if (!filter) return;
+      let target = event.target as Container | null;
+      while (target && target !== filter.container) target = target.parent;
+      this.setSelectionFilterFocused(target === filter.container);
+    });
+    panel.hitArea = new Rectangle(0, 0, width, modalHeight);
+    panel.accessible = true;
+    panel.accessibleTitle = presentation.title;
+    panel.tabIndex = -1;
+    const sourceSprite = sourceCard ? new CardSprite(sourceCard, "hand") : null;
+    let sourceWidth = 0;
+    let sourceHeight = 0;
+    let sourceX = 0;
+    let sourceY = 0;
+    let placeSourceSprite: (() => void) | null = null;
+    if (sourceSprite && sourceCard) {
+      this.configurePromptCardSprite(sourceSprite, sourceCard);
+      sourceSprite.setHandRulesHighlight(this.spec?.currentPrompt?.sourceAbilityText ?? "");
+      sourceWidth = sourceSize.width;
+      sourceHeight = sourceSize.height;
+      placeSourceSprite = () => {
+        const rotated =
+          sourceSprite.horizontalFrame && !this.promptCardState(sourceCard).horizontalFlipped;
+        sourceSprite.rotation = rotated ? -Math.PI / 2 : 0;
+        const horizontal = sourceSprite.horizontalFrame && !rotated;
+        const cardWidth = horizontal ? CARD_H : CARD_W;
+        const cardHeight = horizontal ? CARD_W : CARD_H;
+        const scale = Math.min(sourceWidth / cardWidth, sourceHeight / cardHeight);
+        sourceSprite.scale.set(scale);
+        sourceSprite.setHandRulesScale(scale);
+        sourceSprite.syncHandControlsScale();
+        sourceSprite.position.set(
+          sourceX + (cardWidth * scale) / 2,
+          sourceY + (cardHeight * scale) / 2,
+        );
+      };
+      sourceSprite.onReorient = placeSourceSprite;
+      sourceSprite.cursor = "pointer";
+      sourceSprite.accessible = true;
+      sourceSprite.accessibleTitle = `${sourceCard.identity.name}, source card`;
+      sourceSprite.accessibleHint = "Focus or hover, then change view or flip face";
+      sourceSprite.tabIndex = 0;
+      this.bindPromptCardActivation(sourceSprite, sourceCard, sourceSprite, false);
+      panel.addChild(sourceSprite);
+    }
+    const inlineSource = !!sourceSprite && !externalSource;
+    const inlineGuidance =
+      this.layerPresentation.actionStyle === "minimal" &&
+      headerLayout === "inline-guidance" &&
+      !inlineSource &&
+      width >= 720;
+    const header = new Container();
+    panel.addChild(header);
+    const titleX = PANEL_PADDING;
+    const overflowHeader = new Container();
+    const titleWidth = Math.max(1, width - titleX - 60);
+    const title = promptRichText(
+      presentation.title,
+      titleStyle?.size ?? (this.viewportWidth < 760 ? 18 : 22),
+      titleStyle?.color ?? this.theme.appTheme.foreground,
+      titleWidth,
+      { weight: "700" },
+    );
+    title.position.set(titleX, 16);
+    header.addChild(title);
+    let bodyTop = 16 + title.height + 8;
+    if (sourceSprite && placeSourceSprite) {
+      if (externalSource) {
+        sourceX = sourceLeft;
+        sourceY = 0;
+        panel.hitArea = new Rectangle(
+          0,
+          0,
+          sourceLeft + sourceWidth,
+          Math.max(modalHeight, sourceY + sourceHeight),
+        );
+      } else {
+        sourceX = Math.max(PANEL_PADDING, width - PANEL_PADDING - sourceWidth);
+        sourceY = 48;
+        bodyTop = Math.max(bodyTop, sourceY + sourceHeight + 8);
+      }
+      sourceSprite.onReorient?.();
+    }
+    if (inlineGuidance) {
+      const guidanceText = [presentation.description, presentation.text]
+        .filter(Boolean)
+        .join(" · ");
+      if (guidanceText) {
+        const guidanceX = titleX + title.width + 28;
+        const guidance = promptRichText(
+          guidanceText,
+          12,
+          this.theme.appTheme["muted-foreground"],
+          Math.max(120, width - guidanceX - PANEL_PADDING - (minimizable ? 28 : 0)),
+          { role: "body" },
+        );
+        guidance.alpha = 0.9;
+        guidance.position.set(guidanceX, 16);
+        header.addChild(guidance);
+        bodyTop = Math.max(bodyTop, 16 + guidance.height + 8);
+      }
+    } else {
+      if (presentation.description) {
+        const description = promptRichText(
+          presentation.description,
+          14,
+          this.theme.appTheme.foreground,
+          width - PANEL_PADDING * 2,
+          { role: "body" },
+        );
+        description.alpha = 0.9;
+        description.position.set(PANEL_PADDING, bodyTop);
+        header.addChild(description);
+        bodyTop += description.height + 6;
+      }
+      if (presentation.text) {
+        const rules = promptRichText(
+          presentation.text,
+          12,
+          this.theme.appTheme["muted-foreground"],
+          width - PANEL_PADDING * 2,
+          { role: "body" },
+        );
+        rules.position.set(PANEL_PADDING, bodyTop);
+        header.addChild(rules);
+        bodyTop += rules.height + 8;
+      }
+    }
+    if (minimizable) {
+      const minimizeIcon = this.makeIcon(
+        "lucide-inspect-board",
+        22,
+        this.theme.appTheme.foreground,
+      );
+      const minimize = new Container();
+      minimize.addChild(minimizeIcon);
+      minimize.eventMode = "static";
+      minimize.cursor = "pointer";
+      const targetSize = Math.max(32, getUiControlFloor());
+      minimize.hitArea = new Rectangle(-targetSize / 2, -targetSize / 2, targetSize, targetSize);
+      minimize.on("pointerover", () => {
+        minimizeIcon.alpha = 0.75;
+      });
+      minimize.on("pointerout", () => {
+        minimizeIcon.alpha = 1;
+      });
+      minimize.on("focusin", () => {
+        minimizeIcon.alpha = 0.75;
+      });
+      minimize.on("focusout", () => {
+        minimizeIcon.alpha = 1;
+      });
+      minimize.on("pointertap", () => this.spec!.onHideModal());
+      minimize.accessible = true;
+      minimize.accessibleTitle = "Hide prompt to inspect battlefield";
+      minimize.tabIndex = 0;
+      minimize.position.set(
+        width - PANEL_PADDING - Math.max(6, getUiControlFloor() / 2),
+        Math.max(20, 12 + getUiControlFloor() / 2),
+      );
+      header.addChild(minimize);
+    }
+
+    let overflowHeight = 0;
+    if (bodyTop > modalHeight - footerHeight - getUiControlHeight() * 2 - CHOICE_SEARCH_HEIGHT) {
+      if (sourceSprite && !externalSource) {
+        overflowHeader.addChild(sourceSprite);
+        sourceX = Math.max(0, (width - PANEL_PADDING * 2 - sourceWidth) / 2);
+        sourceY = 0;
+        placeSourceSprite?.();
+        overflowHeight = sourceHeight + 12;
+      }
+      for (const child of [...header.children]) {
+        if (child === title || child.eventMode !== "none") continue;
+        overflowHeader.addChild(child);
+        child.position.set(0, overflowHeight);
+        overflowHeight += child.height + 8;
+      }
+      bodyTop = Math.max(16 + title.height + 8, getUiControlHeight() + 20);
+    }
+    bodyTop = Math.round(bodyTop);
+    const viewportHeight = Math.max(
+      0,
+      modalHeight - bodyTop - footerHeight - MODAL_BODY_BOTTOM_PADDING,
+    );
+    const mask = new Graphics()
+      .rect(PANEL_PADDING, bodyTop, width - PANEL_PADDING * 2, viewportHeight)
+      .fill({ color: hexToNum(this.theme.appTheme.foreground) });
+    panel.addChild(mask);
+    const scrollBody = new Container();
+    scrollBody.position.set(PANEL_PADDING, bodyTop);
+    scrollBody.mask = mask;
+    panel.addChild(scrollBody);
+    scrollBody.addChild(overflowHeader);
+    const body = new Container();
+    body.y = overflowHeight;
+    scrollBody.addChild(body);
+
+    const scrollTrack = new Graphics()
+      .roundRect(width - 8, bodyTop, 3, viewportHeight, 2)
+      .fill({ color: hexToNum(this.theme.appTheme.border), alpha: 0.5 });
+    const scrollThumb = new Graphics();
+    scrollTrack.visible = false;
+    scrollThumb.visible = false;
+    panel.addChild(scrollTrack, scrollThumb);
+
+    const footer = new Container();
+    let footerBackground: Graphics | null = null;
+    let footerHintWidth = 0;
+    if (footerHeight > 0) {
+      const footerTop = modalHeight - footerHeight;
+      footerBackground = new Graphics()
+        .moveTo(0, footerTop)
+        .lineTo(width, footerTop)
+        .lineTo(width, modalHeight - 12)
+        .arc(width - 12, modalHeight - 12, 12, 0, Math.PI / 2)
+        .lineTo(12, modalHeight)
+        .arc(12, modalHeight - 12, 12, Math.PI / 2, Math.PI)
+        .closePath()
+        .fill({ color: hexToNum(this.theme.appTheme.card), alpha: 0.98 })
+        .moveTo(0, footerTop)
+        .lineTo(width, footerTop)
+        .stroke({ color: hexToNum(this.theme.appTheme.border), width: 1, alpha: 0.8 });
+      footer.position.set(
+        PANEL_PADDING,
+        footerTop + Math.max(8, (footerHeight - footerContentHeight) / 2),
+      );
+      if (cardHints) {
+        const shortcuts = this.promptCardShortcutHint();
+        if (shortcuts) {
+          const hint = promptText(shortcuts, 10, this.theme.appTheme["muted-foreground"], {
+            role: "meta",
+          });
+          hint.position.set(0, footerContentHeight - hint.height);
+          footer.addChild(hint);
+          footerHintWidth = hint.width;
+        }
+      }
+      panel.addChild(footerBackground, footer);
+    }
+
+    panel.on("wheel", (event: FederatedWheelEvent) => this.scrollModal(event));
+    this.modalBody = {
+      panel,
+      panelBackground,
+      body: scrollBody,
+      bodyTop,
+      width,
+      height: modalHeight,
+      hitWidth: externalSource ? width + SOURCE_CARD_GAP + sourceWidth : width,
+      externalSourceHeight: externalSource ? sourceHeight : 0,
+      footerHeight,
+      footerContentHeight,
+      footer,
+      footerBackground,
+      mask,
+      viewportHeight,
+      scrollTrack,
+      scrollThumb,
+    };
+    {
+      let touchId: number | null = null;
+      let touchStartY = 0;
+      let scrollStart = 0;
+      let didScroll = false;
+      let scrolledTouchId: number | null = null;
+      panel.on("pointerdowncapture", (event: FederatedPointerEvent) => {
+        if (event.pointerType !== "touch" || touchId !== null) return;
+        scrolledTouchId = null;
+        if (this.modalScrollMax <= 0) return;
+        const state = this.modalBody!;
+        const { x: localX, y: localY } = panel.toLocal(event.global);
+        if (
+          localX < PANEL_PADDING ||
+          localX > state.width - PANEL_PADDING ||
+          localY < state.bodyTop ||
+          localY > state.bodyTop + state.viewportHeight
+        )
+          return;
+        touchId = event.pointerId;
+        didScroll = false;
+        touchStartY = localY;
+        scrollStart = this.modalScrollOffset;
+      });
+      panel.on("globalpointermove", (event: FederatedPointerEvent) => {
+        if (touchId !== event.pointerId || this.drag?.pointerId === event.pointerId) return;
+        const delta = panel.toLocal(event.global).y - touchStartY;
+        if (!didScroll && Math.abs(delta) < TOUCH_MOVE_SLOP_PX) return;
+        didScroll = true;
+        scrolledTouchId = event.pointerId;
+        event.preventDefault();
+        this.promptCardLongPress.cancel();
+        this.modalScrollOffset = Math.max(0, Math.min(this.modalScrollMax, scrollStart - delta));
+        this.modalScrollTarget = this.modalScrollOffset;
+        this.syncModalScrollPosition();
+        this.callbacks.onRenderRequested?.();
+      });
+      panel.on("pointerup", (event: FederatedPointerEvent) => {
+        if (touchId === event.pointerId) touchId = null;
+      });
+      panel.on("pointerupoutside", (event: FederatedPointerEvent) => {
+        if (touchId === event.pointerId) touchId = null;
+        if (scrolledTouchId === event.pointerId) scrolledTouchId = null;
+      });
+      const cancelTouch = (event: PointerEvent) => {
+        if (touchId === event.pointerId) touchId = null;
+        if (scrolledTouchId === event.pointerId) scrolledTouchId = null;
+      };
+      window.addEventListener("pointercancel", cancelTouch, true);
+      panel.once("destroyed", () => window.removeEventListener("pointercancel", cancelTouch, true));
+      panel.on("pointertapcapture", (event: FederatedPointerEvent) => {
+        if (event.pointerType === "touch" && event.pointerId === scrolledTouchId) {
+          event.stopImmediatePropagation();
+          scrolledTouchId = null;
+        }
+      });
+    }
+    this.container.addChild(panel);
+    return { panel, body, bodyTop, footer, footerHintWidth };
+  }
+
+  protected resizeModalShell(
+    state: NonNullable<PromptModalLayer["modalBody"]>,
+    height: number,
+  ): void {
+    state.height = height;
+    state.viewportHeight = Math.max(
+      0,
+      height - state.bodyTop - state.footerHeight - MODAL_BODY_BOTTOM_PADDING,
+    );
+    const layoutHeight = Math.max(height, state.externalSourceHeight);
+    state.panel.position.y = Math.round((this.viewportHeight - layoutHeight) / 2);
+    state.panel.hitArea = new Rectangle(0, 0, state.hitWidth, layoutHeight);
+    state.panelBackground
+      .clear()
+      .roundRect(0, 0, state.width, height, 12)
+      .fill({ color: hexToNum(this.theme.appTheme.card), alpha: 0.97 })
+      .stroke({ color: hexToNum(this.theme.appTheme.border), width: 1, alpha: 0.9 });
+    state.mask
+      .clear()
+      .rect(PANEL_PADDING, state.bodyTop, state.width - PANEL_PADDING * 2, state.viewportHeight)
+      .fill({ color: hexToNum(this.theme.appTheme.foreground) });
+    state.scrollTrack
+      .clear()
+      .roundRect(state.width - 8, state.bodyTop, 3, state.viewportHeight, 2)
+      .fill({ color: hexToNum(this.theme.appTheme.border), alpha: 0.5 });
+    if (state.footerBackground) {
+      const footerTop = height - state.footerHeight;
+      state.footerBackground
+        .clear()
+        .moveTo(0, footerTop)
+        .lineTo(state.width, footerTop)
+        .lineTo(state.width, height - 12)
+        .arc(state.width - 12, height - 12, 12, 0, Math.PI / 2)
+        .lineTo(12, height)
+        .arc(12, height - 12, 12, Math.PI / 2, Math.PI)
+        .closePath()
+        .fill({ color: hexToNum(this.theme.appTheme.card), alpha: 0.98 })
+        .moveTo(0, footerTop)
+        .lineTo(state.width, footerTop)
+        .stroke({ color: hexToNum(this.theme.appTheme.border), width: 1, alpha: 0.8 });
+      state.footer.position.set(
+        PANEL_PADDING,
+        footerTop + Math.max(8, (state.footerHeight - state.footerContentHeight) / 2),
+      );
+    }
+  }
+
+  protected scrollModal(event: FederatedWheelEvent): void {
+    const state = this.modalBody;
+    if (!state || this.modalScrollMax <= 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rawDelta =
+      event.deltaMode === 1
+        ? event.deltaY * MODAL_SCROLL_LINE_HEIGHT
+        : event.deltaMode === 2
+          ? event.deltaY * state.viewportHeight
+          : event.deltaY;
+    const delta = Math.max(
+      -MODAL_SCROLL_MAX_STEP,
+      Math.min(MODAL_SCROLL_MAX_STEP, rawDelta * MODAL_SCROLL_SCALE),
+    );
+    this.modalScrollTarget = Math.max(
+      0,
+      Math.min(this.modalScrollMax, this.modalScrollTarget + delta),
+    );
+    if (!animationsEnabled()) {
+      this.modalScrollOffset = this.modalScrollTarget;
+      this.syncModalScrollPosition();
+    }
+  }
+
+  protected finalizeModalScroll(): void {
+    const state = this.modalBody;
+    if (!state) return;
+    const mask = state.body.mask;
+    state.body.mask = null;
+    const bounds = state.body.getLocalBounds();
+    state.body.mask = mask;
+    const contentHeight = Math.max(0, bounds.y + bounds.height);
+    const footerAvailableWidth = state.width - PANEL_PADDING * 2;
+    const placedFooter = state.footer.getLocalBounds();
+    if (
+      isTouchUi() ||
+      placedFooter.x < 0 ||
+      placedFooter.x + placedFooter.width > footerAvailableWidth + 1
+    ) {
+      let footerWidth = 0;
+      let footerTop = 0;
+      let footerRowHeight = 0;
+      for (const child of state.footer.children) {
+        if (!child.visible) continue;
+        const childBounds = child.getLocalBounds();
+        const childWidth = childBounds.width;
+        const childHeight = childBounds.height;
+        if (footerWidth > 0 && footerWidth + ROW_GAP + childWidth > footerAvailableWidth) {
+          footerWidth = 0;
+          footerTop += footerRowHeight + ROW_GAP;
+          footerRowHeight = 0;
+        }
+        if (footerWidth > 0) footerWidth += ROW_GAP;
+        child.position.set(footerWidth - childBounds.x, footerTop - childBounds.y);
+        footerWidth += childWidth;
+        footerRowHeight = Math.max(footerRowHeight, childHeight);
+      }
+    }
+    if (state.footerHeight > 0) {
+      const footerBounds = state.footer.getLocalBounds();
+      state.footerContentHeight = Math.max(0, footerBounds.y + footerBounds.height);
+      state.footerHeight = Math.max(state.footerHeight, state.footerContentHeight + 16);
+    }
+    const fittedHeight = Math.min(
+      this.viewportHeight - PROMPT_MODAL_VIEWPORT_MARGIN,
+      Math.max(
+        MODAL_MIN_HEIGHT,
+        state.bodyTop + contentHeight + state.footerHeight + MODAL_BODY_BOTTOM_PADDING,
+      ),
+    );
+    this.resizeModalShell(state, fittedHeight);
+    const overflow = contentHeight - state.viewportHeight;
+    this.modalScrollMax = overflow > 1 ? overflow : 0;
+    this.modalScrollOffset = Math.min(this.modalScrollOffset, this.modalScrollMax);
+    this.modalScrollTarget = Math.min(this.modalScrollTarget, this.modalScrollMax);
+    const scrollable = this.modalScrollMax > 0 && state.viewportHeight > 0;
+    state.scrollTrack.visible = scrollable;
+    state.scrollThumb.visible = scrollable;
+    if (scrollable) {
+      const thumbHeight = Math.max(
+        24,
+        state.viewportHeight * Math.min(1, state.viewportHeight / contentHeight),
+      );
+      state.scrollThumb
+        .clear()
+        .roundRect(0, 0, 3, thumbHeight, 2)
+        .fill({ color: hexToNum(this.theme.appTheme["muted-foreground"]), alpha: 0.85 });
+      state.scrollThumb.x = state.width - 8;
+    }
+    this.syncModalScrollPosition();
+  }
+
+  protected syncModalScrollPosition(): void {
+    const state = this.modalBody;
+    if (!state) return;
+    state.body.y = state.bodyTop - this.modalScrollOffset;
+    if (this.modalScrollMax <= 0) return;
+    const thumbHeight = state.scrollThumb.height;
+    const travel = Math.max(0, state.viewportHeight - thumbHeight);
+    state.scrollThumb.y = state.bodyTop + travel * (this.modalScrollOffset / this.modalScrollMax);
+  }
+
+  protected updateScrollMotion(deltaMs: number): void {
+    const blend = 1 - Math.pow(0.5, Math.min(deltaMs, 50) / MODAL_SCROLL_HALF_LIFE_MS);
+    if (this.modalScrollOffset !== this.modalScrollTarget) {
+      const gap = this.modalScrollTarget - this.modalScrollOffset;
+      this.modalScrollOffset =
+        Math.abs(gap) < MODAL_SCROLL_SNAP_PIXELS
+          ? this.modalScrollTarget
+          : this.modalScrollOffset + gap * blend;
+      this.syncModalScrollPosition();
+    }
+    if (this.scryPoolScrollOffset !== this.scryPoolScrollTarget) {
+      const gap = this.scryPoolScrollTarget - this.scryPoolScrollOffset;
+      this.setScryPoolScrollOffset(
+        Math.abs(gap) < MODAL_SCROLL_SNAP_PIXELS
+          ? this.scryPoolScrollTarget
+          : this.scryPoolScrollOffset + gap * blend,
+      );
+    }
+  }
+
+  protected renderBoolean(
+    presentation: PromptPresentation,
+    denyLabel: string,
+    confirmLabel: string,
+  ): void {
+    const width = this.modalPromptWidth(520);
+    const height = Math.min(280, this.viewportHeight - 24);
+    const footerHeight = 64;
+    const buttonHeight = 44;
+    const availableWidth = width - PANEL_PADDING * 2;
+    const buttonWidth = Math.min(160, (availableWidth - ROW_GAP) / 2);
+    const { footer } = this.createModalShell(
+      width,
+      height,
+      presentation,
+      true,
+      footerHeight,
+      buttonHeight,
+    );
+    const buttons = [
+      this.makeButton(denyLabel, () => this.spec!.respond({ type: "decision", value: false }), {
+        outline: true,
+        width: buttonWidth,
+        height: buttonHeight,
+      }),
+      this.makeButton(confirmLabel, () => this.spec!.respond({ type: "decision", value: true }), {
+        width: buttonWidth,
+        height: buttonHeight,
+      }),
+    ];
+    this.addButtonRow(footer, buttons, 0, availableWidth);
+  }
+
+  protected renderSelection(
+    presentation: PromptPresentation,
+    options: SelectionOption[],
+    minTotal: number,
+    maxTotal: number,
+  ): void {
+    const showFilter = options.length > 5;
+    const indexedOptions = options.map((option, index) => ({ option, index }));
+    const normalizedFilter = this.selectionFilter.toLocaleLowerCase();
+    const visibleOptions = showFilter
+      ? indexedOptions.filter(({ option }) =>
+          option.label.toLocaleLowerCase().includes(normalizedFilter),
+        )
+      : indexedOptions;
+    const compactSelection = this.layerPresentation.actionStyle === "minimal";
+    const visibleRowCount = Math.max(1, Math.min(visibleOptions.length, 7));
+    const width = this.modalPromptWidth(CHOICE_MODAL_WIDTH);
+    const height = Math.min(
+      Math.max(260, 132 + visibleRowCount * 66 + (showFilter ? 48 : 0) + 52),
+      this.viewportHeight - 24,
+    );
+    const { panel, body, footer } = this.createModalShell(
+      width,
+      height,
+      presentation,
+      true,
+      60,
+      36,
+      false,
+      "stacked",
+    );
+    const availableWidth = Math.round(width - PANEL_PADDING * 2);
+    const confirmWidth = compactSelection ? 112 : 130;
+    const showWeights = options.some((option) => option.weight !== 1);
+    let y = 4;
+
+    if (showFilter) {
+      const state = this.modalBody!;
+      state.bodyTop += CHOICE_SEARCH_HEIGHT;
+      this.resizeModalShell(state, state.height);
+      state.body.position.set(PANEL_PADDING, state.bodyTop);
+      this.renderChoiceFilter(
+        panel,
+        availableWidth,
+        state.bodyTop - CHOICE_SEARCH_HEIGHT,
+        visibleOptions.length,
+        "Search choices",
+        compactSelection,
+        PANEL_PADDING,
+      );
+    }
+
+    if (visibleOptions.length === 0) {
+      const empty = promptText(
+        "No choices match your search",
+        compactSelection ? 14 : 12,
+        this.theme.appTheme.muted,
+        { width: availableWidth, align: "center" },
+      );
+      empty.position.set(0, y + 22);
+      body.addChild(empty);
+      y += 66;
+    }
+
+    const selectionColumns = this.layerPresentation.selectionColumns(
+      visibleOptions.every(({ option }) => !option.canRepeat),
+    );
+    const selectionGap = selectionColumns > 1 ? 8 : 0;
+    const optionWidth = (availableWidth - selectionGap * (selectionColumns - 1)) / selectionColumns;
+    const optionRowHeight = this.layerPresentation.selectionRowHeight;
+    const controlSize = getUiControlHeight();
+    const quantityWidth = controlSize * 3 + 16;
+    const stackedQuantity = optionWidth < quantityWidth + 180;
+    let rowTop = y;
+    for (const { option, index } of visibleOptions) {
+      const count = this.counts.get(index) ?? 0;
+      const currentTotal = this.selectionTotal(options);
+      const selected = count > 0;
+      const canIncrement = currentTotal + option.weight <= maxTotal;
+      const disabled = !selected && !canIncrement;
+      const label = promptRichText(
+        option.label,
+        compactSelection ? 16 : 13,
+        this.theme.appTheme.foreground,
+        Math.max(
+          1,
+          optionWidth - 58 - (option.canRepeat && !stackedQuantity ? quantityWidth + 8 : 0),
+        ),
+        { weight: "600" },
+      );
+      const labelBlockHeight =
+        label.height + (showWeights ? Math.ceil(getUiFontSize("meta") * 1.35) + 4 : 0);
+      const rowHeight = Math.max(
+        optionRowHeight,
+        labelBlockHeight + 20 + (option.canRepeat && stackedQuantity ? controlSize + 8 : 0),
+        controlSize + 16,
+      );
+      const row = new Container();
+      row.position.set(0, rowTop);
+      row.eventMode = disabled ? "none" : "static";
+      row.cursor = disabled ? "default" : "pointer";
+      row.hitArea = new Rectangle(0, 0, optionWidth, rowHeight);
+      row.accessible = true;
+      row.accessibleTitle = `${option.label}${showWeights ? `, ${option.weight} point${option.weight === 1 ? "" : "s"}` : ""}${selected ? `, selected ${count} time${count === 1 ? "" : "s"}` : ""}`;
+      row.accessibleHint = option.canRepeat
+        ? "Activate to add one selection. Use the remove control to decrease the count."
+        : "Activate to toggle this option.";
+      row.tabIndex = disabled ? -1 : 0;
+      const rowBackground = new Graphics();
+      const drawRowBackground = (hover: boolean) => {
+        rowBackground
+          .clear()
+          .roundRect(0.5, 0.5, optionWidth - 1, rowHeight - 1, 8.5)
+          .fill({
+            color: hexToNum(
+              selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme.background,
+            ),
+            alpha: selected ? (hover ? 0.2 : 0.12) : hover ? 0.78 : 0.55,
+          })
+          .stroke({
+            color: hexToNum(
+              selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme.border,
+            ),
+            width: selected ? 2 : 1,
+            alpha: selected ? 0.9 : hover ? 1 : 0.8,
+          });
+      };
+      row.on("pointerover", () => drawRowBackground(true));
+      row.on("pointerout", () => drawRowBackground(false));
+      row.on("focusin", () => drawRowBackground(true));
+      row.on("focusout", () => drawRowBackground(false));
+      drawRowBackground(false);
+      row.addChild(rowBackground);
+
+      const indicator = new Graphics()
+        .circle(22, rowHeight / 2, 10)
+        .fill({
+          color: hexToNum(
+            selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme.background,
+          ),
+          alpha: selected ? 1 : 0.55,
+        })
+        .stroke({
+          color: hexToNum(
+            selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme["muted-foreground"],
+          ),
+          width: 2,
+          alpha: selected ? 1 : 0.7,
+        });
+      row.addChild(indicator);
+      if (selected) {
+        const check = this.makeIcon(
+          "lucide-check",
+          12,
+          readableTextColor(
+            this.theme.gameTheme.cardSelection,
+            this.theme.gameTheme.canvas.shadow,
+            this.theme.gameTheme.textOnTinted,
+          ),
+        );
+        check.position.set(22, rowHeight / 2);
+        row.addChild(check);
+      }
+
+      label.position.set(42, 10);
+      row.addChild(label);
+      if (showWeights) {
+        const weight = promptText(
+          `${option.weight} point${option.weight === 1 ? "" : "s"}`,
+          compactSelection ? 12 : 10,
+          selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme["muted-foreground"],
+          { weight: "600" },
+        );
+        weight.position.set(42, 14 + label.height);
+        row.addChild(weight);
+      }
+
+      const increment = () => {
+        if (!option.canRepeat && selected) {
+          this.counts.delete(index);
+          this.rebuild();
+          return;
+        }
+        if (!canIncrement) return;
+        if (option.canRepeat) {
+          this.counts.set(index, count + 1);
+        } else {
+          if (maxTotal === 1) this.counts.clear();
+          this.counts.set(index, 1);
+        }
+        this.rebuild();
+      };
+      row.on("pointertap", increment);
+
+      if (option.canRepeat) {
+        const controlX = optionWidth - quantityWidth - 8;
+        const controlY = stackedQuantity ? labelBlockHeight + 18 : (rowHeight - controlSize) / 2;
+        const minus = this.makeButton(
+          "",
+          () => {
+            if (count <= 1) this.counts.delete(index);
+            else this.counts.set(index, count - 1);
+            this.rebuild();
+          },
+          {
+            title: `Remove one ${option.label}`,
+            icon: "lucide-minus",
+            outline: true,
+            compact: true,
+            disabled: count === 0,
+            width: controlSize,
+            height: controlSize,
+          },
+        );
+        minus.position.set(controlX, controlY);
+        minus.on("pointertap", (event) => event.stopPropagation());
+        const countBackground = new Graphics()
+          .roundRect(controlX + controlSize + 8, controlY, controlSize, controlSize, 7)
+          .fill({ color: hexToNum(this.theme.appTheme.muted), alpha: 0.55 });
+        const countText = promptText(String(count), 13, this.theme.appTheme.foreground, {
+          weight: "700",
+        });
+        countText.anchor.set(0.5);
+        countText.position.set(controlX + controlSize * 1.5 + 8, controlY + controlSize / 2);
+        const plus = this.makeButton("", increment, {
+          title: `Add one ${option.label}`,
+          icon: "lucide-plus",
+          outline: true,
+          compact: true,
+          disabled: !canIncrement,
+          width: controlSize,
+          height: controlSize,
+        });
+        plus.position.set(controlX + (controlSize + 8) * 2, controlY);
+        plus.on("pointertap", (event) => event.stopPropagation());
+        row.addChild(minus, countBackground, countText, plus);
+      }
+
+      row.alpha = disabled ? 0.48 : 1;
+      body.addChild(row);
+      rowTop += rowHeight + Math.max(8, this.layerPresentation.selectionRowPitch - optionRowHeight);
+    }
+
+    const selectedTotal = this.selectionTotal(options);
+    const canConfirm = selectedTotal >= minTotal && selectedTotal <= maxTotal;
+    const requirement = compactSelection
+      ? minTotal === maxTotal
+        ? `${selectedTotal} of ${maxTotal} points`
+        : `${selectedTotal} points · need ${minTotal}–${maxTotal}`
+      : minTotal === maxTotal
+        ? `${selectedTotal} of ${maxTotal} points selected`
+        : `${selectedTotal} points selected · choose ${minTotal}–${maxTotal}`;
+    const status = promptText(
+      requirement,
+      compactSelection ? 13 : 11,
+      canConfirm ? this.successForeground : this.theme.appTheme["muted-foreground"],
+      { weight: "600", width: availableWidth },
+    );
+    status.position.set(2, 10);
+    footer.addChild(status);
+    const confirmLabel = minTotal === 0 && selectedTotal === 0 ? "SKIP" : "CONFIRM";
+    const confirm = this.makeButton(
+      confirmLabel,
+      () => {
+        const chosenIndices = [...this.counts.entries()]
+          .sort(([left], [right]) => Number(left) - Number(right))
+          .flatMap(([selectedIndex, selectedCount]) =>
+            Array.from({ length: selectedCount }, () => Number(selectedIndex)),
+          );
+        this.spec!.respond({ type: "selectionDecision", chosenIndices });
+      },
+      {
+        disabled: !canConfirm,
+        width: confirmWidth,
+        title: `${confirmLabel}. ${requirement}`,
+      },
+    );
+    confirm.position.set(availableWidth - confirm.buttonWidth, 0);
+    footer.addChild(confirm);
+  }
+
+  protected selectionTotal(options: SelectionOption[]): number {
+    let total = 0;
+    for (const [index, count] of this.counts) {
+      if (typeof index === "number") total += count * (options[index]?.weight ?? 0);
+    }
+    return total;
+  }
+
+  protected renderChoiceFilter(
+    parent: Container,
+    width: number,
+    y: number,
+    resultCount: number,
+    placeholder: string,
+    compact: boolean,
+    x = 0,
+  ): void {
+    const filter = new Container();
+    filter.position.set(x, y);
+    parent.addChild(filter);
+    const background = new Graphics();
+    background.eventMode = "static";
+    background.cursor = "text";
+    background.accessible = true;
+    background.accessibleTitle = `${placeholder}. Start typing to search.`;
+    background.tabIndex = 0;
+    background.on("focusin", () => this.setSelectionFilterFocused(true));
+    background.on("focusout", () => this.setSelectionFilterFocused(false));
+    if (!this.choiceSearchInput) {
+      const input = document.createElement("input");
+      input.type = "search";
+      input.setAttribute("aria-label", placeholder);
+      input.autocomplete = "off";
+      input.autocapitalize = "off";
+      input.spellcheck = false;
+      input.style.cssText =
+        "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none;font-size:16px";
+      input.addEventListener("focus", () => this.setSelectionFilterFocused(true));
+      input.addEventListener("input", () => {
+        this.selectionFilter = input.value;
+        this.selectionFilterFocused = true;
+        this.modalScrollOffset = 0;
+        this.modalScrollTarget = 0;
+        this.rebuild();
+      });
+      input.addEventListener("blur", () => this.setSelectionFilterFocused(false));
+      input.addEventListener("keydown", (event) => {
+        if (event.isComposing) return;
+        if (event.key === "Enter") {
+          event.preventDefault();
+          input.blur();
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          if (input.value) {
+            input.value = "";
+            input.dispatchEvent(new Event("input"));
+          } else {
+            input.blur();
+          }
+        }
+      });
+      document.body.append(input);
+      this.choiceSearchInput = input;
+    }
+    this.choiceSearchInput.setAttribute("aria-label", placeholder);
+    if (this.choiceSearchInput.value !== this.selectionFilter)
+      this.choiceSearchInput.value = this.selectionFilter;
+    background.on("pointerdown", (event: FederatedPointerEvent) => {
+      event.preventDefault();
+      this.choiceSearchInput?.focus({ preventScroll: true });
+    });
+    const searchIcon = this.makeIcon(
+      "lucide-search",
+      15,
+      this.selectionFilter
+        ? this.theme.appTheme.foreground
+        : this.theme.appTheme["muted-foreground"],
+    );
+    searchIcon.position.set(16, Math.max(40, getUiControlFloor()) / 2);
+    const showResultCount = width >= CHOICE_SEARCH_COUNT_MIN_WIDTH;
+    const searchText = promptText(
+      this.selectionFilter || placeholder,
+      compact ? 15 : 12,
+      this.selectionFilter
+        ? this.theme.appTheme.foreground
+        : this.theme.appTheme["muted-foreground"],
+      { width: Math.max(1, width - (showResultCount ? 160 : 86)), truncate: true, role: "input" },
+    );
+    searchText.position.set(30, (getUiControlHeight() - searchText.height) / 2);
+    const countText = promptText(
+      `${resultCount} result${resultCount === 1 ? "" : "s"}`,
+      compact ? 12 : 10,
+      this.theme.appTheme["muted-foreground"],
+      { weight: "600" },
+    );
+    countText.anchor.set(1, 0.5);
+    countText.position.set(
+      width - (this.selectionFilter ? getUiControlHeight() + 8 : 10),
+      getUiControlHeight() / 2,
+    );
+    countText.visible = showResultCount;
+    const caret = new Graphics()
+      .rect(
+        searchText.x + (this.selectionFilter ? searchText.width + 2 : 0),
+        searchText.y,
+        1.5,
+        searchText.height,
+      )
+      .fill({ color: hexToNum(this.theme.gameTheme.cardRing) });
+    caret.eventMode = "none";
+    filter.addChild(background, searchIcon, searchText, countText, caret);
+    this.selectionFilterView = { container: filter, background, caret, width, y: 0 };
+    if (this.selectionFilter) {
+      const clear = this.makeButton(
+        "",
+        () => {
+          this.selectionFilter = "";
+          this.selectionFilterFocused = true;
+          this.modalScrollOffset = 0;
+          this.modalScrollTarget = 0;
+          this.rebuild();
+          this.choiceSearchInput?.focus({ preventScroll: true });
+        },
+        {
+          title: "Clear filter",
+          icon: "lucide-x",
+          outline: true,
+          compact: true,
+          width: 30,
+          height: 30,
+        },
+      );
+      clear.position.set(width - clear.buttonWidth, 0);
+      filter.addChild(clear);
+    }
+    this.setSelectionFilterFocused(this.selectionFilterFocused);
+  }
+
+  protected renderCards(
+    presentation: PromptPresentation,
+    cards: CardDto[],
+    min: number,
+    max: number,
+    reveal: boolean,
+  ): void {
+    const showFilter = !reveal && cards.length > 1;
+    const normalizedFilter = this.selectionFilter.toLocaleLowerCase();
+    const visibleIndices = showFilter
+      ? cards.reduce<number[]>((indices, card, index) => {
+          if (card.identity.name.toLocaleLowerCase().includes(normalizedFilter))
+            indices.push(index);
+          return indices;
+        }, [])
+      : null;
+    const visibleCount = visibleIndices?.length ?? cards.length;
+    const sections = promptCardSections(cards, visibleIndices ?? cards.map((_, index) => index));
+    const sectionHeaderHeight = sections.some((section) => section.label !== null)
+      ? CARD_SECTION_HEADER_HEIGHT
+      : 0;
+    const horizontalScroll =
+      this.layerPresentation.cardLayout(this.viewportHeight) === "horizontal-scroll";
+    const { width: preferredCardWidth } = this.promptCardDimensions(
+      this.layerPresentation.cardMaxHeight(this.viewportHeight),
+    );
+    const maxCardWidthRatio = Math.max(
+      1,
+      ...cards.map((card) => this.promptCardDisplayDimensions(card, CARD_W).width / CARD_W),
+    );
+    const preferredRowWidth =
+      cards.length * preferredCardWidth * maxCardWidthRatio +
+      Math.max(0, cards.length - 1) * PROMPT_CARD_GAP +
+      PANEL_PADDING * 2 +
+      CARD_TILE_EDGE_INSET * 2;
+    const width = this.modalPromptWidth(
+      Math.min(PROMPT_CARD_MODAL_MAX_WIDTH, Math.max(CARD_PROMPT_MIN_WIDTH, preferredRowWidth)),
+    );
+    const cardAreaWidth = width - PANEL_PADDING * 2 - CARD_TILE_EDGE_INSET * 2;
+    const portraitCardWidth = Math.max(
+      1,
+      Math.min(preferredCardWidth, cardAreaWidth / maxCardWidthRatio),
+    );
+    const cardSizes = cards.map((card) =>
+      this.promptCardDisplayDimensions(card, portraitCardWidth),
+    );
+    const cardWidth = Math.max(0, ...cardSizes.map((size) => size.width));
+    const cardHeight = Math.max(0, ...cardSizes.map((size) => size.height));
+    const columns = horizontalScroll
+      ? Math.max(1, visibleCount)
+      : Math.max(
+          1,
+          Math.min(
+            visibleCount,
+            Math.floor((cardAreaWidth + PROMPT_CARD_GAP) / (cardWidth + PROMPT_CARD_GAP)),
+          ),
+        );
+    const rows = horizontalScroll
+      ? Math.min(1, visibleCount)
+      : sections.reduce((total, section) => total + Math.ceil(section.indices.length / columns), 0);
+    const headersHeight = horizontalScroll
+      ? sectionHeaderHeight
+      : sectionHeaderHeight * sections.length;
+    const compactScrollRow = horizontalScroll;
+    const compactCardSpacing =
+      visibleCount <= 1
+        ? 0
+        : compactScrollRow
+          ? cardWidth + PROMPT_CARD_GAP
+          : Math.min(
+              cardWidth + PROMPT_CARD_GAP,
+              Math.max(0, (cardAreaWidth - cardWidth) / (visibleCount - 1)),
+            );
+    const height = Math.min(
+      this.viewportHeight - 24,
+      244 + rows * (cardHeight + PROMPT_CARD_ROW_GAP) + headersHeight,
+    );
+    const { panel, body, footer } = this.createModalShell(
+      width,
+      height,
+      reveal
+        ? {
+            ...presentation,
+            description:
+              presentation.description ??
+              `${cards.length} card${cards.length === 1 ? "" : "s"} shown`,
+          }
+        : presentation,
+      true,
+      60,
+      36,
+      true,
+    );
+    if (showFilter) {
+      const state = this.modalBody!;
+      this.renderChoiceFilter(
+        panel,
+        width - PANEL_PADDING * 2,
+        state.bodyTop,
+        visibleCount,
+        "Search cards by name",
+        horizontalScroll,
+        PANEL_PADDING,
+      );
+      state.bodyTop += 52;
+      this.resizeModalShell(state, state.height);
+      state.body.position.set(PANEL_PADDING, state.bodyTop);
+    }
+    const startY = 4;
+    if (showFilter && visibleCount === 0) {
+      const empty = promptText(
+        "No cards match your search",
+        12,
+        this.theme.appTheme["muted-foreground"],
+        { width: width - PANEL_PADDING * 2, align: "center" },
+      );
+      empty.position.set(0, startY + 22);
+      body.addChild(empty);
+    }
+    const compactScrollRowWidth =
+      visibleCount > 0 ? (visibleCount - 1) * compactCardSpacing + cardWidth : 0;
+    const compactScrollOverflow = compactScrollRow && compactScrollRowWidth > cardAreaWidth;
+    const cardRow = compactScrollOverflow ? new Container() : null;
+    if (cardRow) {
+      cardRow.eventMode = "static";
+      cardRow.once("destroyed", () => gsap.killTweensOf(cardRow));
+      body.addChild(cardRow);
+    }
+    const rowX = (cardsInRow: number) => {
+      const rowWidth = horizontalScroll
+        ? cardWidth + compactCardSpacing * Math.max(0, visibleCount - 1)
+        : cardsInRow * cardWidth + Math.max(0, cardsInRow - 1) * PROMPT_CARD_GAP;
+      return CARD_TILE_EDGE_INSET + Math.max(0, (cardAreaWidth - rowWidth) / 2);
+    };
+    let position = 0;
+    let sectionTop = startY;
+    sections.forEach((section, sectionIndex) => {
+      if (section.label !== null) {
+        const lastSection = sectionIndex === sections.length - 1;
+        const headerX = horizontalScroll
+          ? rowX(visibleCount) + position * compactCardSpacing
+          : CARD_TILE_EDGE_INSET;
+        const headerWidth = horizontalScroll
+          ? Math.max(
+              1,
+              (section.indices.length - 1) * compactCardSpacing +
+                (lastSection ? cardWidth : compactCardSpacing - PROMPT_CARD_GAP),
+            )
+          : cardAreaWidth;
+        const header = promptText(
+          section.label,
+          this.viewportWidth < 760 ? 18 : 22,
+          this.theme.appTheme.foreground,
+          { weight: "800", truncate: true, width: headerWidth },
+        );
+        header.position.set(headerX, sectionTop);
+        const ruleY = sectionTop + header.height + 6;
+        const rule = new Graphics()
+          .moveTo(headerX, ruleY)
+          .lineTo(headerX + headerWidth, ruleY)
+          .stroke({ color: hexToNum(this.theme.appTheme.border), width: 2 });
+        (cardRow ?? body).addChild(header, rule);
+        if (!horizontalScroll) sectionTop += sectionHeaderHeight;
+      }
+      const cardsTop = horizontalScroll ? startY + sectionHeaderHeight : sectionTop;
+      section.indices.forEach((index, sectionPosition) => {
+        const card = cards[index]!;
+        const selected = this.selectedIds.has(card.id);
+        const disabled = !reveal && max !== 1 && this.selectedIds.size >= max && !selected;
+        const cardSize = cardSizes[index]!;
+        const tile = this.createCardTile(
+          card,
+          selected,
+          disabled,
+          cardSize.width,
+          cardSize.height,
+          reveal
+            ? undefined
+            : () => {
+                if (disabled) return;
+                if (selected) {
+                  this.selectedIds.delete(card.id);
+                } else {
+                  if (max === 1) this.selectedIds.clear();
+                  this.selectedIds.add(card.id);
+                }
+                this.rebuild();
+              },
+        );
+        const row = horizontalScroll ? 0 : Math.floor(sectionPosition / columns);
+        const column = horizontalScroll ? position : sectionPosition % columns;
+        const cardsInRow = Math.min(columns, section.indices.length - row * columns);
+        tile.position.set(
+          rowX(cardsInRow) +
+            column * (horizontalScroll ? compactCardSpacing : cardWidth + PROMPT_CARD_GAP) +
+            (cardWidth - cardSize.width) / 2,
+          cardsTop + row * (cardHeight + PROMPT_CARD_ROW_GAP) + (cardHeight - cardSize.height) / 2,
+        );
+        (cardRow ?? body).addChild(tile);
+        position++;
+      });
+      if (!horizontalScroll)
+        sectionTop +=
+          Math.ceil(section.indices.length / columns) * (cardHeight + PROMPT_CARD_ROW_GAP);
+    });
+    if (cardRow) {
+      const panLimit = cardAreaWidth - compactScrollRowWidth;
+      const rowsHeight = rows * (cardHeight + PROMPT_CARD_ROW_GAP) + sectionHeaderHeight;
+      const pitch = cardWidth + compactCardSpacing;
+      const promptId = this.spec?.currentPrompt?.promptId ?? null;
+      if (this.compactScrollPan?.promptId !== promptId) {
+        this.compactScrollPan = { promptId, x: CARD_TILE_EDGE_INSET };
+      }
+      cardRow.x = Math.min(CARD_TILE_EDGE_INSET, Math.max(panLimit, this.compactScrollPan.x));
+      const panStatus = promptText("", 11, this.theme.appTheme["muted-foreground"], {
+        weight: "600",
+      });
+      cardRow.mask = new Graphics()
+        .rect(
+          CARD_TILE_EDGE_INSET,
+          startY - CARD_TILE_EDGE_INSET,
+          cardAreaWidth,
+          rowsHeight + CARD_H,
+        )
+        .fill({ color: 0xffffff });
+      let panning = false;
+      let panMoved = false;
+      let panStartX = 0;
+      let panOrigin = 0;
+      let panLastX = 0;
+      let panLastAt = 0;
+      let panVelocity = 0;
+      const updatePanStatus = () => {
+        if (this.compactScrollPan) this.compactScrollPan.x = cardRow.x;
+        const first = Math.min(
+          cards.length,
+          Math.max(1, Math.round((CARD_TILE_EDGE_INSET - cardRow.x) / pitch) + 1),
+        );
+        panStatus.text = `${first} / ${cards.length}`;
+        panStatus.position.set(
+          PANEL_PADDING + cardAreaWidth - panStatus.width,
+          startY + rowsHeight + 8,
+        );
+      };
+      body.eventMode = "static";
+      body.hitArea = new Rectangle(0, 0, width, height);
+      body.cursor = "grab";
+      body.on("pointerdown", (event: FederatedPointerEvent) => {
+        gsap.killTweensOf(cardRow);
+        panning = true;
+        panMoved = false;
+        for (const child of cardRow.children) this.suppressedTapItems.delete(child);
+        panStartX = event.global.x;
+        panOrigin = cardRow.x;
+        panLastX = event.global.x;
+        panLastAt = performance.now();
+        panVelocity = 0;
+        cardRow.cursor = "grabbing";
+      });
+      body.on("pointermove", (event: FederatedPointerEvent) => {
+        if (!panning) return;
+        cardRow.x = Math.min(0, Math.max(panLimit, panOrigin + (event.global.x - panStartX)));
+        if (this.compactScrollPan) this.compactScrollPan.x = cardRow.x;
+        if (!panMoved && Math.abs(event.global.x - panStartX) > 8) {
+          panMoved = true;
+          for (const child of cardRow.children) this.suppressedTapItems.add(child);
+        }
+        const now = performance.now();
+        const elapsed = now - panLastAt;
+        if (elapsed > 0) {
+          panVelocity = 0.7 * panVelocity + 0.3 * ((event.global.x - panLastX) / elapsed);
+          panLastX = event.global.x;
+          panLastAt = now;
+        }
+        updatePanStatus();
+      });
+      const stopPan = () => {
+        if (!panning) return;
+        panning = false;
+        cardRow.cursor = "grab";
+        const projected = Math.min(0, Math.max(panLimit, cardRow.x + panVelocity * 180));
+        if (Math.abs(projected - cardRow.x) > 2) {
+          gsap.to(cardRow, {
+            x: projected,
+            duration: 0.4,
+            ease: "power3.out",
+            onUpdate: updatePanStatus,
+          });
+        }
+      };
+      body.on("pointerup", stopPan);
+      body.on("pointerupoutside", stopPan);
+      body.addChild(panStatus);
+      updatePanStatus();
+    }
+    const chosen = [...this.selectedIds];
+    const canConfirm = reveal || (chosen.length >= min && chosen.length <= max);
+    const status = promptText(
+      reveal
+        ? `${cards.length} card${cards.length === 1 ? "" : "s"} revealed`
+        : `${chosen.length} of ${max} selected`,
+      11,
+      canConfirm ? this.successForeground : this.theme.appTheme["muted-foreground"],
+      { weight: "600" },
+    );
+    status.position.set(0, 10);
+    footer.addChild(status);
+    const label = reveal ? "CONTINUE" : chosen.length === 0 && min === 0 ? "SKIP" : "CONFIRM";
+    const confirm = this.makeButton(
+      label,
+      () => {
+        if (reveal) this.spec!.respond({ type: "revealCardsAcknowledged" });
+        else this.spec!.respond({ type: "chooseCardsDecision", chosenCardIds: chosen });
+      },
+      { disabled: !canConfirm, width: 136 },
+    );
+    confirm.position.set(width - PANEL_PADDING * 2 - confirm.buttonWidth, 0);
+    footer.addChild(confirm);
+    if (compactScrollRow && compactScrollOverflow && this.spec?.action.onBrowseRevealGrid) {
+      const grid = this.makeButton("GRID", () => this.spec!.action.onBrowseRevealGrid?.(), {
+        width: 96,
+      });
+      grid.position.set(confirm.x - grid.buttonWidth - 8, 0);
+      footer.addChild(grid);
+    }
+  }
+
+  protected createCardTile(
+    card: CardDto,
+    selected: boolean,
+    disabled: boolean,
+    width: number,
+    height: number,
+    onPress?: () => void,
+    actionable = !!onPress,
+  ): Container {
+    const tile = new Container();
+    const radius = (CARD_RADIUS * width) / CARD_W;
+    tile.eventMode = "static";
+    tile.cursor = disabled ? "default" : onPress ? "pointer" : "default";
+    tile.hitArea = new Rectangle(0, 0, width, height);
+    tile.accessible = true;
+    tile.accessibleTitle = `${card.identity.name}${selected ? ", selected" : ""}${
+      disabled ? ", unavailable" : ""
+    }`;
+    tile.accessibleHint = disabled
+      ? "This card is not currently available"
+      : onPress
+        ? selected
+          ? "Activate to deselect this card"
+          : "Activate to select this card"
+        : "Focus or hover, then change view or flip face";
+    tile.tabIndex = disabled ? -1 : 0;
+    const sprite = new CardSprite(card, "hand");
+    this.configurePromptCardSprite(sprite, card);
+    const placeSprite = () => {
+      const rotated = sprite.horizontalFrame && !this.promptCardState(card).horizontalFlipped;
+      sprite.rotation = rotated ? -Math.PI / 2 : 0;
+      const horizontal = sprite.horizontalFrame && !rotated;
+      const cardWidth = horizontal ? CARD_H : CARD_W;
+      const cardHeight = horizontal ? CARD_W : CARD_H;
+      const scale = Math.min(width / cardWidth, height / cardHeight);
+      sprite.scale.set(scale);
+      sprite.setHandRulesScale(scale);
+      sprite.syncHandControlsScale();
+      sprite.position.set((cardWidth * scale) / 2, (cardHeight * scale) / 2);
+    };
+    sprite.onReorient = placeSprite;
+    placeSprite();
+    sprite.eventMode = "passive";
+    tile.addChild(sprite);
+    this.bindPromptCardActivation(tile, card, sprite, actionable && !disabled);
+    if (disabled) {
+      const unavailable = new Graphics()
+        .roundRect(0, 0, width, height, radius)
+        .fill({ color: hexToNum(this.theme.appTheme.card), alpha: 0.28 });
+      unavailable.eventMode = "none";
+      tile.addChild(unavailable);
+    }
+    if (selected) {
+      const ring = new Graphics()
+        .roundRect(0, 0, width, height, radius)
+        .stroke({ color: hexToNum(this.theme.gameTheme.cardSelection), width: 4 });
+      ring.eventMode = "none";
+      const badge = new Graphics()
+        .circle(width - 14, 14, 12)
+        .fill({ color: hexToNum(this.theme.gameTheme.cardSelection) })
+        .stroke({ color: hexToNum(this.theme.appTheme.card), width: 2 });
+      badge.eventMode = "none";
+      const check = this.makeIcon(
+        "lucide-check",
+        13,
+        readableTextColor(
+          this.theme.gameTheme.cardSelection,
+          this.theme.gameTheme.canvas.shadow,
+          this.theme.gameTheme.textOnTinted,
+        ),
+      );
+      check.position.set(width - 14, 14);
+      tile.addChild(ring, badge, check);
+    }
+    tile.alpha = disabled ? 0.72 : 1;
+    tile.on("pointertap", () => {
+      if (this.suppressedTapItems.delete(tile)) return;
+      if (disabled) return;
+      onPress?.();
+    });
+    return tile;
+  }
+
+  protected createScryDestinationTile(
+    card: CardDto,
+    selected: boolean,
+    disabled: boolean,
+    width: number,
+    height: number,
+    onPress?: () => void,
+  ): Container {
+    const tile = new Container();
+    tile.eventMode = "static";
+    tile.cursor = disabled ? "default" : "pointer";
+    tile.hitArea = new Rectangle(0, 0, width, height);
+    tile.accessible = !disabled;
+    tile.accessibleTitle = `${card.identity.name}${selected ? ", selected" : ""}`;
+    tile.accessibleHint = selected
+      ? "Activate to deselect this card"
+      : "Activate to select this card";
+    tile.tabIndex = disabled ? -1 : 0;
+    const sprite = new CardSprite(card, "zone");
+    const state = this.promptCardState(card);
+    sprite.onVisualChange = this.callbacks.onRenderRequested;
+    sprite.setPreviewFace(state.face);
+    const placeSprite = () => {
+      const rotated = sprite.horizontalFrame && !state.horizontalFlipped;
+      sprite.rotation = rotated ? -Math.PI / 2 : 0;
+      const horizontal = sprite.horizontalFrame && !rotated;
+      const cardWidth = horizontal ? CARD_H : CARD_W;
+      const cardHeight = horizontal ? CARD_W : CARD_H;
+      const scale = Math.min(width / cardWidth, height / cardHeight);
+      sprite.scale.set(scale);
+      sprite.position.set((cardWidth * scale) / 2, (cardHeight * scale) / 2);
+    };
+    sprite.onReorient = placeSprite;
+    placeSprite();
+    sprite.eventMode = "none";
+    tile.addChild(sprite);
+    if (disabled) this.bindPromptCardLongPress(tile, card, sprite);
+    else this.bindPromptCardActivation(tile, card, sprite, true);
+    if (selected) {
+      const ring = new Graphics()
+        .roundRect(0, 0, width, height, CARD_RADIUS)
+        .stroke({ color: hexToNum(this.theme.gameTheme.cardSelection), width: 3 });
+      ring.eventMode = "none";
+      tile.addChild(ring);
+    }
+    tile.alpha = disabled ? 0.72 : 1;
+    tile.on("pointertap", () => {
+      if (this.suppressedTapItems.delete(tile)) return;
+      if (!disabled) onPress?.();
+    });
+    return tile;
+  }
+
+  protected renderColors(
+    presentation: PromptPresentation,
+    validColors: string[],
+    amount: number,
+    repeatAllowed: boolean,
+  ): void {
+    const width = this.modalPromptWidth(620);
+    const height = Math.min(
+      this.viewportHeight - 24,
+      amount <= 1 ? 230 : 190 + validColors.length * 64,
+    );
+    const { body, footer } = this.createModalShell(
+      width,
+      height,
+      presentation,
+      true,
+      amount <= 1 ? 0 : 60,
+    );
+    const availableWidth = width - PANEL_PADDING * 2;
+    const colors: Record<string, string> = {
+      White: this.theme.gameTheme.mana.W,
+      Blue: this.theme.gameTheme.mana.U,
+      Black: this.theme.gameTheme.mana.B,
+      Red: this.theme.gameTheme.mana.R,
+      Green: this.theme.gameTheme.mana.G,
+      Colorless: this.theme.gameTheme.mana.C,
+      W: this.theme.gameTheme.mana.W,
+      U: this.theme.gameTheme.mana.U,
+      B: this.theme.gameTheme.mana.B,
+      R: this.theme.gameTheme.mana.R,
+      G: this.theme.gameTheme.mana.G,
+      C: this.theme.gameTheme.mana.C,
+    };
+    if (amount <= 1) {
+      const colorLayout = this.layerPresentation.colorChoiceLayout(
+        validColors.length,
+        availableWidth,
+        ROW_GAP,
+      );
+      const { columns, buttonWidth, buttonHeight } = colorLayout;
+      const gap = columns > 1 ? ROW_GAP : 0;
+      const buttons = validColors.map((color) =>
+        this.makeButton(
+          "",
+          () => this.spec!.respond({ type: "colorDecision", chosenColors: { [color]: 1 } }),
+          {
+            title: color,
+            color: colors[color] ?? this.theme.appTheme.muted,
+            foreground: readableTextColor(
+              colors[color] ?? this.theme.appTheme.muted,
+              this.theme.gameTheme.canvas.background,
+              this.theme.gameTheme.textOnTinted,
+            ),
+            width: buttonWidth,
+            height: buttonHeight,
+            iconTexture: loadManaSymbolTexture(this.manaSymbol(color)),
+            iconTint: false,
+            iconSize: 28,
+          },
+        ),
+      );
+      if (colorLayout.grid) {
+        buttons.forEach((button, index) => {
+          button.position.set(
+            (index % columns) * (buttonWidth + gap),
+            8 + Math.floor(index / columns) * (buttonHeight + gap),
+          );
+          body.addChild(button);
+        });
+      } else {
+        this.addButtonRow(body, buttons, 18, availableWidth);
+      }
+      return;
+    }
+
+    const total = [...this.counts.values()].reduce((sum, value) => sum + value, 0);
+    let y = 4;
+    const controlSize = Math.max(34, getUiControlFloor());
+    const quantityWidth = controlSize * 3 + 16;
+    const stackedControls = availableWidth < quantityWidth + 200;
+    const rowHeight =
+      Math.max(
+        64,
+        Math.ceil(getUiFontSize("label") * 1.35) + Math.ceil(getUiFontSize("meta") * 1.35) + 20,
+      ) + (stackedControls ? controlSize + 8 : 0);
+    for (const color of validColors) {
+      const count = this.counts.get(color) ?? 0;
+      const colorValue = colors[color] ?? this.theme.appTheme.muted;
+      const selected = count > 0;
+      const row = new Container();
+      row.position.set(0, y);
+      const rowBackground = new Graphics()
+        .roundRect(0, 0, availableWidth, rowHeight, 9)
+        .fill({
+          color: hexToNum(selected ? colorValue : this.theme.appTheme.background),
+          alpha: selected ? 0.12 : 0.55,
+        })
+        .stroke({
+          color: hexToNum(selected ? colorValue : this.theme.appTheme.border),
+          width: selected ? 2 : 1,
+          alpha: selected ? 0.9 : 0.8,
+        });
+      const manaIcon = this.makeManaIcon(this.manaSymbol(color), 30);
+      manaIcon.position.set(30, 28);
+      const colorText = promptText(color, 13, this.theme.appTheme.foreground, {
+        weight: "600",
+        role: "label",
+      });
+      colorText.position.set(54, 13);
+      const stateText = promptText(
+        selected ? `${count} selected` : "Not selected",
+        10,
+        selected ? colorValue : this.theme.appTheme["muted-foreground"],
+        { weight: "600" },
+      );
+      stateText.position.set(54, colorText.y + colorText.height + 2);
+      row.addChild(rowBackground, manaIcon, colorText, stateText);
+
+      const controlX = availableWidth - quantityWidth - 8;
+      const controlY = stackedControls
+        ? rowHeight - controlSize - 8
+        : (rowHeight - controlSize) / 2;
+      const minus = this.makeButton(
+        "",
+        () => {
+          if (count <= 1) this.counts.delete(color);
+          else this.counts.set(color, count - 1);
+          this.rebuild();
+        },
+        {
+          title: `Remove one ${color}`,
+          icon: "lucide-minus",
+          color: colorValue,
+          outline: true,
+          disabled: count <= 0,
+          compact: true,
+          width: controlSize,
+          height: controlSize,
+        },
+      );
+      minus.position.set(controlX, controlY);
+      const countBackground = new Graphics()
+        .roundRect(controlX + controlSize + 8, controlY, controlSize, controlSize, 7)
+        .fill({ color: hexToNum(this.theme.appTheme.muted), alpha: 0.55 });
+      const countText = promptText(String(count), 14, this.theme.appTheme.foreground, {
+        weight: "700",
+      });
+      countText.anchor.set(0.5);
+      countText.position.set(controlX + controlSize * 1.5 + 8, controlY + controlSize / 2);
+      const plus = this.makeButton(
+        "",
+        () => {
+          this.counts.set(color, count + 1);
+          this.rebuild();
+        },
+        {
+          title: `Add one ${color}`,
+          icon: "lucide-plus",
+          color: colorValue,
+          outline: true,
+          disabled: total >= amount || (!repeatAllowed && count >= 1),
+          compact: true,
+          width: controlSize,
+          height: controlSize,
+        },
+      );
+      plus.position.set(controlX + (controlSize + 8) * 2, controlY);
+      row.addChild(minus, countBackground, countText, plus);
+      body.addChild(row);
+      y += rowHeight + 8;
+    }
+
+    const ready = total === amount;
+    let previewX = 0;
+    for (const [color, count] of this.counts) {
+      if (typeof color !== "string" || count <= 0) continue;
+      const icon = this.makeManaIcon(this.manaSymbol(color), 24);
+      icon.position.set(previewX + 12, 18);
+      footer.addChild(icon);
+      previewX += 27;
+      if (count > 1) {
+        const countLabel = promptText(`×${count}`, 10, this.theme.appTheme.foreground, {
+          weight: "700",
+        });
+        countLabel.position.set(previewX - 1, 11);
+        footer.addChild(countLabel);
+        previewX += countLabel.width + 8;
+      }
+    }
+    const status = promptText(
+      ready ? "Ready" : `${amount - total} left`,
+      11,
+      ready ? this.successForeground : this.theme.appTheme["muted-foreground"],
+      { weight: "600" },
+    );
+    status.position.set(previewX + (previewX > 0 ? 4 : 0), 11);
+    footer.addChild(status);
+    const confirm = this.makeButton(
+      "CONFIRM",
+      () => {
+        const chosenColors: Record<string, number> = {};
+        for (const [color, count] of this.counts) {
+          if (typeof color === "string" && count > 0) chosenColors[color] = count;
+        }
+        this.spec!.respond({ type: "colorDecision", chosenColors });
+      },
+      { disabled: !ready, width: 120 },
+    );
+    confirm.position.set(availableWidth - confirm.buttonWidth, 0);
+    footer.addChild(confirm);
+  }
+
+  protected renderNumber(presentation: PromptPresentation, min: number, max: number): void {
+    const range = max - min + 1;
+    const width = this.modalPromptWidth(520);
+    const height = Math.min(range <= 10 ? 250 : 275, this.viewportHeight - 24);
+    const { body, footer } = this.createModalShell(
+      width,
+      height,
+      presentation,
+      true,
+      range <= 10 ? 0 : 60,
+    );
+    const availableWidth = width - PANEL_PADDING * 2;
+    if (range <= 10) {
+      const buttons = Array.from({ length: range }, (_, index) => {
+        const value = min + index;
+        return this.makeButton(
+          String(value),
+          () => this.spec!.respond({ type: "numberDecision", chosenNumber: value }),
+          {
+            outline: true,
+            compact: true,
+            width: 48,
+            height: 52,
+          },
+        );
+      });
+      this.addButtonRow(body, buttons, 20, availableWidth);
+      return;
+    }
+
+    const parsedValue = Number(this.numberBuffer);
+    const isValid =
+      this.numberBuffer !== "" &&
+      this.numberBuffer !== "-" &&
+      Number.isInteger(parsedValue) &&
+      parsedValue >= min &&
+      parsedValue <= max;
+    const showInvalid = this.numberBuffer !== "" && this.numberBuffer !== "-" && !isValid;
+    const setValue = (value: number) => {
+      this.numberValue = Math.max(min, Math.min(max, value));
+      this.numberBuffer = String(this.numberValue);
+      this.rebuild();
+    };
+    const numberLayout = this.layerPresentation.numberControlLayout(availableWidth);
+    const controlGap = numberLayout.gap;
+    const edgeWidth = Math.max(numberLayout.edgeWidth, getUiControlFloor());
+    const stepWidth = Math.max(numberLayout.stepWidth, getUiControlFloor());
+    const valueWidth = Math.max(
+      numberLayout.minimumValueWidth,
+      availableWidth - edgeWidth * 2 - stepWidth * 2 - controlGap * 4,
+    );
+    let x = 0;
+    const minimum = this.makeButton("MIN", () => setValue(min), {
+      title: `Set to minimum ${min}`,
+      outline: true,
+      width: edgeWidth,
+      height: 56,
+    });
+    minimum.position.set(x, 12);
+    body.addChild(minimum);
+    x += edgeWidth + controlGap;
+
+    const decrease = this.makeButton("", () => setValue((isValid ? parsedValue : min) - 1), {
+      title: "Decrease value",
+      icon: "lucide-minus",
+      iconSize: 20,
+      outline: true,
+      disabled: isValid && parsedValue <= min,
+      width: stepWidth,
+      height: 56,
+    });
+    decrease.position.set(x, 12);
+    body.addChild(decrease);
+    x += stepWidth + controlGap;
+
+    const focused = this.numberInputFocused;
+    const valueX = x;
+    const valueBackground = new Graphics()
+      .roundRect(x, 12, valueWidth, 56, 9)
+      .fill({ color: hexToNum(this.theme.appTheme.background), alpha: focused ? 0.9 : 0.72 })
+      .stroke({
+        color: hexToNum(
+          showInvalid
+            ? this.theme.appTheme.destructive
+            : focused
+              ? this.theme.gameTheme.cardRing
+              : this.theme.appTheme.border,
+        ),
+        width: 2,
+        alpha: focused || showInvalid ? 1 : 0.75,
+      });
+    valueBackground.eventMode = "static";
+    valueBackground.cursor = "text";
+    valueBackground.accessible = true;
+    valueBackground.accessibleTitle = isValid
+      ? `Current value ${parsedValue}. Type to replace or edit the value.`
+      : `Enter a whole number from ${min} to ${max}.`;
+    valueBackground.tabIndex = 0;
+    valueBackground.on("pointertap", () => {
+      if (this.numberInputFocused) return;
+      this.numberInputFocused = true;
+      this.rebuild();
+    });
+    valueBackground.on("focusin", () => {
+      if (this.numberInputFocused) return;
+      this.numberInputFocused = true;
+      this.rebuild();
+    });
+    const valueText = promptText(
+      this.numberBuffer ? `${this.numberBuffer}${focused ? "│" : ""}` : "Type…",
+      this.numberBuffer ? 24 : 16,
+      this.numberBuffer ? this.theme.appTheme.foreground : this.theme.appTheme["muted-foreground"],
+      { weight: this.numberBuffer ? "700" : "500", role: "input" },
+    );
+    valueText.anchor.set(0.5);
+    valueText.position.set(x + valueWidth / 2, 40);
+    body.addChild(valueBackground, valueText);
+    x += valueWidth + controlGap;
+
+    const increase = this.makeButton("", () => setValue((isValid ? parsedValue : min) + 1), {
+      title: "Increase value",
+      icon: "lucide-plus",
+      iconSize: 20,
+      outline: true,
+      disabled: isValid && parsedValue >= max,
+      width: stepWidth,
+      height: 56,
+    });
+    increase.position.set(x, 12);
+    body.addChild(increase);
+    x += stepWidth + controlGap;
+
+    const maximum = this.makeButton("MAX", () => setValue(max), {
+      title: `Set to maximum ${max}`,
+      outline: true,
+      width: edgeWidth,
+      height: 56,
+    });
+    maximum.position.set(x, 12);
+    body.addChild(maximum);
+    if (x + maximum.buttonWidth > availableWidth) {
+      valueBackground.position.set((availableWidth - valueWidth) / 2 - valueX, -12);
+      valueText.position.set(availableWidth / 2, 28);
+      this.addButtonRow(body, [minimum, decrease, increase, maximum], 68, availableWidth);
+    }
+
+    const rangeText = promptText(
+      `Whole number from ${min} to ${max}`,
+      11,
+      showInvalid ? this.theme.appTheme.destructive : this.theme.appTheme["muted-foreground"],
+      { weight: showInvalid ? "600" : "500", width: availableWidth },
+    );
+    rangeText.position.set(0, 11);
+    footer.addChild(rangeText);
+    const confirm = this.makeButton(
+      "CONFIRM",
+      () => this.spec!.respond({ type: "numberDecision", chosenNumber: parsedValue }),
+      { disabled: !isValid, width: 126 },
+    );
+    confirm.position.set(availableWidth - confirm.buttonWidth, 0);
+    footer.addChild(confirm);
+  }
+
+  protected renderReorder(presentation: PromptPresentation, items: ReorderItem[]): void {
+    const width = this.modalPromptWidth(PROMPT_CARD_MODAL_MAX_WIDTH);
+    const contentWidth = width - PANEL_PADDING * 2;
+    const zoneWidth = contentWidth - CARD_TILE_EDGE_INSET * 2;
+    const { width: preferredCardWidth } = this.promptCardDimensions(
+      this.layerPresentation.reorderCardMaxHeight(
+        this.viewportHeight,
+        REORDER_MODAL_VERTICAL_RESERVE,
+      ),
+    );
+    const maxCardWidthRatio = Math.max(
+      ...items.map((item) => this.promptCardDisplayDimensions(item.card, CARD_W).width / CARD_W),
+    );
+    const portraitCardWidth = Math.max(
+      1,
+      Math.min(preferredCardWidth, (zoneWidth - REORDER_CARD_INSET * 2) / maxCardWidthRatio),
+    );
+    const cardSizes = new Map(
+      items.map((item) => [
+        item.id,
+        this.promptCardDisplayDimensions(item.card, portraitCardWidth),
+      ]),
+    );
+    const cardWidth = Math.max(...[...cardSizes.values()].map((size) => size.width));
+    const cardHeight = Math.max(...[...cardSizes.values()].map((size) => size.height));
+    const sourceCard = this.promptSourceCard();
+    const sourceIsInternal =
+      !!sourceCard &&
+      width + SOURCE_CARD_GAP + this.promptSourceCardDisplayDimensions().width >
+        this.layoutWidth - 24;
+    const height = Math.min(
+      this.viewportHeight - 24,
+      cardHeight +
+        REORDER_MODAL_VERTICAL_RESERVE +
+        (sourceIsInternal ? preferredCardWidth * CARD_ASPECT_RATIO : 0),
+    );
+    const { body, footer } = this.createModalShell(width, height, presentation, true, 60, 36, true);
+    const byId = new Map(items.map((item) => [item.id, item]));
+    const instruction = promptText(
+      "Drag to reorder · Leftmost resolves first",
+      12,
+      this.theme.gameTheme.promptAction.defenseAction,
+      { weight: "600", role: "body", width: contentWidth - CARD_TILE_EDGE_INSET * 2 },
+    );
+    instruction.position.set(CARD_TILE_EDGE_INSET, 2);
+    body.addChild(instruction);
+    body.sortableChildren = true;
+
+    const orderLabel = promptText("RESOLUTION ORDER", 11, this.theme.appTheme["muted-foreground"], {
+      weight: "700",
+    });
+    orderLabel.position.set(CARD_TILE_EDGE_INSET, instruction.y + instruction.height + 8);
+    body.addChild(orderLabel);
+    const orderZone = new Rectangle(
+      CARD_TILE_EDGE_INSET,
+      orderLabel.y + orderLabel.height + 8,
+      zoneWidth,
+      cardHeight + REORDER_CARD_INSET + getUiControlHeight() + 20,
+    );
+    const orderBackground = new Graphics()
+      .roundRect(orderZone.x, orderZone.y, orderZone.width, orderZone.height, 8)
+      .fill({ color: hexToNum(this.theme.appTheme.background), alpha: 0.45 })
+      .stroke({ color: hexToNum(this.theme.appTheme["muted-foreground"]), width: 2, alpha: 0.45 });
+    body.addChild(orderBackground);
+    this.dropZones.push({
+      id: REORDER_ORDER_ZONE_ID,
+      rect: orderZone,
+      container: body,
+      visual: orderBackground,
+      dropX: orderZone.x + REORDER_CARD_INSET,
+      dropY: orderZone.y + REORDER_CARD_INSET,
+      targetAlpha: 1,
+    });
+
+    this.order.forEach((id, index) => {
+      const item = byId.get(id);
+      const cardSize = cardSizes.get(id);
+      if (!item || !cardSize) return;
+      const tile = this.createCardTile(
+        item.card,
+        false,
+        false,
+        cardSize.width,
+        cardSize.height,
+        undefined,
+        true,
+      );
+      tile.accessibleTitle = `${item.card.identity.name}, position ${index + 1}`;
+      tile.accessibleHint = "Drag to reorder or use the earlier and later controls";
+      tile.zIndex = index + 1;
+      const slotX = this.reorderCardX(orderZone, cardWidth, index, this.order.length);
+      const slotY = orderZone.y + REORDER_CARD_INSET;
+      const x = slotX + (cardWidth - cardSize.width) / 2;
+      const y = slotY + (cardHeight - cardSize.height) / 2;
+      tile.position.set(x, y);
+      this.makeDraggable(
+        tile,
+        (dropX, dropY) => this.dropReorderCard(id, cardWidth, dropX, dropY),
+        (dropX, dropY) => this.reorderDropPosition(id, cardWidth, dropX, dropY),
+        (dragX, dragY) => this.previewReorderGap(id, cardWidth, dragX, dragY),
+      );
+      const rank = new Graphics()
+        .circle(0, 0, Math.max(13, getUiFontFloor("meta") * 1.2))
+        .fill(hexToNum(index === 0 ? this.theme.gameTheme.cardRing : this.theme.appTheme.muted));
+      const rankText = promptText(
+        String(index + 1),
+        11,
+        index === 0
+          ? readableTextColor(
+              this.theme.gameTheme.cardRing,
+              this.theme.gameTheme.canvas.shadow,
+              this.theme.gameTheme.textOnTinted,
+            )
+          : this.theme.appTheme["muted-foreground"],
+        { weight: "700" },
+      );
+      rankText.anchor.set(0.5);
+      tile.addChild(rank, rankText);
+
+      const move = (offset: number) => {
+        const target = Math.max(0, Math.min(this.order.length - 1, index + offset));
+        if (target === index) return;
+        this.captureReorderCardPositions();
+        const next = [...this.order];
+        next.splice(index, 1);
+        next.splice(target, 0, id);
+        this.order = next;
+        this.rebuild();
+      };
+      const previous = this.makeButton("", () => move(-1), {
+        title: "Move earlier",
+        icon: "lucide-chevron-left",
+        outline: true,
+        compact: true,
+        disabled: index === 0,
+        width: 32,
+        backgroundColor: this.theme.gameTheme.cardRing,
+        backgroundAlpha: 0.08,
+        borderColor: this.theme.gameTheme.cardRing,
+        borderAlpha: 0.42,
+        hoverBackgroundAlpha: 0.24,
+        hoverBorderAlpha: 1,
+      });
+      const next = this.makeButton("", () => move(1), {
+        title: "Move later",
+        icon: "lucide-chevron-right",
+        outline: true,
+        compact: true,
+        disabled: index === this.order.length - 1,
+        width: 32,
+        backgroundColor: this.theme.gameTheme.cardRing,
+        backgroundAlpha: 0.08,
+        borderColor: this.theme.gameTheme.cardRing,
+        borderAlpha: 0.42,
+        hoverBackgroundAlpha: 0.24,
+        hoverBorderAlpha: 1,
+      });
+      const controlGap = 10;
+      const controlRowWidth = previous.buttonWidth + next.buttonWidth + controlGap;
+      const slotPitch =
+        this.order.length > 1
+          ? Math.max(0, (zoneWidth - cardWidth - REORDER_CARD_INSET * 2) / (this.order.length - 1))
+          : cardWidth;
+      const stackedControls = slotPitch < controlRowWidth + controlGap;
+      const controlX = stackedControls
+        ? orderZone.x + 8
+        : slotX + (cardWidth - controlRowWidth) / 2;
+      const controlY =
+        slotY +
+        cardHeight +
+        8 +
+        (stackedControls ? index * (Math.max(previous.buttonHeight, next.buttonHeight) + 8) : 0);
+      const controls = new Container();
+      controls.position.set(controlX, controlY);
+      controls.zIndex = 100 + index;
+      next.position.x = previous.buttonWidth + controlGap;
+      controls.addChild(previous, next);
+      if (stackedControls) {
+        const name = promptText(
+          `${index + 1}. ${item.card.identity.name}`,
+          12,
+          this.theme.appTheme.foreground,
+          {
+            role: "label",
+            width: Math.max(1, zoneWidth - controlRowWidth - 32),
+            truncate: true,
+          },
+        );
+        name.position.set(controlRowWidth + 12, (previous.buttonHeight - name.height) / 2);
+        controls.addChild(name);
+      }
+      body.addChild(tile, controls);
+      this.reorderCardVisuals.set(id, {
+        tile,
+        controls,
+        slotOffsetX: x - slotX,
+        slotOffsetY: y - slotY,
+        controlsOffsetX: controlX - x,
+        controlsOffsetY: controlY - y,
+        rank,
+        rankText,
+        cardName: item.card.identity.name,
+      });
+    });
+
+    const confirm = this.makeButton(
+      "CONFIRM ORDER",
+      () => this.spec!.respond({ type: "reorderDecision", orderedIds: [...this.order] }),
+      { width: 150 },
+    );
+    confirm.position.set(contentWidth - confirm.buttonWidth, 0);
+    footer.addChild(confirm);
+  }
+
+  protected reorderCardX(zone: Rectangle, cardWidth: number, index: number, count: number): number {
+    if (count <= 1) return zone.x + REORDER_CARD_INSET;
+    const available = Math.max(0, zone.width - cardWidth - REORDER_CARD_INSET * 2);
+    const spacing = Math.min(cardWidth + 12, available / (count - 1));
+    return zone.x + REORDER_CARD_INSET + index * spacing;
+  }
+
+  protected reorderInsertIndex(
+    zone: Rectangle,
+    cardWidth: number,
+    count: number,
+    x: number,
+  ): number {
+    if (count === 0) return 0;
+    const available = Math.max(0, zone.width - cardWidth - REORDER_CARD_INSET * 2);
+    const spacing = Math.min(cardWidth + 12, available / count);
+    if (spacing === 0) return count;
+    const firstCenter = zone.x + REORDER_CARD_INSET + cardWidth / 2;
+    return Math.max(0, Math.min(count, Math.round((x - firstCenter) / spacing)));
+  }
+
+  protected previewReorderGap(cardId: string, cardWidth: number, x: number, y: number): void {
+    const orderZone = this.dropZones.find((zone) => zone.id === REORDER_ORDER_ZONE_ID);
+    const target = this.findDropZone(x, y);
+    if (!orderZone) return;
+
+    let index: number | null = null;
+    if (target?.id === REORDER_ORDER_ZONE_ID) {
+      const point = target.container.toLocal({ x, y });
+      index = this.reorderInsertIndex(target.rect, cardWidth, this.order.length - 1, point.x);
+    }
+    if (this.reorderPreview?.cardId === cardId && this.reorderPreview.index === index) return;
+    this.reorderPreview = { cardId, index };
+
+    const previewOrder = this.order.filter((id) => id !== cardId);
+    if (index != null) previewOrder.splice(index, 0, cardId);
+    else previewOrder.splice(this.order.indexOf(cardId), 0, cardId);
+
+    for (const [previewIndex, id] of previewOrder.entries()) {
+      const visual = this.reorderCardVisuals.get(id);
+      if (!visual) continue;
+      const first = previewIndex === 0;
+      visual.rank
+        .clear()
+        .circle(0, 0, Math.max(13, getUiFontFloor("meta") * 1.2))
+        .fill(hexToNum(first ? this.theme.gameTheme.cardRing : this.theme.appTheme.muted));
+      visual.rankText.text = String(previewIndex + 1);
+      visual.rankText.tint = hexToNum(
+        first
+          ? readableTextColor(
+              this.theme.gameTheme.cardRing,
+              this.theme.gameTheme.canvas.shadow,
+              this.theme.gameTheme.textOnTinted,
+            )
+          : this.theme.appTheme["muted-foreground"],
+      );
+      visual.tile.accessibleTitle = `${visual.cardName}, position ${previewIndex + 1}`;
+      if (id === cardId) {
+        gsap.killTweensOf(visual.controls);
+        if (animationsEnabled()) {
+          gsap.to(visual.controls, {
+            alpha: 0,
+            duration: REORDER_PREVIEW_SECONDS,
+            ease: "power2.out",
+            overwrite: true,
+          });
+        } else {
+          visual.controls.alpha = 0;
+        }
+        continue;
+      }
+
+      const slotX = this.reorderCardX(orderZone.rect, cardWidth, previewIndex, previewOrder.length);
+      const slotY = orderZone.rect.y + REORDER_CARD_INSET;
+      const targetX = slotX + visual.slotOffsetX;
+      const targetY = slotY + visual.slotOffsetY;
+      const controlsX = targetX + visual.controlsOffsetX;
+      const controlsY = targetY + visual.controlsOffsetY;
+      if (!animationsEnabled()) {
+        visual.tile.position.set(targetX, targetY);
+        visual.controls.position.set(controlsX, controlsY);
+        continue;
+      }
+      gsap.to(visual.tile.position, {
+        x: targetX,
+        y: targetY,
+        duration: REORDER_PREVIEW_SECONDS,
+        ease: "power2.out",
+        overwrite: true,
+      });
+      gsap.to(visual.controls.position, {
+        x: controlsX,
+        y: controlsY,
+        duration: REORDER_PREVIEW_SECONDS,
+        ease: "power2.out",
+        overwrite: true,
+      });
+    }
+  }
+
+  protected dropReorderCard(cardId: string, cardWidth: number, x: number, y: number): void {
+    const target = this.findDropZone(x, y);
+    if (!target || target.id !== REORDER_ORDER_ZONE_ID) {
+      this.rebuild();
+      return;
+    }
+    this.captureReorderCardPositions();
+    const next = this.order.filter((id) => id !== cardId);
+    const point = target.container.toLocal({ x, y });
+    const index = this.reorderInsertIndex(target.rect, cardWidth, next.length, point.x);
+    next.splice(index, 0, cardId);
+    this.order = next;
+    this.rebuild();
+  }
+
+  protected reorderDropPosition(
+    cardId: string,
+    cardWidth: number,
+    x: number,
+    y: number,
+  ): { x: number; y: number } | null {
+    const target = this.findDropZone(x, y);
+    if (!target || target.id !== REORDER_ORDER_ZONE_ID) return null;
+    const nextOrder = this.order.filter((id) => id !== cardId);
+    const point = target.container.toLocal({ x, y });
+    const index = this.reorderInsertIndex(target.rect, cardWidth, nextOrder.length, point.x);
+    const visual = this.reorderCardVisuals.get(cardId);
+    return {
+      x:
+        this.reorderCardX(target.rect, cardWidth, index, nextOrder.length + 1) +
+        (visual?.slotOffsetX ?? 0),
+      y: target.rect.y + REORDER_CARD_INSET + (visual?.slotOffsetY ?? 0),
+    };
+  }
+
+  protected animateReorderLayout(): void {
+    if (animationsEnabled()) {
+      for (const [id, { tile, controls }] of this.reorderCardVisuals) {
+        const previous = this.reorderPreviousPositions.get(id);
+        if (!previous) continue;
+        const start = tile.parent!.toLocal(previous);
+        const x = tile.x;
+        const y = tile.y;
+        if (Math.hypot(x - start.x, y - start.y) < 0.5) continue;
+        const controlX = controls.x;
+        const controlY = controls.y;
+        controls.position.set(controlX + start.x - x, controlY + start.y - y);
+        tile.position.copyFrom(start);
+        gsap.to(tile.position, {
+          x,
+          y,
+          duration: REORDER_LAYOUT_SETTLE_SECONDS,
+          ease: "power3.out",
+        });
+        gsap.to(controls.position, {
+          x: controlX,
+          y: controlY,
+          duration: REORDER_LAYOUT_SETTLE_SECONDS,
+          ease: "power3.out",
+        });
+      }
+    }
+    this.reorderPreviousPositions.clear();
+  }
+
+  protected captureReorderCardPositions(): void {
+    this.reorderPreviousPositions.clear();
+    for (const [cardId, visual] of this.reorderCardVisuals) {
+      const position = visual.tile.toGlobal({ x: 0, y: 0 });
+      this.reorderPreviousPositions.set(cardId, { x: position.x, y: position.y });
+    }
+  }
+
+  protected clearReorderCardVisuals(): void {
+    for (const { tile, controls } of this.reorderCardVisuals.values()) {
+      gsap.killTweensOf(tile.position);
+      gsap.killTweensOf(tile.scale);
+      gsap.killTweensOf(controls.position);
+      gsap.killTweensOf(controls);
+    }
+    this.reorderCardVisuals.clear();
+    this.reorderPreview = null;
+  }
+
+  protected renderScry(
+    presentation: PromptPresentation,
+    cards: CardDto[],
+    zones: ScryDestination[],
+  ): void {
+    const width = this.modalPromptWidth(PROMPT_CARD_MODAL_MAX_WIDTH);
+    const poolWidth = width - PANEL_PADDING * 2;
+    const zoneGap = 12;
+    const zoneColumns = Math.max(
+      1,
+      Math.min(
+        zones.length,
+        Math.floor((poolWidth + zoneGap) / (Math.max(160, getUiFontSize("label") * 10) + zoneGap)),
+      ),
+    );
+    const zoneWidth = (poolWidth - zoneGap * (zoneColumns - 1)) / zoneColumns;
+    const scryLayout = this.layerPresentation.scryLayout(
+      this.viewportHeight,
+      cards.length,
+      GAME_CARD_SIZES.battlefield.width,
+    );
+    const stackDepth = scryLayout.stackDepth;
+    const height = this.viewportHeight - 24;
+    const footerHeight = scryLayout.footerHeight;
+    const { body, footer } = this.createModalShell(
+      width,
+      height,
+      presentation,
+      true,
+      footerHeight,
+      36,
+      scryLayout.cardHints,
+      "inline-guidance",
+    );
+    const { width: preferredCardWidth } = this.promptCardDimensions(scryLayout.cardMaxHeight);
+    const maxCardWidthRatio = Math.max(
+      1,
+      ...cards.map((card) => this.promptCardDisplayDimensions(card, CARD_W).width / CARD_W),
+    );
+    const portraitCardWidth = Math.max(
+      1,
+      Math.min(preferredCardWidth, (poolWidth - CARD_TILE_EDGE_INSET * 2) / maxCardWidthRatio),
+    );
+    const cardSizes = new Map(
+      cards.map((card) => [card.id, this.promptCardDisplayDimensions(card, portraitCardWidth)]),
+    );
+    const cardWidth = Math.max(...[...cardSizes.values()].map((size) => size.width));
+    const cardHeight = Math.max(...[...cardSizes.values()].map((size) => size.height));
+    const destinationPortraitWidth = scryLayout.destinationPortraitWidth;
+    const destinationCardSizes = new Map(
+      cards.map((card) => [
+        card.id,
+        this.promptCardDisplayDimensions(card, destinationPortraitWidth),
+      ]),
+    );
+    const destinationCardWidth = Math.max(
+      ...[...destinationCardSizes.values()].map((size) => size.width),
+    );
+    const destinationCardHeight = Math.max(
+      ...[...destinationCardSizes.values()].map((size) => size.height),
+    );
+    cards.forEach((card) => {
+      const cardSize = cardSizes.get(card.id)!;
+      const destinationCardSize = destinationCardSizes.get(card.id)!;
+      this.scryCardOffsets.set(card.id, {
+        x: (cardWidth - cardSize.width) / 2,
+        y: (cardHeight - cardSize.height) / 2,
+        width: cardSize.width,
+        height: cardSize.height,
+      });
+      this.scryDestinationCardOffsets.set(card.id, {
+        x: (destinationCardWidth - destinationCardSize.width) / 2,
+        y: (destinationCardHeight - destinationCardSize.height) / 2,
+        width: destinationCardSize.width,
+        height: destinationCardSize.height,
+      });
+    });
+    body.sortableChildren = true;
+    const byId = new Map(cards.map((card) => [card.id, card]));
+    const poolLabel = promptText("CARDS TO PLACE", 11, this.theme.appTheme["muted-foreground"], {
+      weight: "700",
+    });
+    poolLabel.position.set(0, 2);
+    body.addChild(poolLabel);
+    const poolHeight = cardHeight + 20;
+    const pool = new Rectangle(0, poolLabel.y + poolLabel.height + 8, poolWidth, poolHeight);
+    const poolIds = this.scryItems.pool ?? [];
+    const poolSpacing =
+      scryLayout.overlapPoolCards && poolIds.length > 1
+        ? Math.min(
+            cardWidth + PROMPT_CARD_GAP,
+            Math.max(0, (poolWidth - CARD_TILE_EDGE_INSET * 2 - cardWidth) / (poolIds.length - 1)),
+          )
+        : cardWidth + PROMPT_CARD_GAP;
+    const poolContentWidth =
+      CARD_TILE_EDGE_INSET * 2 + Math.max(0, poolIds.length - 1) * poolSpacing + cardWidth;
+    this.scryPoolScrollMax = scryLayout.overlapPoolCards
+      ? 0
+      : Math.max(0, poolContentWidth - poolWidth);
+    if (this.scryPoolScrollToEnd) {
+      this.scryPoolScrollOffset = this.scryPoolScrollMax;
+      this.scryPoolScrollToEnd = false;
+    }
+    this.scryPoolScrollOffset = Math.min(this.scryPoolScrollOffset, this.scryPoolScrollMax);
+    const poolLayer = new Container();
+    poolLayer.eventMode = "static";
+    poolLayer.sortableChildren = true;
+    const poolMask = new Graphics()
+      .rect(pool.x, pool.y, pool.width, pool.height)
+      .fill({ color: hexToNum(this.theme.appTheme.foreground) });
+    body.addChild(poolMask);
+    poolLayer.mask = poolMask;
+    body.addChild(poolLayer);
+    const poolBg = new Graphics()
+      .roundRect(pool.x, pool.y, pool.width, pool.height, 8)
+      .fill({ color: hexToNum(this.theme.appTheme.background), alpha: 0.6 })
+      .stroke({ color: hexToNum(this.theme.appTheme["muted-foreground"]), width: 2, alpha: 0.45 });
+    poolLayer.addChild(poolBg);
+    const poolMarker = new Graphics()
+      .roundRect(pool.x, pool.y, pool.width, pool.height, 8)
+      .stroke({ color: hexToNum(this.theme.gameTheme.cardRing), width: 2.5 });
+    poolMarker.eventMode = "none";
+    poolMarker.visible = false;
+    poolMarker.zIndex = 500;
+    poolLayer.addChild(poolMarker);
+    const poolScrollThumb = new Graphics();
+    poolScrollThumb.eventMode = "none";
+    poolScrollThumb.zIndex = 501;
+    poolLayer.addChild(poolScrollThumb);
+    poolLayer.on("wheel", (event: FederatedWheelEvent) => this.scrollScryPool(event));
+    const contentDropX = CARD_TILE_EDGE_INSET + poolIds.length * poolSpacing;
+    const visibleDropX = Math.max(
+      pool.x + 4,
+      Math.min(contentDropX - this.scryPoolScrollOffset, pool.x + pool.width - cardWidth - 4),
+    );
+    this.dropZones.push({
+      id: "pool",
+      rect: pool,
+      container: body,
+      visual: poolBg,
+      dropX: visibleDropX,
+      dropY: pool.y + 10,
+      targetAlpha: 1,
+      marker: poolMarker,
+    });
+    if (this.scryPoolScrollMax > 0) {
+      const trackWidth = pool.width - 24;
+      const thumbWidth = Math.max(24, trackWidth * (poolWidth / poolContentWidth));
+      const travel = trackWidth - thumbWidth;
+      poolScrollThumb
+        .clear()
+        .roundRect(
+          pool.x + 12 + travel * (this.scryPoolScrollOffset / this.scryPoolScrollMax),
+          pool.y + pool.height - 6,
+          thumbWidth,
+          3,
+          2,
+        )
+        .fill({ color: hexToNum(this.theme.appTheme["muted-foreground"]), alpha: 0.85 });
+    }
+    poolIds.forEach((id, index) => {
+      const card = byId.get(id);
+      const cardSize = cardSizes.get(id);
+      if (!card || !cardSize) return;
+      const tile = this.createCardTile(
+        card,
+        this.scrySelectedId === id,
+        false,
+        cardSize.width,
+        cardSize.height,
+        () => {
+          this.scrySelectedId = this.scrySelectedId === id ? null : id;
+          this.rebuild();
+        },
+      );
+      const offsetX = (cardWidth - cardSize.width) / 2;
+      const offsetY = (cardHeight - cardSize.height) / 2;
+      const contentX = CARD_TILE_EDGE_INSET + index * poolSpacing + offsetX;
+      this.scryPoolSlotX.set(id, contentX);
+      this.makeDraggable(
+        tile,
+        (x, y) => this.dropScryCard(id, x, y),
+        (x, y) => this.scryDropPosition(id, x, y),
+        (dragX, dragY) => this.autoScrollScryPool(dragX, dragY),
+        SCRY_POOL_DRAG_SCALE,
+        true,
+      );
+      this.placeScryCardTile(
+        poolLayer,
+        tile,
+        id,
+        contentX - this.scryPoolScrollOffset,
+        pool.y + 10 + offsetY,
+      );
+    });
+
+    const zoneLabels = zones.map((destination, index) => {
+      const ids = this.scryItems[`zone-${index}`] ?? [];
+      return promptText(
+        `${this.scryDestinationLabel(destination)}${ids.length ? ` · ${ids.length}` : ""}`,
+        11,
+        this.scrySelectedId
+          ? this.theme.gameTheme.cardRing
+          : this.theme.appTheme["muted-foreground"],
+        { weight: "700", width: zoneWidth - 8, role: "label" },
+      );
+    });
+    const labelHeight = Math.max(0, ...zoneLabels.map((label) => label.height));
+    const zoneY = pool.y + pool.height + Math.max(scryLayout.zoneGap, labelHeight + 8);
+    const zoneHeight = Math.max(
+      destinationCardHeight + scryLayout.destinationVerticalPadding + stackDepth,
+      2 *
+        (scryLayout.hint.textOffsetY -
+          scryLayout.hint.centerOffsetY +
+          Math.ceil(getUiFontSize("label") * 1.35) * 2 +
+          8),
+    );
+    zones.forEach((destination, index) => {
+      const key = `zone-${index}`;
+      const ids = this.scryItems[key] ?? [];
+      const rect = new Rectangle(
+        (index % zoneColumns) * (zoneWidth + zoneGap),
+        zoneY + Math.floor(index / zoneColumns) * (zoneHeight + labelHeight + 16),
+        zoneWidth,
+        zoneHeight,
+      );
+      const zoneBg = new Graphics()
+        .roundRect(rect.x, rect.y, rect.width, rect.height, 8)
+        .fill({
+          color: hexToNum(
+            this.scrySelectedId ? this.theme.gameTheme.cardRing : this.theme.appTheme.background,
+          ),
+          alpha: this.scrySelectedId ? 0.08 : 0.45,
+        })
+        .stroke({
+          color: hexToNum(
+            this.scrySelectedId
+              ? this.theme.gameTheme.cardRing
+              : this.theme.appTheme["muted-foreground"],
+          ),
+          width: 2,
+          alpha: this.scrySelectedId ? 0.75 : 0.45,
+        });
+      zoneBg.eventMode = "static";
+      zoneBg.cursor = this.scrySelectedId ? "pointer" : "default";
+      zoneBg.accessible = true;
+      zoneBg.accessibleTitle = `Move selected card to ${this.scryDestinationLabel(destination)}`;
+      zoneBg.tabIndex = this.scrySelectedId ? 0 : -1;
+      zoneBg.on("pointertap", () => {
+        if (this.scrySelectedId) this.moveScryCard(this.scrySelectedId, key);
+      });
+      body.addChild(zoneBg);
+      const label = zoneLabels[index]!;
+      label.position.set(rect.x + 4, rect.y - label.height - 8);
+      body.addChild(label);
+      const dropX = rect.x + (rect.width - destinationCardWidth) / 2;
+      const dropY = rect.y + (rect.height - destinationCardHeight) / 2;
+      const marker = new Graphics()
+        .roundRect(rect.x, rect.y, rect.width, rect.height, 8)
+        .stroke({ color: hexToNum(this.theme.gameTheme.cardRing), width: 2.5 });
+      marker.eventMode = "none";
+      marker.visible = false;
+      marker.zIndex = 500;
+      body.addChild(marker);
+      this.dropZones.push({
+        id: key,
+        rect,
+        container: body,
+        visual: zoneBg,
+        dropX,
+        dropY,
+        targetAlpha: 1,
+        marker,
+      });
+      ids.forEach((id, cardIndex) => {
+        const card = byId.get(id);
+        const cardSize = destinationCardSizes.get(id);
+        if (!card || !cardSize) return;
+        const tile = this.createScryDestinationTile(
+          card,
+          this.scrySelectedId === id,
+          cardIndex !== ids.length - 1,
+          cardSize.width,
+          cardSize.height,
+          cardIndex === ids.length - 1
+            ? () => {
+                this.scrySelectedId = this.scrySelectedId === id ? null : id;
+                this.rebuild();
+              }
+            : undefined,
+        );
+        const offsetX = (destinationCardWidth - cardSize.width) / 2;
+        const offsetY = (destinationCardHeight - cardSize.height) / 2;
+        const tileX = rect.x + (rect.width - destinationCardWidth) / 2 + offsetX;
+        const tileY = dropY + (cardIndex - (ids.length - 1)) * 16 + offsetY;
+        if (cardIndex === ids.length - 1) {
+          this.makeDraggable(
+            tile,
+            (x, y) => this.dropScryCard(id, x, y),
+            (x, y) => this.scryDropPosition(id, x, y),
+            (dragX, dragY) => this.autoScrollScryPool(dragX, dragY),
+          );
+        }
+        this.placeScryCardTile(body, tile, id, tileX, tileY);
+      });
+      if (ids.length === 0) this.addScryDestinationHint(body, destination, rect);
+    });
+
+    const allPlaced = poolIds.length === 0;
+    const status = promptText(
+      `${cards.length - poolIds.length} of ${cards.length} placed`,
+      11,
+      allPlaced ? this.successForeground : this.theme.appTheme["muted-foreground"],
+      { weight: "600" },
+    );
+    status.position.set(0, 3);
+    footer.addChild(status);
+    const confirm = this.makeButton(
+      "CONFIRM",
+      () => {
+        this.spec!.respond({
+          type: "scryDecision",
+          zoneCardIds: zones.map((_, index) =>
+            [...(this.scryItems[`zone-${index}`] ?? [])].reverse(),
+          ),
+        });
+      },
+      { disabled: !allPlaced, width: 120 },
+    );
+    confirm.position.set(poolWidth - confirm.buttonWidth, 0);
+    footer.addChild(confirm);
+  }
+
+  protected autoScrollScryPool(x: number, y: number): void {
+    if (this.scryPoolScrollMax <= 0) return;
+    const zone = this.dropZones.find((candidate) => candidate.id === "pool");
+    if (!zone) return;
+    const point = zone.container.toLocal({ x, y });
+    const edge = Math.min(48, zone.rect.width / 4);
+    if (point.y < zone.rect.top - edge || point.y > zone.rect.bottom + edge) return;
+    const direction =
+      point.x < zone.rect.left + edge ? -1 : point.x > zone.rect.right - edge ? 1 : 0;
+    if (direction === 0) return;
+    this.scryPoolScrollTarget = Math.max(
+      0,
+      Math.min(this.scryPoolScrollMax, this.scryPoolScrollTarget + direction * 24),
+    );
+    this.setScryPoolScrollOffset(this.scryPoolScrollTarget);
+    this.callbacks.onRenderRequested?.();
+  }
+
+  protected scrollScryPool(event: FederatedWheelEvent): void {
+    if (this.scryPoolScrollMax <= 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const dominant = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    const rawDelta = event.deltaMode === 1 ? dominant * MODAL_SCROLL_LINE_HEIGHT : dominant;
+    const delta = Math.max(
+      -MODAL_SCROLL_MAX_STEP,
+      Math.min(MODAL_SCROLL_MAX_STEP, rawDelta * MODAL_SCROLL_SCALE),
+    );
+    this.scryPoolScrollTarget = Math.max(
+      0,
+      Math.min(this.scryPoolScrollMax, this.scryPoolScrollTarget + delta),
+    );
+    if (!animationsEnabled()) this.setScryPoolScrollOffset(this.scryPoolScrollTarget);
+    this.callbacks.onRenderRequested?.();
+  }
+
+  protected setScryPoolScrollOffset(offset: number): void {
+    this.scryPoolScrollOffset = Math.max(0, Math.min(this.scryPoolScrollMax, offset));
+    for (const [cardId, tile] of this.scryCardTiles) {
+      if (this.drag?.item === tile) continue;
+      if (this.scryCardSource(cardId) !== "pool") continue;
+      const contentX = this.scryPoolSlotX.get(cardId);
+      if (contentX === undefined) continue;
+      gsap.killTweensOf(tile.position);
+      tile.x = contentX - this.scryPoolScrollOffset;
+    }
+  }
+
+  protected dropScryCard(cardId: string, x: number, y: number): void {
+    const target = this.findDropZone(x, y);
+    if (!target) {
+      this.rebuild();
+      return;
+    }
+    this.moveScryCard(cardId, target.id);
+  }
+
+  protected moveScryCard(cardId: string, targetId: string): void {
+    const source = this.scryCardSource(cardId);
+    if (!source || source === targetId) {
+      this.rebuild();
+      return;
+    }
+    this.captureScryCardPositions();
+    this.scryItems[source] = this.scryItems[source]!.filter((id) => id !== cardId);
+    this.scryItems[targetId] = [...(this.scryItems[targetId] ?? []), cardId];
+    if (targetId === "pool") this.scryPoolScrollToEnd = true;
+    this.scrySelectedId = null;
+    this.rebuild();
+  }
+
+  protected scryCardSource(cardId: string): string | undefined {
+    return Object.entries(this.scryItems).find(([, ids]) => ids.includes(cardId))?.[0];
+  }
+
+  protected scryDropPosition(
+    cardId: string,
+    x: number,
+    y: number,
+  ): { x: number; y: number } | null {
+    const target = this.findDropZone(x, y);
+    if (!target || target.id === this.scryCardSource(cardId)) return null;
+    const layout =
+      target.id === "pool"
+        ? this.scryCardOffsets.get(cardId)
+        : this.scryDestinationCardOffsets.get(cardId);
+    const tile = this.scryCardTiles.get(cardId);
+    if (!layout || !tile) return null;
+    const bounds =
+      tile.hitArea instanceof Rectangle ? tile.hitArea : tile.getLocalBounds().rectangle;
+    return {
+      x: target.dropX + layout.x + layout.width / 2 - (bounds.x + bounds.width / 2),
+      y: target.dropY + layout.y + layout.height / 2 - (bounds.y + bounds.height / 2),
+    };
+  }
+
+  protected captureScryCardPositions(): void {
+    this.scryPreviousPositions.clear();
+    this.scryPreviousCardSizes.clear();
+    for (const [cardId, tile] of this.scryCardTiles) {
+      const bounds =
+        tile.hitArea instanceof Rectangle ? tile.hitArea : tile.getLocalBounds().rectangle;
+      const center = tile.toGlobal({
+        x: bounds.x + bounds.width / 2,
+        y: bounds.y + bounds.height / 2,
+      });
+      this.scryPreviousPositions.set(cardId, { x: center.x, y: center.y });
+      this.scryPreviousCardSizes.set(cardId, {
+        width: bounds.width * Math.abs(tile.scale.x),
+        height: bounds.height * Math.abs(tile.scale.y),
+      });
+    }
+  }
+
+  protected placeScryCardTile(
+    body: Container,
+    tile: Container,
+    cardId: string,
+    x: number,
+    y: number,
+  ): void {
+    tile.position.set(x, y);
+    body.addChild(tile);
+    this.scryCardTiles.set(cardId, tile);
+  }
+
+  protected animateScryLayout(): void {
+    if (animationsEnabled()) {
+      for (const [cardId, tile] of this.scryCardTiles) {
+        const previous = this.scryPreviousPositions.get(cardId);
+        if (!previous) continue;
+        const bounds =
+          tile.hitArea instanceof Rectangle ? tile.hitArea : tile.getLocalBounds().rectangle;
+        const previousSize = this.scryPreviousCardSizes.get(cardId);
+        const startCenter = tile.parent!.toLocal(previous);
+        const x = tile.x;
+        const y = tile.y;
+        const centerX = bounds.x + bounds.width / 2;
+        const centerY = bounds.y + bounds.height / 2;
+        const targetCenterX = x + centerX;
+        const targetCenterY = y + centerY;
+        const startScale = previousSize
+          ? Math.min(previousSize.width / bounds.width, previousSize.height / bounds.height)
+          : 1;
+        const resized = Math.abs(startScale - 1) > 0.001;
+        if (
+          Math.hypot(targetCenterX - startCenter.x, targetCenterY - startCenter.y) < 0.5 &&
+          !resized
+        )
+          continue;
+        tile.position.set(x + startCenter.x - targetCenterX, y + startCenter.y - targetCenterY);
+        const timeline = gsap.timeline();
+        timeline.to(
+          tile.position,
+          {
+            x,
+            y,
+            duration: SCRY_LAYOUT_SETTLE_SECONDS,
+            ease: "power3.out",
+          },
+          0,
+        );
+        if (resized) {
+          tile.origin.set(centerX, centerY);
+          tile.scale.set(startScale);
+          timeline.to(
+            tile.scale,
+            {
+              x: 1,
+              y: 1,
+              duration: SCRY_LAYOUT_SETTLE_SECONDS,
+              ease: "power2.inOut",
+              onComplete: () => tile.origin.set(0, 0),
+            },
+            0,
+          );
+        }
+      }
+    }
+    this.scryPreviousPositions.clear();
+    this.scryPreviousCardSizes.clear();
+  }
+
+  protected clearScryCardTiles(): void {
+    for (const tile of this.scryCardTiles.values()) {
+      gsap.killTweensOf(tile.position);
+      gsap.killTweensOf(tile.scale);
+    }
+    this.scryCardTiles.clear();
+    this.scryCardOffsets.clear();
+    this.scryDestinationCardOffsets.clear();
+    this.scryPoolSlotX.clear();
+  }
+
+  protected scryDestinationLabel(destination: ScryDestination): string {
+    switch (destination) {
+      case "libraryTop":
+        return "TOP OF LIBRARY";
+      case "libraryBottom":
+        return "BOTTOM OF LIBRARY";
+      case "graveyard":
+        return "GRAVEYARD";
+      case "exile":
+        return "EXILE";
+      case "hand":
+        return "HAND";
+    }
+  }
+
+  protected addScryDestinationHint(
+    body: Container,
+    destination: ScryDestination,
+    rect: Rectangle,
+  ): void {
+    const hintStyle = this.layerPresentation.scryHint;
+    const color = this.theme.appTheme["muted-foreground"];
+    const centerX = rect.x + rect.width / 2;
+    const centerY = rect.y + rect.height / 2 - hintStyle.centerOffsetY;
+    if (destination === "libraryTop" || destination === "libraryBottom") {
+      if (destination === "libraryTop") {
+        const deck = this.makeIcon("deck", hintStyle.deckSize, color);
+        deck.position.set(centerX + hintStyle.deckOffsetX, centerY);
+        body.addChild(deck);
+      } else {
+        const card = new Graphics();
+        for (let x = -24; x < 24; x += 10) {
+          card.moveTo(x, -18).lineTo(Math.min(x + 6, 24), -18);
+          card.moveTo(x, 18).lineTo(Math.min(x + 6, 24), 18);
+        }
+        for (let y = -18; y < 18; y += 10) {
+          card.moveTo(-24, y).lineTo(-24, Math.min(y + 6, 18));
+          card.moveTo(24, y).lineTo(24, Math.min(y + 6, 18));
+        }
+        card.stroke({ color: hexToNum(color), width: 2, alpha: 0.7 });
+        card.scale.set(hintStyle.cardScale);
+        card.position.set(centerX + hintStyle.deckOffsetX, centerY);
+        body.addChild(card);
+      }
+      const arrow = this.makeIcon("arrow-dunk", hintStyle.arrowSize, color);
+      arrow.position.set(centerX - hintStyle.arrowOffsetX, centerY - hintStyle.arrowOffsetY);
+      body.addChild(arrow);
+    } else {
+      const icon = this.makeIcon(destination, hintStyle.iconSize, color);
+      icon.position.set(centerX, centerY);
+      body.addChild(icon);
+    }
+    const hint = promptText(this.scryDestinationHint(destination), 11, color, {
+      weight: "600",
+      align: "center",
+      width: rect.width - 12,
+      role: "label",
+    });
+    hint.anchor.set(0.5, 0);
+    hint.position.set(centerX, centerY + hintStyle.textOffsetY);
+    body.addChild(hint);
+  }
+
+  protected scryDestinationHint(destination: ScryDestination): string {
+    switch (destination) {
+      case "libraryTop":
+        return "Put on top";
+      case "libraryBottom":
+        return "Send to bottom";
+      case "graveyard":
+        return "To graveyard";
+      case "exile":
+        return "Exile";
+      case "hand":
+        return "To hand";
+    }
+  }
+  protected renderDamageOrder(): void {
+    const damageOrder = this.spec!.damageOrder;
+    if (!damageOrder) return;
+    const width = this.modalPromptWidth(540);
+    const height = Math.min(this.viewportHeight - 24, 270 + damageOrder.blockerCards.length * 72);
+    const input = this.spec!.currentPrompt?.input;
+    const targets: TargetRef[] =
+      input?.type === "chooseDamageAssignmentOrder"
+        ? [
+            { kind: "card", id: input.attackerId, intent: "damage" },
+            ...damageOrder.blockerCards.map((card) => ({
+              kind: "card" as const,
+              id: card.id,
+              intent: "damage" as const,
+            })),
+          ]
+        : damageOrder.blockerCards.map((card) => ({
+            kind: "card" as const,
+            id: card.id,
+            intent: "damage" as const,
+          }));
+    const presentation: PromptPresentation = {
+      title: "Order Combat Damage",
+      description: `${damageOrder.attackerName} is blocked by ${damageOrder.blockerCards.length} creatures. Choose which blocker receives damage first.`,
+      targets,
+    };
+    const { body, footer, footerHintWidth } = this.createModalShell(
+      width,
+      height,
+      presentation,
+      true,
+      60,
+      36,
+      true,
+    );
+    const availableWidth = width - PANEL_PADDING * 2;
+    const selectedCount = damageOrder.order.length;
+    const complete =
+      selectedCount >= damageOrder.blockerCards.length && damageOrder.blockerCards.length > 0;
+    const progressBackground = new Graphics()
+      .roundRect(0, 4, availableWidth, 36, 8)
+      .fill({
+        color: hexToNum(complete ? this.theme.gameTheme.success : this.theme.appTheme.background),
+        alpha: complete ? 0.12 : 0.6,
+      })
+      .stroke({
+        color: hexToNum(complete ? this.successForeground : this.theme.appTheme.border),
+        width: 1,
+        alpha: 0.8,
+      });
+    const progressText = promptText(
+      complete
+        ? "Order complete"
+        : selectedCount === 0
+          ? "Choose the first blocker"
+          : `Choose blocker ${selectedCount + 1} of ${damageOrder.blockerCards.length}`,
+      12,
+      complete ? this.successForeground : this.theme.appTheme.foreground,
+      { weight: "600", width: Math.max(1, availableWidth - 88), role: "label" },
+    );
+    progressText.position.set(12, 14);
+    const progressCount = promptText(
+      `${selectedCount}/${damageOrder.blockerCards.length}`,
+      12,
+      complete ? this.successForeground : this.theme.appTheme["muted-foreground"],
+      { weight: "700" },
+    );
+    progressCount.anchor.set(1, 0);
+    progressCount.position.set(availableWidth - 12, 14);
+    body.addChild(progressBackground, progressText, progressCount);
+
+    let y = Math.max(52, progressText.y + progressText.height + 12);
+    for (const card of damageOrder.blockerCards) {
+      const index = damageOrder.order.indexOf(card.id);
+      const selected = index >= 0;
+      const row = new Container();
+      row.position.set(0, y);
+      row.eventMode = "static";
+      row.cursor = "pointer";
+      row.hitArea = new Rectangle(0, 0, availableWidth, 62);
+      row.accessible = true;
+      row.accessibleTitle = selected
+        ? `${card.identity.name}, damage order ${index + 1}, ${card.power ?? "unknown"} power and ${card.toughness ?? "unknown"} toughness`
+        : `${card.identity.name}, not ordered, ${card.power ?? "unknown"} power and ${card.toughness ?? "unknown"} toughness`;
+      row.accessibleHint = "Activate to add or remove this blocker from the damage order.";
+      row.tabIndex = 0;
+      const background = new Graphics()
+        .roundRect(0, 0, availableWidth, 62, 8)
+        .fill({
+          color: hexToNum(
+            selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme.background,
+          ),
+          alpha: selected ? 0.11 : 0.58,
+        })
+        .stroke({
+          color: hexToNum(
+            selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme.border,
+          ),
+          width: selected ? 2 : 1,
+          alpha: selected ? 0.9 : 0.8,
+        });
+      const rankBackground = new Graphics().circle(25, 31, 14).fill({
+        color: hexToNum(selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme.muted),
+        alpha: selected ? 1 : 0.72,
+      });
+      const rank = promptText(
+        selected ? String(index + 1) : "—",
+        14,
+        selected
+          ? readableTextColor(
+              this.theme.gameTheme.cardSelection,
+              this.theme.appTheme.background,
+              this.theme.appTheme.foreground,
+            )
+          : this.theme.appTheme.foreground,
+        {
+          weight: "700",
+        },
+      );
+      rank.anchor.set(0.5);
+      rank.position.set(25, 31);
+      const label = promptText(card.identity.name, 13, this.theme.appTheme.foreground, {
+        weight: "600",
+        role: "label",
+        width: availableWidth - 132,
+        truncate: true,
+      });
+      label.position.set(50, 12);
+      const stats = promptText(
+        `${card.power ?? "?"}/${card.toughness ?? "?"}${card.damage ? ` · ${card.damage} damage marked` : ""}`,
+        10,
+        this.theme.appTheme["muted-foreground"],
+        { weight: "600", width: Math.max(1, availableWidth - 64) },
+      );
+      stats.position.set(50, label.y + label.height + 4);
+      const state = promptText(
+        selected ? `ORDER ${index + 1}` : "SELECT",
+        10,
+        selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme["muted-foreground"],
+        { weight: "700", letterSpacing: 0.7, role: "label" },
+      );
+      state.anchor.set(1, 0.5);
+      state.position.set(availableWidth - 14, 31);
+      row.addChild(background, rankBackground, rank, label, stats, state);
+      const target: TargetRef = { kind: "card", id: card.id, intent: "damage" };
+      row.on("pointerover", () => this.callbacks.onReferenceChange?.(target));
+      row.on("pointerout", () => this.callbacks.onReferenceChange?.(null));
+      row.on("focusin", () => this.callbacks.onReferenceChange?.(target));
+      row.on("focusout", () => this.callbacks.onReferenceChange?.(null));
+      row.on("pointertap", () => damageOrder.onToggle(card.id));
+      body.addChild(row);
+      const rowHeight = Math.max(62, stats.y + stats.height + 10);
+      background
+        .clear()
+        .roundRect(0, 0, availableWidth, rowHeight, 8)
+        .fill({
+          color: hexToNum(
+            selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme.background,
+          ),
+          alpha: selected ? 0.11 : 0.58,
+        })
+        .stroke({
+          color: hexToNum(
+            selected ? this.theme.gameTheme.cardSelection : this.theme.appTheme.border,
+          ),
+          width: selected ? 2 : 1,
+          alpha: selected ? 0.9 : 0.8,
+        });
+      row.hitArea = new Rectangle(0, 0, availableWidth, rowHeight);
+      y += rowHeight + 8;
+    }
+
+    const auto = this.makeButton("AUTO", damageOrder.onAuto, {
+      outline: true,
+      disabled: this.spec!.action.isWaitingForResponse,
+    });
+    const footerLeft = footerHintWidth > 0 ? footerHintWidth + 12 : 0;
+    auto.position.set(footerLeft, 0);
+    footer.addChild(auto);
+    if (selectedCount > 0) {
+      const undo = this.makeButton("UNDO", damageOrder.onUndo, {
+        outline: true,
+        disabled: this.spec!.action.isWaitingForResponse,
+      });
+      undo.position.set(footerLeft + auto.buttonWidth + 8, 0);
+      footer.addChild(undo);
+    }
+    const confirm = this.makeButton("CONFIRM ORDER", damageOrder.onConfirm, {
+      disabled: this.spec!.action.isWaitingForResponse || !complete,
+      icon: "lucide-swords",
+      width: 156,
+    });
+    confirm.position.set(availableWidth - confirm.buttonWidth, 0);
+    footer.addChild(confirm);
+  }
+
+  protected renderCombatDamage(input: ChooseCombatDamageAssignmentInput): void {
+    const width = this.modalPromptWidth(600);
+    const availableWidth = width - PANEL_PADDING * 2;
+    const assignees = [...input.blockerIds, ...(input.defenderId ? [input.defenderId] : [])];
+    const height = Math.min(this.viewportHeight - 24, 284 + assignees.length * 70);
+    const attacker = this.spec!.gameView.battlefield.find((card) => card.id === input.attackerId);
+    const targets: TargetRef[] = [
+      { kind: "card", id: input.attackerId, intent: "damage" },
+      ...input.blockerIds.map((id) => ({
+        kind: "card" as const,
+        id,
+        intent: "damage" as const,
+      })),
+      ...(input.defenderId
+        ? [{ kind: "player" as const, id: input.defenderId, intent: "damage" as const }]
+        : []),
+    ];
+    const presentation: PromptPresentation = {
+      title: "Assign Combat Damage",
+      description: attacker
+        ? `${attacker.identity.name} assigns ${input.totalDamage} combat damage.`
+        : undefined,
+      targets,
+    };
+    const { body, footer } = this.createModalShell(width, height, presentation, true, 64, 38);
+    const assigned = Object.values(this.damageAssigned).reduce((sum, damage) => sum + damage, 0);
+    const remaining = input.totalDamage - assigned;
+    const waiting = this.spec!.action.isWaitingForResponse;
+    const allocation = promptText(
+      `${assigned} of ${input.totalDamage} assigned`,
+      10,
+      this.theme.appTheme["muted-foreground"],
+      { weight: "600" },
+    );
+    allocation.anchor.set(1, 0);
+    allocation.position.set(availableWidth, 4);
+    const progressTrack = new Graphics()
+      .roundRect(0, 28, availableWidth, 6, 3)
+      .fill({ color: hexToNum(this.theme.appTheme.muted), alpha: 0.72 });
+    body.addChild(allocation, progressTrack);
+    if (assigned > 0) {
+      const progressWidth = Math.min(
+        availableWidth,
+        (availableWidth * assigned) / input.totalDamage,
+      );
+      const progress = new Graphics()
+        .roundRect(0, 28, progressWidth, 6, 3)
+        .fill({ color: hexToNum(this.theme.gameTheme.cardRing), alpha: 0.92 });
+      body.addChild(progress);
+    }
+    const guidance = promptText(
+      input.defenderId
+        ? "Divide damage freely. Assign lethal to all blockers before the defender."
+        : "Divide combat damage among the blockers as you choose.",
+      10,
+      this.theme.appTheme["muted-foreground"],
+      { weight: "500", width: availableWidth, role: "body" },
+    );
+    guidance.position.set(0, 43);
+    body.addChild(guidance);
+
+    let y = guidance.y + guidance.height + 12;
+    const controlSize = Math.max(36, getUiControlFloor());
+    const lethalWidth = Math.max(80, Math.ceil(getUiFontFloor("label") * 7) + 20);
+    const controlsWidth = lethalWidth + controlSize * 3 + 32;
+    const stackedControls = availableWidth < controlsWidth + 180;
+    const splitControls = availableWidth < controlsWidth + 24;
+    const labelWidth = Math.max(1, availableWidth - 24 - (stackedControls ? 0 : controlsWidth + 8));
+    assignees.forEach((id) => {
+      const damage = this.damageAssigned[id] ?? 0;
+      const lethal =
+        id === input.defenderId ? null : this.combatLethal(id, input.attackerHasDeathtouch);
+      const blocked =
+        id === input.defenderId &&
+        input.blockerIds.some(
+          (blockerId) =>
+            (this.damageAssigned[blockerId] ?? 0) <
+            this.combatLethal(blockerId, input.attackerHasDeathtouch),
+        );
+      const label = this.combatLabel(id);
+      const lethalReached = lethal != null && damage >= lethal;
+      const rowColor = lethalReached
+        ? this.theme.gameTheme.promptAction.attackAction
+        : damage > 0
+          ? this.theme.gameTheme.cardRing
+          : this.theme.appTheme.border;
+      const rowBg = new Graphics()
+        .roundRect(0.5, y + 0.5, availableWidth - 1, 61, 9)
+        .fill({
+          color: hexToNum(damage > 0 ? rowColor : this.theme.appTheme.background),
+          alpha: damage > 0 ? 0.09 : 0.56,
+        })
+        .stroke({
+          color: hexToNum(rowColor),
+          width: 1,
+          alpha: blocked ? 0.5 : damage > 0 ? 0.86 : 1,
+        });
+      rowBg.eventMode = "static";
+      rowBg.cursor = "default";
+      rowBg.accessible = true;
+      rowBg.accessibleTitle = `Damage assigned to ${label}: ${damage}${
+        lethalReached
+          ? ", lethal damage assigned"
+          : lethal == null
+            ? ""
+            : `, lethal damage ${lethal}`
+      }${blocked ? ", unavailable until all blockers have lethal damage assigned" : ""}`;
+      rowBg.tabIndex = 0;
+      const target: TargetRef =
+        id === input.defenderId
+          ? { kind: "player", id, intent: "damage" }
+          : { kind: "card", id, intent: "damage" };
+      rowBg.on("pointerover", () => this.callbacks.onReferenceChange?.(target));
+      rowBg.on("pointerout", () => this.callbacks.onReferenceChange?.(null));
+      rowBg.on("focusin", () => this.callbacks.onReferenceChange?.(target));
+      rowBg.on("focusout", () => this.callbacks.onReferenceChange?.(null));
+      body.addChild(rowBg);
+
+      const defender = this.spec!.gameView.players.find((player) => player.id === id);
+      const card = this.spec!.gameView.battlefield.find((candidate) => candidate.id === id);
+      const name = promptText(label, 12, this.theme.appTheme.foreground, {
+        weight: "600",
+        width: labelWidth,
+        role: "label",
+      });
+      name.position.set(12, y + 8);
+      const detail = defender
+        ? `Defender · ${defender.life} → ${defender.life - damage} life`
+        : card
+          ? `${card.power ?? "?"}/${card.toughness ?? "?"}${card.damage ? ` · ${card.damage} marked` : ""}`
+          : lethal != null
+            ? `Lethal ${lethal}`
+            : "";
+      const detailText = promptText(
+        detail,
+        10,
+        lethalReached
+          ? this.theme.gameTheme.promptAction.attackAction
+          : this.theme.appTheme["muted-foreground"],
+        {
+          weight: lethalReached ? "700" : "500",
+          width: labelWidth,
+        },
+      );
+      detailText.position.set(12, name.y + name.height + 4);
+      body.addChild(name, detailText);
+      const controlY = stackedControls ? detailText.y + detailText.height + 10 : y + 12;
+      const rowHeight = Math.max(
+        detailText.y + detailText.height - y + 12,
+        controlY - y + controlSize * (splitControls ? 2 : 1) + (splitControls ? 8 : 0) + 12,
+      );
+      rowBg
+        .clear()
+        .roundRect(0.5, y + 0.5, availableWidth - 1, rowHeight - 1, 9)
+        .fill({
+          color: hexToNum(damage > 0 ? rowColor : this.theme.appTheme.background),
+          alpha: damage > 0 ? 0.09 : 0.56,
+        })
+        .stroke({
+          color: hexToNum(rowColor),
+          width: 1,
+          alpha: blocked ? 0.5 : damage > 0 ? 0.86 : 1,
+        });
+      const controlX = Math.max(12, availableWidth - controlsWidth);
+      const quantityX = splitControls
+        ? availableWidth - controlSize * 3 - 24
+        : controlX + lethalWidth + 8;
+      const quantityY = controlY + (splitControls ? controlSize + 8 : 0);
+      if (lethalReached) {
+        const skull = this.makeIcon(
+          "lucide-skull",
+          18,
+          this.theme.gameTheme.promptAction.attackAction,
+        );
+        skull.position.set(availableWidth - 20, y + 20);
+        body.addChild(skull);
+      }
+
+      const lethalDisabled = waiting || blocked || lethalReached || remaining <= 0;
+      if (lethal != null) {
+        const lethalButton = this.makeButton(
+          `LETHAL ${lethal}`,
+          () => {
+            this.damageAssigned[id] = Math.min(lethal, damage + remaining);
+            this.normalizeDamage(input, assignees);
+            this.rebuild();
+          },
+          {
+            title: `Assign lethal damage to ${label}`,
+            outline: true,
+            disabled: lethalDisabled,
+            compact: true,
+            width: lethalWidth,
+            height: controlSize,
+            paddingX: 6,
+            fontSize: 9,
+            letterSpacing: 0.3,
+            borderColor: lethalReached
+              ? this.theme.gameTheme.promptAction.attackAction
+              : this.theme.appTheme.border,
+          },
+        );
+        lethalButton.alpha = lethalDisabled ? 0.46 : 1;
+        lethalButton.position.set(controlX, controlY);
+        body.addChild(lethalButton);
+      }
+
+      const minusDisabled = waiting || damage <= 0;
+      const minus = this.makeButton(
+        "",
+        () => {
+          this.damageAssigned[id] = Math.max(0, damage - 1);
+          this.normalizeDamage(input, assignees);
+          this.rebuild();
+        },
+        {
+          title: `Remove one damage from ${label}`,
+          icon: "lucide-minus",
+          outline: true,
+          disabled: minusDisabled,
+          compact: true,
+          width: controlSize,
+          height: controlSize,
+        },
+      );
+      minus.alpha = minusDisabled ? 0.46 : 1;
+      const amountBackground = new Graphics()
+        .roundRect(quantityX + controlSize + 8, quantityY, controlSize, controlSize, 7)
+        .fill({ color: hexToNum(this.theme.appTheme.muted), alpha: 0.68 });
+      const amount = promptText(String(damage), 14, this.theme.appTheme.foreground, {
+        weight: "700",
+      });
+      amount.anchor.set(0.5);
+      const plusDisabled = waiting || blocked || remaining <= 0;
+      const plus = this.makeButton(
+        "",
+        () => {
+          this.damageAssigned[id] = damage + 1;
+          this.normalizeDamage(input, assignees);
+          this.rebuild();
+        },
+        {
+          title: `Assign one damage to ${label}`,
+          icon: "lucide-plus",
+          outline: true,
+          disabled: plusDisabled,
+          compact: true,
+          width: controlSize,
+          height: controlSize,
+        },
+      );
+      plus.alpha = plusDisabled ? 0.46 : 1;
+      minus.position.set(quantityX, quantityY);
+      amount.position.set(quantityX + controlSize * 1.5 + 8, quantityY + controlSize / 2);
+      plus.position.set(quantityX + (controlSize + 8) * 2, quantityY);
+      body.addChild(minus, amountBackground, amount, plus);
+      y += rowHeight + 8;
+    });
+
+    const legal = remaining === 0 && this.damageAssignmentLegal(input);
+    const confirmDisabled = waiting || !legal;
+    const confirm = this.makeButton(
+      "ASSIGN DAMAGE",
+      () =>
+        this.spec!.respond({
+          type: "combatDamageAssignmentDecision",
+          assignments: assignees.map((assigneeId) => ({
+            assigneeId,
+            damage: this.damageAssigned[assigneeId] ?? 0,
+          })),
+        }),
+      { disabled: confirmDisabled, width: 142 },
+    );
+    confirm.alpha = confirmDisabled ? 0.56 : 1;
+    confirm.position.set(availableWidth - confirm.buttonWidth, 0);
+    const auto = this.makeButton(
+      "AUTO",
+      () => {
+        this.autoAssignDamage(input, assignees);
+        this.rebuild();
+      },
+      {
+        title: "Automatically distribute combat damage",
+        icon: "lucide-wand-sparkles",
+        outline: true,
+        disabled: waiting,
+      },
+    );
+    auto.alpha = waiting ? 0.46 : 1;
+    auto.position.set(availableWidth - confirm.buttonWidth - 8 - auto.buttonWidth, 0);
+    footer.addChild(auto, confirm);
+  }
+
+  protected combatLabel(id: string): string {
+    return (
+      this.spec!.gameView.battlefield.find((card) => card.id === id)?.identity.name ??
+      this.spec!.gameView.players.find((player) => player.id === id)?.name ??
+      id
+    );
+  }
+
+  protected combatLethal(id: string, deathtouch: boolean): number {
+    const card = this.spec!.gameView.battlefield.find((candidate) => candidate.id === id);
+    if (!card) return 0;
+    if (card.types?.includes("Planeswalker")) {
+      return Math.max(0, card.counters?.LOYALTY ?? card.counters?.Loyalty ?? 0);
+    }
+    if (deathtouch) return 1;
+    return Math.max(0, parseCombatNumber(card.toughness) - (card.damage ?? 0));
+  }
+
+  protected normalizeDamage(input: ChooseCombatDamageAssignmentInput, assignees: string[]): void {
+    if (input.defenderId && !this.damageAssignmentLegal(input)) {
+      this.damageAssigned[input.defenderId] = 0;
+    }
+    let assigned = Object.values(this.damageAssigned).reduce((sum, damage) => sum + damage, 0);
+    if (assigned <= input.totalDamage) return;
+    for (let index = assignees.length - 1; index >= 0 && assigned > input.totalDamage; index -= 1) {
+      const id = assignees[index]!;
+      const remove = Math.min(this.damageAssigned[id] ?? 0, assigned - input.totalDamage);
+      this.damageAssigned[id] = (this.damageAssigned[id] ?? 0) - remove;
+      assigned -= remove;
+    }
+  }
+
+  protected damageAssignmentLegal(input: ChooseCombatDamageAssignmentInput): boolean {
+    return (
+      !input.defenderId ||
+      (this.damageAssigned[input.defenderId] ?? 0) === 0 ||
+      input.blockerIds.every(
+        (id) =>
+          (this.damageAssigned[id] ?? 0) >= this.combatLethal(id, input.attackerHasDeathtouch),
+      )
+    );
+  }
+
+  protected autoAssignDamage(input: ChooseCombatDamageAssignmentInput, assignees: string[]): void {
+    this.damageAssigned = {};
+    let remaining = input.totalDamage;
+    for (const id of assignees) {
+      if (remaining <= 0 || id === input.defenderId) continue;
+      const damage = Math.min(remaining, this.combatLethal(id, input.attackerHasDeathtouch));
+      this.damageAssigned[id] = damage;
+      remaining -= damage;
+    }
+    if (remaining > 0) {
+      const target = input.defenderId ?? assignees.at(-1);
+      if (target) this.damageAssigned[target] = (this.damageAssigned[target] ?? 0) + remaining;
+    }
+    this.normalizeDamage(input, assignees);
+  }
+
+  protected renderDice(
+    presentation: PromptPresentation,
+    sides: number,
+    rolls: Array<{
+      label?: string;
+      playerId?: string;
+      round?: number;
+      naturalResults: number[];
+      finalResults: number[];
+      ignoredRolls: number[];
+      highlighted: boolean;
+    }>,
+  ): void {
+    const maxRound = Math.max(0, ...rolls.map((roll) => roll.round ?? 0));
+    const entries: RollDisplayEntry[] = rolls.flatMap((roll, rollIndex) => {
+      const round = roll.round ?? 0;
+      const label =
+        maxRound > 0 ? `Round ${round + 1} · ${roll.label ?? `Roll ${rollIndex + 1}`}` : roll.label;
+      const kept = roll.finalResults.map((value, resultIndex) => {
+        const natural = roll.naturalResults[resultIndex] ?? value;
+        return {
+          sides,
+          value,
+          playerId: roll.playerId,
+          label:
+            roll.finalResults.length > 1
+              ? `${label ?? `Roll ${rollIndex + 1}`} ${resultIndex + 1}`
+              : label,
+          detail: natural === value ? undefined : `${natural} → ${value}`,
+          round,
+          highlighted: roll.highlighted,
+          ignored: false,
+        };
+      });
+      return [
+        ...kept,
+        ...roll.ignoredRolls.map((value, ignoredIndex) => ({
+          sides,
+          value,
+          playerId: roll.playerId,
+          label: `${label ?? `Roll ${rollIndex + 1}`} ignored ${ignoredIndex + 1}`,
+          round,
+          highlighted: false,
+          ignored: true,
+        })),
+      ];
+    });
+    this.renderRollResults(
+      { ...presentation, title: `${presentation.title || "Dice roll"} · d${sides}` },
+      entries,
+      "Dice roll",
+      () => this.spec!.respond({ type: "diceRolledAcknowledged" }),
+    );
+  }
+
+  protected renderRollResults(
+    presentation: PromptPresentation,
+    entries: RollDisplayEntry[],
+    fallbackTitle: string,
+    onConfirm: () => void,
+  ): void {
+    this.rollVisuals = [];
+    this.rollHighlightText = null;
+    this.rollHighlightLabel = null;
+    this.rollConfirm = null;
+    const visibleEntries = entries.length
+      ? entries
+      : [
+          {
+            sides: 6,
+            value: "—",
+            round: 0,
+            highlighted: false,
+            ignored: false,
+          },
+        ];
+    const rollEntries = visibleEntries.map((entry, index) => {
+      const seed = rollSeed(this.spec?.currentPrompt?.promptId, entry.round, index);
+      return { entry, index, seed, trajectory: rollTrajectory(seed) };
+    });
+    this.rollDurationMs = Math.max(
+      ...rollEntries.map(({ trajectory }) => trajectory.flightMs + ROLL_IMPACT_MS + ROLL_SETTLE_MS),
+    );
+    this.rollSettled = !animationsEnabled() || this.rollElapsedMs >= this.rollDurationMs;
+    const width = this.modalPromptWidth(620);
+    const landingColumns = Math.max(
+      1,
+      Math.min(
+        Math.ceil(Math.sqrt(visibleEntries.length)),
+        Math.floor((width - PANEL_PADDING * 2) / 120),
+      ),
+    );
+    const landingRows = Math.max(1, Math.ceil(visibleEntries.length / landingColumns));
+    const dieSize = Math.min(
+      72,
+      (width - PANEL_PADDING * 2 - ROW_GAP * (landingColumns - 1)) / landingColumns,
+    );
+    const winner = visibleEntries.find((entry) => entry.highlighted && !entry.ignored);
+    const height = Math.min(620, this.viewportHeight - 24);
+    const footerHeight = 60;
+    const title = presentation.title || fallbackTitle;
+    const { body, bodyTop, footer } = this.createModalShell(
+      width,
+      height,
+      { ...presentation, title },
+      true,
+      footerHeight,
+    );
+    const availableWidth = width - PANEL_PADDING * 2;
+    const cellWidth = availableWidth / landingColumns;
+    const labels = visibleEntries.map((entry) =>
+      entry.label || entry.detail
+        ? promptText(
+            [entry.label, entry.detail].filter(Boolean).join(" · "),
+            10,
+            this.theme.appTheme["muted-foreground"],
+            { weight: "600", width: cellWidth - 12, align: "center" },
+          )
+        : null,
+    );
+    const labelHeight = Math.max(0, ...labels.map((label) => label?.height ?? 0));
+    const winnerLabel = winner ? (winner.label ?? String(winner.value)) : null;
+    const resultLabel = winner
+      ? promptText("RESULT", 9, this.rollPlayerColor(winner.playerId), {
+          weight: "700",
+          letterSpacing: 0.8,
+        })
+      : null;
+    const winnerText =
+      winnerLabel != null
+        ? promptText(winnerLabel, 16, this.theme.appTheme.foreground, {
+            weight: "700",
+            width: availableWidth,
+            align: "center",
+            role: "body",
+          })
+        : null;
+    const resultHeight =
+      resultLabel && winnerText ? resultLabel.height + winnerText.height + 24 : 0;
+    const bodyHeight = Math.max(
+      landingRows * (dieSize + labelHeight + 28) + resultHeight + 8,
+      height - bodyTop - footerHeight - MODAL_BODY_BOTTOM_PADDING - body.y,
+    );
+    const resultBottom = bodyHeight - resultHeight;
+    const throwBottom = winner ? resultBottom - 10 : bodyHeight - 12;
+    const arenaTop = 8;
+    const arenaHeight = Math.max(dieSize + 32, throwBottom - arenaTop);
+    const cellHeight = arenaHeight / landingRows;
+    body.boundsArea = new Rectangle(0, 0, availableWidth, bodyHeight);
+    const rollLayer = new Container();
+    body.addChild(rollLayer);
+    body.accessible = true;
+    body.accessibleTitle = visibleEntries
+      .map(
+        (entry) =>
+          `${entry.label ? `${entry.label}: ` : ""}${entry.value}${entry.ignored ? ", ignored" : ""}`,
+      )
+      .join(". ");
+    rollEntries.forEach(({ entry, index, seed, trajectory }) => {
+      const column = index % landingColumns;
+      const row = Math.floor(index / landingColumns);
+      const rowItemCount = Math.min(landingColumns, visibleEntries.length - row * landingColumns);
+      const rowStartX = (availableWidth - rowItemCount * cellWidth) / 2;
+      const x = rowStartX + (column + 0.5) * cellWidth;
+      const slotY = arenaTop + row * cellHeight + dieSize / 2 + 8;
+      const y = Math.max(dieSize / 2 + 8, Math.min(throwBottom - dieSize / 2 - 24, slotY));
+      const minX = dieSize / 2 + 8;
+      const maxX = availableWidth - dieSize / 2 - 8;
+      const minY = arenaTop + dieSize / 2;
+      const maxY = Math.max(minY, throwBottom - dieSize / 2 - 12);
+      const startX = Math.max(minX, Math.min(maxX, x + trajectory.startX));
+      const startY = Math.max(minY, Math.min(maxY, y + trajectory.startY));
+      const playerColor = this.rollPlayerColor(entry.playerId);
+      const token = createRollToken({
+        sides: entry.sides,
+        size: dieSize,
+        fill: this.theme.appTheme.card,
+        border: entry.ignored ? this.theme.appTheme.destructive : playerColor,
+        foreground: this.theme.appTheme.foreground,
+      });
+      token.root.position.set(x, y);
+      setRollTokenValue(token, entry.value);
+      rollLayer.addChild(token.root);
+      const ignoredMark = entry.ignored
+        ? new Graphics()
+            .moveTo(-dieSize * 0.42, dieSize * 0.42)
+            .lineTo(dieSize * 0.42, -dieSize * 0.42)
+            .stroke({ color: hexToNum(this.theme.appTheme.destructive), width: 3, alpha: 0.9 })
+        : null;
+      if (ignoredMark) {
+        ignoredMark.alpha = this.rollSettled ? 1 : 0;
+        token.root.addChild(ignoredMark);
+      }
+      this.rollVisuals.push({
+        token,
+        finalValue: entry.value,
+        sides: entry.sides,
+        seed,
+        trajectory,
+        baseX: x,
+        baseY: y,
+        startX,
+        startY,
+        restingRotation: 0,
+        ignored: entry.ignored,
+        ignoredMark,
+      });
+      const label = labels[index];
+      if (label) {
+        label.anchor.set(0.5, 0);
+        label.position.set(x, y + dieSize / 2 + 5);
+        body.addChild(label);
+      }
+    });
+    if (winner && winnerLabel != null && resultLabel && winnerText) {
+      resultLabel.anchor.set(0.5, 0);
+      resultLabel.position.set((width - PANEL_PADDING * 2) / 2, resultBottom + 2);
+      winnerText.text = this.rollSettled ? winnerLabel : "Rolling…";
+      winnerText.anchor.set(0.5, 0);
+      winnerText.position.set(
+        (width - PANEL_PADDING * 2) / 2,
+        resultLabel.y + resultLabel.height + 4,
+      );
+      this.rollHighlightText = winnerText;
+      this.rollHighlightLabel = winnerLabel;
+      body.addChild(resultLabel, winnerText);
+    }
+    const confirm = this.makeButton("CONTINUE", onConfirm, {
+      disabled: !this.rollSettled,
+      width: 120,
+    });
+    this.rollConfirm = confirm;
+    confirm.position.set(width - PANEL_PADDING * 2 - confirm.buttonWidth, 0);
+    footer.addChild(confirm);
+    this.startRollAnimation();
+  }
+
+  protected rollPlayerColor(playerId: string | undefined): string {
+    const colors = this.theme.gameTheme.playerColors;
+    if (!playerId || playerId === this.spec?.localPlayerId) return colors.self;
+    const opponentIndex = this.spec
+      ? this.spec.gameView.players
+          .filter((player) => player.id !== this.spec!.localPlayerId)
+          .findIndex((player) => player.id === playerId)
+      : 0;
+    const seat = OPPONENT_SEATS[Math.max(0, Math.min(OPPONENT_SEATS.length - 1, opponentIndex))]!;
+    return colors[seat];
+  }
+
+  protected startRollAnimation(): void {
+    if (!animationsEnabled() || this.rollSettled) {
+      this.settleRollVisuals();
+      return;
+    }
+    const timeline = gsap.timeline({ paused: true });
+    this.rollTimeline = timeline;
+    for (const visual of this.rollVisuals) {
+      const trajectory = visual.trajectory;
+      const finalRotation =
+        trajectory.spinDirection * trajectory.turns * Math.PI * 2 + visual.restingRotation;
+      const controlX = (visual.startX + visual.baseX) / 2 + trajectory.controlX;
+      const controlY = Math.min(visual.startY, visual.baseY) + trajectory.controlY;
+      visual.token.root.position.set(visual.startX, visual.startY);
+      visual.token.root.alpha = 1;
+      visual.token.root.rotation = visual.restingRotation - trajectory.spinDirection * 0.45;
+      visual.token.root.scale.set(0.92);
+      const landingAt = trajectory.flightMs / 1000;
+      timeline.to(
+        visual.token.root,
+        {
+          rotation: finalRotation,
+          pixi: { scaleX: 1, scaleY: 1 },
+          motionPath: {
+            path: [
+              { x: visual.startX, y: visual.startY },
+              { x: controlX, y: controlY },
+              { x: visual.baseX, y: visual.baseY },
+            ],
+            curviness: 1,
+          },
+          duration: trajectory.flightMs / 1000,
+          ease: "power2.out",
+        },
+        0,
+      );
+      timeline.to(
+        visual.token.root,
+        {
+          y: visual.baseY + 2,
+          rotation: finalRotation + trajectory.spinDirection * 0.04,
+          pixi: { scaleX: 1.04, scaleY: 0.96 },
+          duration: ROLL_IMPACT_MS / 1000,
+          ease: "power1.out",
+        },
+        landingAt,
+      );
+      timeline.to(
+        visual.token.root,
+        {
+          x: visual.baseX,
+          y: visual.baseY,
+          rotation: finalRotation,
+          alpha: visual.ignored ? 0.42 : 1,
+          pixi: { scaleX: 1, scaleY: 1 },
+          duration: ROLL_SETTLE_MS / 1000,
+          ease: "back.out(1.3)",
+        },
+        landingAt + ROLL_IMPACT_MS / 1000,
+      );
+      if (visual.ignoredMark) {
+        timeline.to(
+          visual.ignoredMark,
+          { alpha: 1, duration: 0.12, ease: "power2.out" },
+          landingAt + ROLL_IMPACT_MS / 1000,
+        );
+      }
+    }
+    timeline.eventCallback("onComplete", () => {
+      if (this.rollTimeline !== timeline) return;
+      this.rollTimeline = null;
+      this.rollElapsedMs = this.rollDurationMs;
+      this.settleRollVisuals();
+    });
+    timeline.seek(Math.min(this.rollElapsedMs / 1000, timeline.duration()), true);
+    timeline.play();
+    this.syncRollVisuals();
+  }
+
+  protected settleRollVisuals(): void {
+    this.rollSettled = true;
+    for (const visual of this.rollVisuals) {
+      visual.token.root.position.set(visual.baseX, visual.baseY);
+      visual.token.root.rotation = visual.restingRotation;
+      visual.token.root.scale.set(1);
+      visual.token.root.alpha = visual.ignored ? 0.42 : 1;
+      if (visual.ignoredMark) visual.ignoredMark.alpha = 1;
+      setRollTokenValue(visual.token, visual.finalValue);
+    }
+    if (this.rollHighlightText && this.rollHighlightLabel) {
+      this.rollHighlightText.text = this.rollHighlightLabel;
+    }
+    this.rollConfirm?.setDisabled(false);
+    if (animationsEnabled() && this.rollHighlightText) {
+      gsap.fromTo(
+        this.rollHighlightText,
+        { alpha: 0.55 },
+        { alpha: 1, duration: 0.22, ease: "power2.out" },
+      );
+    }
+  }
+
+  protected stopRollAnimation(): void {
+    this.rollTimeline?.kill();
+    this.rollTimeline = null;
+  }
+  protected syncRollVisuals(): void {
+    if (this.rollSettled) return;
+    if (!animationsEnabled()) {
+      this.stopRollAnimation();
+      this.rollElapsedMs = this.rollDurationMs;
+      this.settleRollVisuals();
+      return;
+    }
+    if (this.rollTimeline) {
+      this.rollElapsedMs = Math.min(this.rollDurationMs, this.rollTimeline.time() * 1000);
+    }
+    for (const visual of this.rollVisuals) {
+      const elapsedMs = this.rollElapsedMs;
+      setRollTokenValue(
+        visual.token,
+        elapsedMs >= visual.trajectory.flightMs
+          ? visual.finalValue
+          : rollingDieValue(visual.sides, Math.max(0, elapsedMs), visual.seed),
+      );
+    }
+  }
+
+  protected renderGameOver(): void {
+    const gameOver = this.spec!.gameOver!;
+    const players = [gameOver.me, ...gameOver.opponents];
+    const anyConceded = players.some((player) => player.status === "conceded");
+    let heading = "Draw";
+    let color = this.theme.appTheme["muted-foreground"];
+    if (gameOver.engineCrash) {
+      heading = "Engine Crashed";
+      color = this.theme.appTheme.destructive;
+    } else if (gameOver.me.status === "conceded") {
+      heading = "You Conceded";
+      color = this.theme.appTheme.destructive;
+    } else if (gameOver.winnerId === gameOver.me.id) {
+      heading = "Victory";
+      color = this.successForeground;
+    } else if (gameOver.winnerId != null) {
+      heading = "Defeat";
+      color = this.theme.appTheme.destructive;
+    } else if (anyConceded) {
+      const names = gameOver.opponents
+        .filter((player) => player.status === "conceded")
+        .map((player) => player.name);
+      if (names.length) heading = `${names.join(" and ")} Conceded`;
+    }
+    const winner = players.find((player) => player.id === gameOver.winnerId);
+    const summary = gameOver.engineCrash
+      ? gameOver.engineCrash.split("\n")[0]
+      : winner
+        ? `${winner.name} won on turn ${gameOver.turn}`
+        : `Game ended in a draw on turn ${gameOver.turn}`;
+    const backdrop = new Graphics()
+      .rect(0, 0, this.viewportWidth, this.viewportHeight)
+      .fill({ color: hexToNum(this.theme.appTheme.background), alpha: 0.72 });
+    backdrop.eventMode = "static";
+    this.container.addChild(backdrop);
+    const panelWidth = Math.min(520, this.layoutWidth - 24);
+    const rowHeight = Math.max(60, Math.ceil(getUiFontSize("meta") * 1.35) * 2 + 20);
+    const {
+      panel: group,
+      body,
+      footer,
+    } = this.createModalShell(
+      panelWidth,
+      this.viewportHeight - 24,
+      { title: heading, description: summary, targets: [] },
+      false,
+      64,
+      44,
+      false,
+      "stacked",
+      { size: 34, color },
+    );
+    group.accessibleTitle = `Game over: ${heading}. ${summary}`;
+    const accent = new Graphics()
+      .roundRect(0, 0, panelWidth, 4, 12)
+      .fill({ color: hexToNum(color) });
+    group.addChild(accent);
+    let playerY = 4;
+    for (const player of players) {
+      const isWinner = player.id === gameOver.winnerId;
+      const rowColor = isWinner
+        ? this.successForeground
+        : player.status === "conceded"
+          ? this.theme.appTheme.destructive
+          : this.theme.appTheme.border;
+      const row = new Graphics()
+        .roundRect(0, playerY, panelWidth - PANEL_PADDING * 2, rowHeight, 7)
+        .fill({ color: hexToNum(this.theme.appTheme.background), alpha: 0.5 })
+        .stroke({ color: hexToNum(rowColor), width: isWinner ? 2 : 1, alpha: 0.65 });
+      const name = promptText(
+        player.id === gameOver.me.id ? `${player.name} · You` : player.name,
+        11,
+        this.theme.appTheme.foreground,
+        {
+          weight: "600",
+          width: panelWidth - PANEL_PADDING * 2 - 20,
+          truncate: true,
+          role: "label",
+        },
+      );
+      name.position.set(10, playerY + 8);
+      const life = promptText(`${player.life} life`, 11, this.theme.appTheme["muted-foreground"], {
+        weight: "600",
+      });
+      life.position.set(10, name.y + name.height + 4);
+      const statusLabel = isWinner
+        ? "WINNER"
+        : player.status === "conceded"
+          ? "CONCEDED"
+          : player.status === "lost"
+            ? "LOST"
+            : "PLAYING";
+      const status = promptText(statusLabel, 9, isWinner ? this.successForeground : rowColor, {
+        weight: "700",
+        letterSpacing: 0.7,
+      });
+      status.anchor.set(1, 0.5);
+      status.position.set(
+        panelWidth - PANEL_PADDING * 2 - 10,
+        name.y + name.height + 4 + status.height / 2,
+      );
+      body.addChild(row, name, life, status);
+      playerY += rowHeight + 8;
+    }
+
+    const button = this.makeButton("RETURN TO MENU", gameOver.onEndGame, {
+      color,
+      width: 170,
+      height: 44,
+      icon: "lucide-log-out",
+    });
+    button.position.set((panelWidth - PANEL_PADDING * 2 - button.buttonWidth) / 2, 0);
+    footer.addChild(button);
+    this.finalizeModalScroll();
+  }
+}

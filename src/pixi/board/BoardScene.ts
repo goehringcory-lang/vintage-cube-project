@@ -1,0 +1,2464 @@
+import { UI_FONT_FAMILY } from "@/themes/typography";
+import { Application, Container, Graphics, Point, Text, type FederatedPointerEvent } from "pixi.js";
+import { isCardPreviewTarget } from "@/lib/cardPreviewEvents";
+import type { CardDto, PlaymatSettings } from "@/protocol/game";
+import type { AttackTargetDto, TargetRef } from "@/protocol/prompts/common";
+import {
+  CardSprite,
+  setCardSpriteTheme,
+  setCardSpriteStyle,
+  setCardSpriteHoverDebug,
+} from "../CardSprite";
+import type { BattlefieldCardStyle, InlineCardStyle } from "@/stores/usePreferencesStore";
+import type { HandCardControlsSpec } from "../HandCardControls";
+import type { HandActionOption } from "@/stores/useGameUIStore";
+import { hexToNum } from "../colorUtils";
+import type { Theme } from "@/hooks/useTheme";
+import { getTheme } from "@/hooks/useTheme";
+import type { ArrowDef } from "../ArrowLayer";
+import {
+  PhaseStripLayer,
+  type PhaseStripCallbacks,
+  type PhaseStripState,
+} from "../PhaseStripLayer";
+import { DragHandler } from "../DragHandler";
+import { dropCellFromPoint, type GridCell } from "../GridLayout";
+import { prewarmManaSymbols } from "../manaSymbolCache";
+import { lerp, setFrameRatio } from "./pixiHelpers";
+import { BattlefieldDividers } from "./BattlefieldDividers";
+import { DELIMITER_EASE } from "./boardLayout";
+import { animationsEnabled } from "../effects/enabled";
+import { LongPressGesture } from "../LongPressGesture";
+import { PREVIEW_TIMING, type PreviewPointerInput } from "@/lib/cardPreview";
+import { topModal } from "@/lib/modalStack";
+import { TOUCH_MOVE_SLOP_PX } from "@/lib/responsive";
+import { haptic } from "@/lib/haptics";
+import { intentIsHostile } from "@/types/promptType";
+import {
+  GAP,
+  FLOATER_FONT_SIZE,
+  FLOATER_LIFETIME_FRAMES,
+  FLOATER_RISE_PER_FRAME,
+  FPS_SAMPLE_INTERVAL_MS,
+  STACK_SEED_TTL_MS,
+  Z_STAGED_REGION,
+  Z_COMBAT_GUEST,
+} from "../constants";
+import { useGameDevStore } from "@/stores/useGameDevStore";
+import type {
+  ArrowEndpoint,
+  ArrowSpec,
+  BattlefieldState,
+  GameCanvasCallbacks,
+  HandState,
+  PlayZoneRect,
+  ScreenBounds,
+  ScreenPos,
+} from "../types";
+import type { StackAnchorProvider } from "../stack/stack.types";
+import { BoardRegion } from "./BoardRegion";
+import type { ZoneTileSpec } from "./BoardZoneTiles";
+import { PlayerHudLayer, PLAYER_HUD_HAND_GAP_PX } from "@/pixi/hud/PlayerHudLayer";
+import type { PlayerHudSpec as PlayerBarSpec } from "@/pixi/hud/playerHud.types";
+import { isAttackerTap } from "./combatRouting";
+import { BattlefieldOverlay } from "./BattlefieldOverlay";
+import { HandController } from "./HandController";
+import { OpponentHandFan } from "./OpponentHandFan";
+import { SelectionController } from "./SelectionController";
+import {
+  collapsedOpponentWidth,
+  STRIP_BAND_PX,
+  type BoardLayout,
+  type RegionOrientation,
+} from "./boardLayout";
+import type {
+  BlockingRect,
+  HandHost,
+  OverlayHost,
+  RegionHost,
+  SceneCombatStaging,
+  SelectionHost,
+  StagedBlocker,
+} from "./types";
+import type { BoardScenePresentation } from "./BoardScenePresentation";
+
+export interface BoardPlayerSpec {
+  playerId: string;
+  isLocal: boolean;
+  playmat?: string;
+  playmatSettings?: PlaymatSettings;
+  /** Seat colour (hex) for the hover highlight. */
+  color?: string;
+}
+
+const RECT_SCRATCH_A = new Point();
+const RECT_SCRATCH_B = new Point();
+const BOARD_ZOOM_MAX = 2.25;
+const BOARD_ZOOM_SNAP_BACK = 1.05;
+const ATTACK_ARROW_LANE_PX = 18;
+/** Extra px around a planeswalker/battle card that still counts as targeting it
+ *  while dragging an attacker — makes small opponent permanents easy to hit. */
+const ATTACK_TARGET_HIT_PAD = 44;
+
+/** `count - 1` evenly-spaced delimiter positions (fractions of width). */
+function evenDelimiters(count: number): number[] {
+  return Array.from({ length: Math.max(0, count - 1) }, (_, i) => (i + 1) / count);
+}
+
+interface RegionRecord {
+  region: BoardRegion;
+  zone: PlayZoneRect;
+  isLocal: boolean;
+}
+
+export class BoardScene {
+  private app: Application;
+  private callbacks: GameCanvasCallbacks;
+  private theme: Theme;
+  private root: Container;
+  private collapseVeil: Graphics;
+  private canvasW = 0;
+  private canvasH = 0;
+  private canvasDomRect: DOMRect | null = null;
+  private canvasDomRectFrame = -1;
+  private domRectTick = 0;
+  private boardWidth = 0;
+  private topHeight = 0;
+  private destroyed = false;
+  private perfFrames = 0;
+  private perfTotalDelta = 0;
+  private perfMinFps = Infinity;
+  private perfMaxFps = 0;
+  private perfLastFlush = 0;
+  private perfSessionFrames = 0;
+  private perfSessionDelta = 0;
+  private perfJankFrames = 0;
+  private perfSessionStarted = performance.now();
+
+  private regions = new Map<string, RegionRecord>();
+  private opponentHands = new Map<string, OpponentHandFan>();
+  private localPlayerId: string | null = null;
+  private opponentIds: string[] = [];
+  private cardScale = 1;
+  private promptReference: TargetRef | null = null;
+
+  private floaterLayer: Container;
+  private floaters: { text: Text; age: number }[] = [];
+  private combatGuestLayer: Container;
+
+  private declareBlockers = false;
+  private blockDragBlockerId: string | null = null;
+  private declareAttackers = false;
+  private attackTargets: AttackTargetDto[] = [];
+  private attackerOptions: { attackerId: string; validTargetIds: string[] }[] = [];
+  // The legal attacker under a pointer-down, armed into an attack drag only once
+  // the pointer actually moves — so a plain tap still reaches the click handler.
+  private attackDragCandidate: string | null = null;
+  private activeGesturePointerId: number | null = null;
+  private longPress = new LongPressGesture();
+  private cardPressSelection: {
+    pointerId: number;
+    cardId: string;
+    selected: Set<string>;
+    restoreOnRelease: boolean;
+  } | null = null;
+  private pinchPointers = new Map<number, { x: number; y: number }>();
+  private pinchStart: {
+    dist: number;
+    scale: number;
+    world: { x: number; y: number };
+  } | null = null;
+  private pinchDownListener: (e: PointerEvent) => void;
+  private stripOutsideListener: (e: PointerEvent) => void;
+  private gestureCancelListener: (e: PointerEvent) => void;
+  private pinchMoveListener: (e: PointerEvent) => void;
+  private pinchUpListener: (e: PointerEvent) => void;
+  private attackDragAttackerId: string | null = null;
+  private attackDragTargetId: string | null = null;
+  // Dragging one of our own already-declared attackers (staged as a guest in an
+  // opponent's band) back toward our field to un-declare it.
+  private unassignDrag: { cardId: string; region: BoardRegion; overOwn: boolean } | null = null;
+  private phaseStripAlphaTarget = 1;
+  private stripBandPx = STRIP_BAND_PX;
+  private readonly presentation: BoardScenePresentation;
+  private tapSuppressedPointers = new Set<number>();
+
+  private hand: HandController | null = null;
+  private handRulesViewDefault = false;
+  private selection: SelectionController | null = null;
+  private overlay: BattlefieldOverlay | null = null;
+  private dragHandler: DragHandler;
+  private phaseStrip: PhaseStripLayer;
+  private overview = false;
+  private focusLocked = false;
+
+  private arrowSpecs: ArrowSpec[] = [];
+  private castingArrow: { sourceCardId: string; hostile: boolean } | null = null;
+  private hoveredCombatArrow: ArrowSpec | null = null;
+  private stackCardSeeds = new Map<string, { x: number; y: number; scale: number; ts: number }>();
+  private lastCardPositions = new Map<
+    string,
+    { x: number; y: number; scaleX: number; scaleY: number }
+  >();
+  private stackProvider: StackAnchorProvider | null = null;
+  private overlayInvalidation: (() => void) | null = null;
+  private overlayHitTest: ((x: number, y: number) => boolean) | null = null;
+
+  private hoveredCell: GridCell | null = null;
+  private invalidDropPoint: ScreenPos | null = null;
+  private stackTargetId: string | null = null;
+  private dropActive = false;
+
+  private hoveredCardId: string | null = null;
+  private hoveredRegionRef: BoardRegion | null = null;
+  private hoverClearTimer: number | null = null;
+
+  private actionPanelLeft: number | null = null;
+  private handPeek = false;
+  private lastCapsuleRects = new Map<string, string>();
+  private autoSort = false;
+  private zoneTilesLocked = false;
+  private gridSkeletonDebug = false;
+  private attackRowDebug = false;
+
+  // Delimiters (opponent clip bands). Owned and eased here, not in React.
+  private delimCurrent: number[] = [];
+  private delimTarget: number[] = [];
+  private focusPlayerId: string | null = null;
+  private combatFocusIds: string[] = [];
+  private targetingFocusIds: string[] | null = null;
+  private manualFocusId: string | null = null;
+  private hoveredOpponentId: string | null = null;
+  private readonly dividers: BattlefieldDividers;
+  private playerBars: PlayerHudLayer;
+  private barsEnabled = false;
+
+  private cursorViewportX = 0;
+  private cursorViewportY = 0;
+  private cursorListener: (e: MouseEvent) => void;
+  private canvasLeaveListener: () => void;
+  private readonly touchFocusOnFelt: boolean;
+  private onStageMove = (e: FederatedPointerEvent): void => this.onGlobalMove(e);
+  private onStageDown = (e: FederatedPointerEvent): void => {
+    if (this.touchFocusOnFelt && e.pointerType === "touch" && e.target === this.app.stage)
+      this.updateHoveredOpponent(e.global.x, e.global.y);
+  };
+  private onStageUp = (e: FederatedPointerEvent): void => this.onGlobalUp(e);
+  private onStageTapCapture = (e: FederatedPointerEvent): void => {
+    if (this.tapSuppressedPointers.has(e.pointerId)) e.stopImmediatePropagation();
+  };
+
+  protected constructor(
+    app: Application,
+    callbacks: GameCanvasCallbacks,
+    presentation: BoardScenePresentation,
+    touchFocusOnFelt = false,
+  ) {
+    this.app = app;
+    this.callbacks = callbacks;
+    this.presentation = presentation;
+    this.touchFocusOnFelt = touchFocusOnFelt;
+    this.theme = getTheme();
+
+    this.root = new Container();
+    this.root.sortableChildren = true;
+    app.stage.addChild(this.root);
+    app.stage.eventMode = "static";
+    app.stage.hitArea = {
+      contains: (x, y) =>
+        !topModal() &&
+        !isCardPreviewTarget(app.renderer.events.pointer.nativeEvent?.target) &&
+        x >= 0 &&
+        x <= this.canvasW &&
+        y >= 0 &&
+        y <= this.canvasH &&
+        (this.activeGesturePointerId !== null ||
+          this.hand?.isDraggingFromHand() ||
+          !this.overlayHitTest?.(x, y)),
+    };
+
+    this.dragHandler = new DragHandler();
+    this.presentation.initializeHand(this.root, this.callbacks, this.app);
+
+    this.collapseVeil = new Graphics();
+    this.collapseVeil.eventMode = "none";
+    this.collapseVeil.zIndex = 5550;
+    this.root.addChild(this.collapseVeil);
+
+    this.dividers = new BattlefieldDividers(this.theme, () => this.overlayInvalidation?.());
+    this.dividers.root.zIndex = 5560;
+    this.root.addChild(this.dividers.root);
+
+    this.playerBars = new PlayerHudLayer(
+      this.theme,
+      (id) => this.callbacks.onTargetPlayer?.(id),
+      (id) => this.callbacks.onShowPlayerSheet?.(id),
+    );
+    this.presentation.configurePlayerBars(this.playerBars);
+    this.playerBars.container.zIndex = 5600;
+    this.playerBars.container.visible = false;
+    this.root.addChild(this.playerBars.container);
+
+    this.phaseStrip = new PhaseStripLayer(this.theme);
+    this.phaseStrip.container.zIndex = 7000;
+    this.phaseStrip.onExpandedChange = () => this.refreshPhaseStripDim();
+    this.presentation.configurePhaseStrip(this.phaseStrip);
+    this.root.addChild(this.phaseStrip.container);
+
+    this.combatGuestLayer = new Container();
+    this.combatGuestLayer.sortableChildren = true;
+    this.combatGuestLayer.zIndex = Z_COMBAT_GUEST;
+    this.root.addChild(this.combatGuestLayer);
+
+    this.floaterLayer = new Container();
+    this.floaterLayer.eventMode = "none";
+    this.floaterLayer.zIndex = 9000;
+    this.root.addChild(this.floaterLayer);
+
+    app.stage.on("pointerdown", this.onStageDown);
+    app.stage.on("pointermove", this.onStageMove);
+    app.stage.on("pointerup", this.onStageUp);
+    app.stage.on("pointerupoutside", this.onStageUp);
+    app.stage.on("pointertapcapture", this.onStageTapCapture);
+
+    this.cursorListener = (e: MouseEvent) => {
+      if (topModal()) {
+        if (this.hand?.hasActiveHover()) this.hand.resetHover();
+        this.updateHoveredOpponent(-1, -1);
+        return;
+      }
+      this.cursorViewportX = e.clientX;
+      this.cursorViewportY = e.clientY;
+      const rect = this.canvasRect();
+      const canvasX = e.clientX - rect.left;
+      const canvasY = e.clientY - rect.top;
+      if (
+        this.activeGesturePointerId === null &&
+        !this.hand?.isDraggingFromHand() &&
+        this.overlayHitTest?.(canvasX, canvasY)
+      ) {
+        if (this.hand?.hasActiveHover()) this.hand.resetHover();
+        this.updateHoveredOpponent(-1, -1);
+        return;
+      }
+      this.updateHoveredOpponent(canvasX, canvasY);
+      if (this.hand?.hasActiveHover()) {
+        const point = this.root.toLocal(
+          RECT_SCRATCH_A.set(canvasX, canvasY),
+          undefined,
+          RECT_SCRATCH_A,
+        );
+        this.hand.clearHoverOutside(point.x, point.y);
+      }
+    };
+    window.addEventListener("pointermove", this.cursorListener);
+    this.canvasLeaveListener = () => this.hand?.clearHover();
+    this.app.canvas.addEventListener("pointerleave", this.canvasLeaveListener);
+    app.stage.on("pointerleave", this.canvasLeaveListener);
+
+    this.pinchDownListener = (e: PointerEvent) => {
+      if (e.pointerType !== "touch") return;
+      const rect = this.canvasRect();
+      this.pinchPointers.set(e.pointerId, { x: e.clientX - rect.left, y: e.clientY - rect.top });
+      if (this.pinchStart) this.tapSuppressedPointers.add(e.pointerId);
+      else if (this.pinchPointers.size === 2) this.beginPinch();
+    };
+    this.pinchMoveListener = (e: PointerEvent) => {
+      if (!this.pinchPointers.has(e.pointerId)) return;
+      const rect = this.canvasRect();
+      this.pinchPointers.set(e.pointerId, { x: e.clientX - rect.left, y: e.clientY - rect.top });
+      if (this.pinchStart) this.updatePinch();
+    };
+    this.pinchUpListener = (e: PointerEvent) => {
+      if (this.tapSuppressedPointers.has(e.pointerId)) {
+        window.setTimeout(() => this.tapSuppressedPointers.delete(e.pointerId), 0);
+      }
+      if (!this.pinchPointers.delete(e.pointerId)) return;
+      if (this.pinchPointers.size < 2) this.endPinch();
+    };
+    this.gestureCancelListener = (e: PointerEvent) => {
+      this.localRegion()?.cancelZoneTileDragForPointer(e.pointerId);
+      if (this.activeGesturePointerId === e.pointerId) this.abortActiveGesture();
+    };
+    window.addEventListener("pointercancel", this.gestureCancelListener);
+    this.stripOutsideListener = (e: PointerEvent) => {
+      if (!this.phaseStrip.isCompactExpanded()) return;
+      const rect = this.canvasRect();
+      const p = this.phaseStrip.container.toLocal(
+        new Point(e.clientX - rect.left, e.clientY - rect.top),
+      );
+      this.phaseStrip.handleOutsidePointerDown(p.x, p.y);
+    };
+    this.app.canvas.addEventListener("pointerdown", this.stripOutsideListener);
+    this.app.canvas.addEventListener("pointerdown", this.pinchDownListener);
+    window.addEventListener("pointermove", this.pinchMoveListener);
+    window.addEventListener("pointerup", this.pinchUpListener, { capture: true });
+    window.addEventListener("pointercancel", this.pinchUpListener, { capture: true });
+
+    app.ticker.add(this.tick, this);
+    prewarmManaSymbols();
+  }
+
+  get isDestroyed(): boolean {
+    return this.destroyed;
+  }
+
+  get canvasElement(): HTMLCanvasElement {
+    return this.app.canvas as HTMLCanvasElement;
+  }
+
+  configure(
+    players: BoardPlayerSpec[],
+    layout: BoardLayout,
+    scales: { self: number; opponent: number },
+    combatRowReserved = true,
+  ): void {
+    if (this.destroyed) return;
+    this.cardScale = scales.self;
+    this.overview = layout.opponentLayout === "overview";
+    const seen = new Set<string>();
+    let oppIndex = 0;
+
+    for (const spec of players) {
+      const opp = spec.isLocal ? null : layout.opponents[oppIndex++];
+      const zone = opp?.rect ?? layout.self;
+      const orientation: RegionOrientation = spec.isLocal ? "bottom" : (opp?.orientation ?? "top");
+      const regionScale = spec.isLocal ? scales.self : scales.opponent;
+      // The clip bands tile the canvas (no overlap), so z-order is cosmetic.
+      const zIndex = spec.isLocal ? 100 : 50;
+      seen.add(spec.playerId);
+      const existing = this.regions.get(spec.playerId);
+      if (existing) {
+        existing.zone = zone;
+        existing.region.container.zIndex = zIndex;
+        existing.region.setOverviewMode(this.overview && !spec.isLocal);
+        existing.region.setCombatRowReserved(combatRowReserved);
+        existing.region.setZone(zone, orientation);
+        existing.region.setCardScale(regionScale);
+        existing.region.setPlaymatSettings(spec.playmatSettings);
+        existing.region.setPlaymat(spec.playmat);
+        continue;
+      }
+      const region = new BoardRegion(
+        this.makeRegionHost(spec.playerId, spec.isLocal),
+        this.root,
+        zone,
+        regionScale,
+        { orientation, combatRowReserved, presentation: this.presentation.region },
+      );
+      region.setPlaymatSettings(spec.playmatSettings);
+      region.setOverviewMode(this.overview && !spec.isLocal);
+      region.setPlaymat(spec.playmat);
+      region.container.zIndex = zIndex;
+      region.setAutoSort(this.autoSort);
+      region.setZoneTilesLocked(this.zoneTilesLocked);
+      region.setSkeletonDebug(this.gridSkeletonDebug);
+      region.setAttackRowDebug(this.attackRowDebug);
+      this.regions.set(spec.playerId, { region, zone, isLocal: spec.isLocal });
+      if (spec.isLocal) {
+        this.localPlayerId = spec.playerId;
+        this.setupLocalControllers(region);
+      }
+    }
+
+    this.boardWidth = layout.self.width;
+    this.topHeight = layout.dividerY - layout.stripBandPx / 2;
+    const oppIds = players.filter((p) => !p.isLocal).map((p) => p.playerId);
+    const sameOpponents =
+      oppIds.length === this.opponentIds.length &&
+      oppIds.every((id, i) => id === this.opponentIds[i]);
+    this.opponentIds = oppIds;
+    if (!sameOpponents || this.delimCurrent.length !== oppIds.length - 1) {
+      this.delimCurrent = evenDelimiters(oppIds.length);
+    }
+    this.recomputeDelimTarget();
+    this.applyDelimiters();
+
+    for (const [id, fan] of [...this.opponentHands]) {
+      if (oppIds.includes(id)) continue;
+      fan.destroy();
+      this.opponentHands.delete(id);
+    }
+    for (const [id, rec] of [...this.regions]) {
+      if (seen.has(id)) continue;
+      rec.region.destroy();
+      this.regions.delete(id);
+      if (this.localPlayerId === id) this.localPlayerId = null;
+    }
+
+    this.positionPhaseStrip(layout);
+    this.dragHandler.setCardScale(scales.self);
+    this.dragHandler.setContainerSize(this.app.renderer.width, this.app.renderer.height);
+    this.syncHandPresentation();
+    this.selection?.refresh();
+    // Regions laid out above sampled capsule bounds from before this pass's
+    // applyDelimiters/layoutSelfBar moved them (resize/rotation) — reconcile.
+    this.refreshCapsuleBlockers();
+  }
+
+  setOpponentFocus(playerId: string | null): void {
+    if (this.focusPlayerId === playerId) return;
+    this.focusPlayerId = playerId;
+    this.recomputeDelimTarget();
+  }
+
+  setCombatFocus(playerIds: string[]): void {
+    if (
+      this.combatFocusIds.length === playerIds.length &&
+      this.combatFocusIds.every((id, i) => id === playerIds[i])
+    ) {
+      return;
+    }
+    this.combatFocusIds = playerIds;
+    this.recomputeDelimTarget();
+  }
+
+  setTargetingFocus(playerIds: string[] | null): void {
+    if (
+      (this.targetingFocusIds === null && playerIds === null) ||
+      (this.targetingFocusIds !== null &&
+        playerIds !== null &&
+        this.targetingFocusIds.length === playerIds.length &&
+        this.targetingFocusIds.every((id, i) => id === playerIds[i]))
+    ) {
+      return;
+    }
+    if (this.targetingFocusIds === null && playerIds !== null) this.hoveredOpponentId = null;
+    this.targetingFocusIds = playerIds;
+    this.recomputeDelimTarget();
+  }
+
+  setManualFocus(playerId: string | null): void {
+    if (this.manualFocusId === playerId) return;
+    this.manualFocusId = playerId;
+    this.recomputeDelimTarget();
+  }
+
+  setFocusLocked(locked: boolean): void {
+    if (locked === this.focusLocked) return;
+    this.focusLocked = locked;
+    if (!locked) this.recomputeDelimTarget();
+  }
+
+  private focusedOpponentIds(): string[] {
+    if (this.manualFocusId) return [this.manualFocusId];
+    if (this.targetingFocusIds !== null) {
+      if (!this.focusLocked && this.hoveredOpponentId) return [this.hoveredOpponentId];
+      const ids = new Set(this.targetingFocusIds);
+      for (const id of this.combatFocusIds) ids.add(id);
+      if (ids.size > 0) return [...ids];
+    }
+    if (!this.focusLocked && this.hoveredOpponentId) return [this.hoveredOpponentId];
+    return this.combatFocusIds.length > 0
+      ? this.combatFocusIds
+      : this.focusPlayerId
+        ? [this.focusPlayerId]
+        : [];
+  }
+
+  private recomputeDelimTarget(): void {
+    const n = this.opponentIds.length;
+    const focused = new Set<number>();
+    for (const id of this.focusedOpponentIds()) {
+      const i = this.opponentIds.indexOf(id);
+      if (i >= 0) focused.add(i);
+    }
+    if (this.overview || n <= 1 || this.boardWidth <= 0 || focused.size === 0) {
+      this.delimTarget = evenDelimiters(n);
+    } else {
+      const banner = collapsedOpponentWidth(this.boardWidth, n) / this.boardWidth;
+      const each = Math.max(banner, (1 - (n - focused.size) * banner) / focused.size);
+      const target: number[] = [];
+      let acc = 0;
+      for (let i = 0; i < n - 1; i++) {
+        acc += focused.has(i) ? each : banner;
+        target.push(acc);
+      }
+      this.delimTarget = target;
+    }
+    for (let i = 0; i < n; i++) {
+      const region = this.regions.get(this.opponentIds[i]!)?.region;
+      if (!region) continue;
+      if (this.overview || focused.size <= 1 || !focused.has(i)) {
+        region.setGridBand(null, 0);
+      } else {
+        const left = Math.round((i === 0 ? 0 : this.delimTarget[i - 1]!) * this.boardWidth);
+        const right = Math.round((i === n - 1 ? 1 : this.delimTarget[i]!) * this.boardWidth);
+        region.setGridBand(left, right - left);
+      }
+    }
+  }
+
+  private easeDelimiters(): void {
+    const n = this.opponentIds.length;
+    if (this.overview) return;
+    if (n <= 1) return;
+    if (this.delimCurrent.length !== n - 1) this.delimCurrent = evenDelimiters(n);
+    if (this.delimTarget.length !== n - 1) this.recomputeDelimTarget();
+    let changed = false;
+    for (let i = 0; i < n - 1; i++) {
+      const next = lerp(
+        this.delimCurrent[i]!,
+        this.delimTarget[i]!,
+        animationsEnabled() ? DELIMITER_EASE.FACTOR : 1,
+        DELIMITER_EASE.SNAP,
+      );
+      changed ||= next !== this.delimCurrent[i];
+      this.delimCurrent[i] = next;
+    }
+    if (changed) this.applyDelimiters();
+  }
+
+  private applyDelimiters(): void {
+    this.layoutSelfBar();
+    const n = this.opponentIds.length;
+    const W = this.boardWidth;
+    if (n <= 0 || W <= 0) return;
+    const playerHudHeight = this.presentation.opponentHudHeight;
+    this.collapseVeil.clear();
+    if (this.overview) {
+      this.dividers.clear();
+      for (const id of this.opponentIds) {
+        const rec = this.regions.get(id);
+        if (!rec) continue;
+        const zone = rec.zone;
+        rec.region.setClip(zone.x, zone.width);
+        this.opponentHands.get(id)?.setBand(zone.x, zone.y, zone.width, zone.height, true);
+        if (this.barsEnabled) {
+          const field = rec.region.getPlaymatRect();
+          const availableWidth = Math.max(1, field.width);
+          const availableHeight = Math.max(1, field.height);
+          const maxWidth = this.presentation.hudMaxWidth;
+          this.playerBars.setRect(
+            id,
+            field.x,
+            field.y,
+            Math.min(maxWidth, availableWidth),
+            Math.min(playerHudHeight, availableHeight),
+            false,
+          );
+        }
+      }
+      return;
+    }
+    const collapsedWidth = collapsedOpponentWidth(W, n);
+    const veilStart = collapsedWidth * 2;
+    const veilColor = hexToNum(this.theme.gameTheme.canvas.background);
+    for (let i = 0; i < n; i++) {
+      const rec = this.regions.get(this.opponentIds[i]!);
+      if (!rec) continue;
+      const left = Math.round((i === 0 ? 0 : this.delimCurrent[i - 1]!) * W);
+      const right = Math.round((i === n - 1 ? 1 : this.delimCurrent[i]!) * W);
+      const bandW = Math.max(0, right - left);
+      rec.region.setClip(left, bandW);
+      this.opponentHands
+        .get(this.opponentIds[i]!)
+        ?.setBand(left, rec.zone.y, bandW, rec.zone.height, bandW >= veilStart);
+      if (this.barsEnabled) {
+        // Solid veil opacity ramps 0→1 as the band narrows from `veilStart` down
+        // to its collapsed width — fully in sync with the ease, no separate tween.
+        const frac = Math.max(0, Math.min(1, (veilStart - bandW) / (veilStart - collapsedWidth)));
+        if (frac > 0.001) {
+          this.collapseVeil.rect(left, 0, bandW, this.topHeight + this.stripBandPx / 2);
+          this.collapseVeil.fill({ color: veilColor, alpha: frac });
+        }
+        const field = rec.region.getPlaymatRect();
+        const column = this.presentation.hudUsesColumn(field.width);
+        const availableWidth = Math.max(1, field.width);
+        const availableHeight = Math.max(1, field.height);
+        const maxWidth = this.presentation.hudMaxWidth;
+        const barW = column ? availableWidth : Math.min(maxWidth, availableWidth);
+        const barH = column ? availableHeight : Math.min(playerHudHeight, availableHeight);
+        this.playerBars.setRect(this.opponentIds[i]!, field.x, field.y, barW, barH, column);
+      }
+    }
+    this.drawDelimiterFog();
+  }
+
+  setZoneTiles(byPlayer: Record<string, ZoneTileSpec[]>): void {
+    for (const [id, rec] of this.regions) rec.region.setZoneTiles(byPlayer[id] ?? []);
+  }
+
+  private preferredPlayerHudHeight(): number {
+    return this.presentation.selfHudHeight;
+  }
+
+  private layoutSelfBar(): void {
+    if (!this.barsEnabled || !this.localPlayerId) return;
+    const record = this.regions.get(this.localPlayerId);
+    if (!record) return;
+    const field = record.region.getPlaymatRect();
+    const hand = this.presentation.selfHudHandBlocker(this.hand);
+    const preferredHeight = this.preferredPlayerHudHeight();
+    const x = field.x;
+    const availableWidth = Math.max(1, field.width);
+    const maxWidth = this.presentation.hudMaxWidth;
+    const desiredWidth = Math.min(availableWidth, maxWidth);
+    let width = desiredWidth;
+    const bottom = field.y + field.height;
+    const overlapsHand =
+      hand &&
+      hand.x < x + width &&
+      hand.x + hand.width > x &&
+      hand.y < bottom &&
+      hand.y + hand.height > bottom - preferredHeight;
+    if (overlapsHand) {
+      const clearWidth = hand.x - PLAYER_HUD_HAND_GAP_PX - x;
+      const minWidth = Math.min(availableWidth, this.presentation.hudMinWidth);
+      width = Math.min(width, Math.max(clearWidth, minWidth));
+    }
+    const height = Math.max(1, Math.min(preferredHeight, bottom - field.y));
+    this.playerBars.setRect(this.localPlayerId, x, bottom - height, width, height, false);
+  }
+
+  setPlayerBars(specs: PlayerBarSpec[], enabled: boolean): void {
+    const reserveChanged = this.barsEnabled !== enabled;
+    this.barsEnabled = enabled;
+    this.playerBars.container.visible = enabled;
+    this.playerBars.setBars(enabled ? specs : []);
+    for (const spec of specs) {
+      const region = this.regions.get(spec.playerId)?.region;
+      region?.setSeatState(spec.color, spec.name);
+    }
+    if (reserveChanged) {
+      for (const rec of this.regions.values()) {
+        if (rec.isLocal) continue;
+        const state = rec.region.getLastState();
+        if (state) rec.region.updateBattlefield(state);
+      }
+    }
+    this.applyDelimiters();
+    this.refreshCapsuleBlockers();
+  }
+
+  private refreshCapsuleBlockers(): void {
+    for (const [id, rec] of this.regions) {
+      const [b] = this.gridCapsuleBlockers(id, rec.isLocal);
+      const key = b ? [b.x, b.y, b.width, b.height].map((v) => Math.round(v / 4)).join(",") : "";
+      if (this.lastCapsuleRects.get(id) === key) continue;
+      this.lastCapsuleRects.set(id, key);
+      const state = rec.region.getLastState();
+      if (state) rec.region.updateBattlefield(state);
+    }
+  }
+
+  private drawDelimiterFog(): void {
+    this.dividers.draw(
+      this.boardWidth,
+      this.topHeight + this.stripBandPx / 2,
+      this.delimCurrent,
+      this.focusedOpponentIds().map((id) => this.opponentIds.indexOf(id)),
+      collapsedOpponentWidth(this.boardWidth, this.opponentIds.length),
+    );
+  }
+
+  private syncDelimiterFogAnimation(): void {
+    this.dividers.setAnimated(
+      animationsEnabled() && !this.overview && this.opponentIds.length > 1 && this.boardWidth > 0,
+    );
+  }
+
+  private delimitersSettling(): boolean {
+    for (let i = 0; i < this.delimCurrent.length; i++) {
+      const target = this.delimTarget[i] ?? this.delimCurrent[i]!;
+      if (Math.abs(target - this.delimCurrent[i]!) > DELIMITER_EASE.SNAP) return true;
+    }
+    return false;
+  }
+
+  private collapseStackPeeks(): void {
+    for (const rec of this.regions.values()) rec.region.collapseStackPeek();
+  }
+
+  private beginPinch(): void {
+    const pts = [...this.pinchPointers.values()];
+    const a = pts[0]!;
+    const b = pts[1]!;
+    const dist = Math.hypot(b.x - a.x, b.y - a.y);
+    if (dist <= 0) return;
+    for (const id of this.pinchPointers.keys()) this.tapSuppressedPointers.add(id);
+    this.abortActiveGesture();
+    const scale = this.root.scale.x;
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    this.pinchStart = {
+      dist,
+      scale,
+      world: {
+        x: (mid.x - this.root.position.x) / scale,
+        y: (mid.y - this.root.position.y) / scale,
+      },
+    };
+  }
+
+  private updatePinch(): void {
+    if (!this.pinchStart) return;
+    const pts = [...this.pinchPointers.values()];
+    const a = pts[0]!;
+    const b = pts[1]!;
+    const dist = Math.hypot(b.x - a.x, b.y - a.y);
+    const s = Math.min(
+      BOARD_ZOOM_MAX,
+      Math.max(1, this.pinchStart.scale * (dist / this.pinchStart.dist)),
+    );
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    this.root.scale.set(s);
+    this.root.position.set(
+      Math.min(0, Math.max(this.canvasW * (1 - s), mid.x - this.pinchStart.world.x * s)),
+      Math.min(0, Math.max(this.canvasH * (1 - s), mid.y - this.pinchStart.world.y * s)),
+    );
+  }
+
+  private endPinch(): void {
+    if (!this.pinchStart) return;
+    this.pinchStart = null;
+    if (this.root.scale.x < BOARD_ZOOM_SNAP_BACK) this.resetBoardZoom();
+  }
+
+  private resetBoardZoom(): void {
+    this.pinchStart = null;
+    this.root.scale.set(1);
+    this.root.position.set(0, 0);
+  }
+
+  private abortActiveGesture(): void {
+    const local = this.localRegion();
+    if (this.dragHandler.isDragging) {
+      this.dragHandler.end();
+      local?.hideGridSkeleton();
+    } else {
+      this.dragHandler.cancel();
+    }
+    this.hoveredCell = null;
+    this.stackTargetId = null;
+    this.invalidDropPoint = null;
+    if (this.cardPressSelection && this.selection) {
+      this.selection.setSelected(new Set(this.cardPressSelection.selected));
+      this.selection.refresh();
+    }
+    this.cardPressSelection = null;
+    if (this.selection?.isMarqueeActive() && local) {
+      this.selection.endMarquee(local.snapshotCurrentPositions());
+    }
+    if (this.unassignDrag) {
+      const ud = this.unassignDrag;
+      this.unassignDrag = null;
+      const st = ud.region.getLastState();
+      if (st) ud.region.updateBattlefield(st);
+    }
+    local?.cancelZoneTileDrag();
+    this.setBlockDragId(null);
+    this.setAttackDragId(null);
+    this.attackDragCandidate = null;
+    this.activeGesturePointerId = null;
+    this.collapseStackPeeks();
+    this.longPress.reset();
+    const state = local?.getLastState();
+    if (local && state) local.updateBattlefield(state);
+  }
+
+  private updateHoveredOpponent(canvasX: number, canvasY: number): void {
+    if (this.pinchStart) return;
+    const local = this.root.toLocal(new Point(canvasX, canvasY));
+    const localX = local.x;
+    const localY = local.y;
+    const n = this.opponentIds.length;
+    const W = this.boardWidth;
+    let hovered: string | null = null;
+    if (
+      n > 0 &&
+      W > 0 &&
+      localY >= 0 &&
+      localY <= this.topHeight &&
+      !this.stackProvider?.hitTest(canvasX, canvasY)
+    ) {
+      for (let i = 0; i < n; i++) {
+        const zone = this.regions.get(this.opponentIds[i]!)?.zone;
+        const left = this.overview ? zone!.x : (i === 0 ? 0 : this.delimCurrent[i - 1]!) * W;
+        const right = this.overview
+          ? zone!.x + zone!.width
+          : (i === n - 1 ? 1 : this.delimCurrent[i]!) * W;
+        if (
+          localX >= left &&
+          localX < right &&
+          (!this.overview || (localY >= zone!.y && localY < zone!.y + zone!.height))
+        ) {
+          hovered = this.opponentIds[i]!;
+          break;
+        }
+      }
+    }
+    if (hovered === this.hoveredOpponentId) return;
+    this.hoveredOpponentId = hovered;
+    if (!this.focusLocked) this.recomputeDelimTarget();
+    this.callbacks.onHoverOpponent?.(hovered);
+  }
+
+  private setupLocalControllers(region: BoardRegion): void {
+    this.hand = new HandController(this.makeHandHost(), this.root);
+    this.hand.setRulesViewDefault(this.handRulesViewDefault);
+    this.presentation.configureHand(this.hand);
+    this.selection = new SelectionController(this.makeSelectionHost(region), this.root);
+    this.overlay = new BattlefieldOverlay(this.makeOverlayHost(region));
+    region.enableFeltMarquee((e) => this.onFeltDown(e));
+    this.syncHandPresentation();
+  }
+  private syncHandPresentation(): void {
+    this.presentation.syncHand(this.hand, this.dragHandler, this.handPeek);
+  }
+
+  private onFeltDown(e: FederatedPointerEvent): void {
+    if (this.destroyed) return;
+    const selection = this.selection;
+    if (!selection) return;
+    if (this.declareBlockers) return;
+    const pos = this.root.toLocal(e.global);
+    // Don't clear on press — endMarquee handles it on release, so a stray press
+    // doesn't wipe the current selection before any movement.
+    selection.startMarquee(pos.x, pos.y, e.shiftKey);
+    this.activeGesturePointerId = e.pointerId;
+  }
+
+  private positionPhaseStrip(layout: BoardLayout): void {
+    this.stripBandPx = layout.stripBandPx;
+    this.phaseStrip.container.x = layout.self.x;
+    this.phaseStrip.container.y = layout.dividerY - this.stripBandPx / 2;
+    this.phaseStrip.resize(layout.self.width, this.stripBandPx);
+  }
+
+  private localRegion(): BoardRegion | null {
+    return this.localPlayerId ? (this.regions.get(this.localPlayerId)?.region ?? null) : null;
+  }
+
+  private localZone(): PlayZoneRect | null {
+    return this.localPlayerId ? (this.regions.get(this.localPlayerId)?.zone ?? null) : null;
+  }
+
+  updateBattlefield(playerId: string, cards: CardDto[]): void {
+    this.regions.get(playerId)?.region.updateBattlefield({ cards } as BattlefieldState);
+  }
+
+  setOpponentHand(playerId: string, cards: CardDto[]): void {
+    if (!this.presentation.showsOpponentHands) return;
+    const existing = this.opponentHands.get(playerId);
+    if (existing) {
+      existing.setCards(cards);
+      return;
+    }
+    const fan = new OpponentHandFan(
+      {
+        onHoverCard: (card, bounds, trigger) =>
+          this.callbacks.onHoverCard?.(card, bounds && this.toViewportBounds(bounds), {
+            useAnchor: true,
+            trigger,
+          }),
+        onInspectCard: (card) => {
+          this.callbacks.onDismissHoverPreview?.();
+          this.callbacks.onInspectCard?.(card);
+        },
+      },
+      this.root,
+    );
+    fan.setRulesViewDefault(this.handRulesViewDefault);
+    fan.setCards(cards);
+    this.opponentHands.set(playerId, fan);
+    this.applyDelimiters();
+  }
+
+  updateRegionState(playerId: string, state: BattlefieldState): void {
+    const region = this.regions.get(playerId)?.region;
+    region?.updateBattlefield(state);
+    if (region && region === this.hoveredRegionRef && this.hoveredCardId) {
+      this.syncHoveredCombatTarget(region, this.hoveredCardId);
+    }
+    this.refreshPhaseStripDim();
+  }
+
+  pruneCardPositions(liveIds: ReadonlySet<string>): void {
+    for (const id of this.lastCardPositions.keys()) {
+      if (!liveIds.has(id)) this.lastCardPositions.delete(id);
+    }
+  }
+
+  private refreshPhaseStripDim(): void {
+    let active = false;
+    for (const rec of this.regions.values()) {
+      if (rec.region.getLastState()?.cards.some((c) => c.isAttacking)) {
+        active = true;
+        break;
+      }
+    }
+    this.phaseStripAlphaTarget = 1;
+    for (const rec of this.regions.values()) rec.region.setCombatDim(active);
+  }
+
+  updateHand(state: HandState): void {
+    this.hand?.updateHand(state);
+    this.syncHandPresentation();
+    this.layoutSelfBar();
+    this.refreshCapsuleBlockers();
+  }
+  getHandBounds(): BlockingRect | null {
+    return this.presentation.handBounds(this.hand);
+  }
+
+  holdHandHover(): void {
+    this.hand?.holdHover();
+  }
+
+  releaseHandHover(): void {
+    this.hand?.releaseHover();
+  }
+
+  setHandPreviewFace(face: 0 | 1): void {
+    this.hand?.setHoveredPreviewFace(face);
+  }
+
+  setHandCardStyle(style: InlineCardStyle): void {
+    this.handRulesViewDefault = style === "rules";
+    this.hand?.setRulesViewDefault(this.handRulesViewDefault);
+    for (const fan of this.opponentHands.values()) {
+      fan.setRulesViewDefault(this.handRulesViewDefault);
+    }
+  }
+
+  handUsesRulesView(cardId: string): boolean {
+    return this.hand?.usesRulesView(cardId) === true;
+  }
+  get handRulesKeyboardTarget() {
+    return this.hand?.handRulesKeyboardTarget ?? null;
+  }
+  hitTestHandRules(x: number, y: number): boolean {
+    return this.hand?.hitTestRules(x, y) === true;
+  }
+
+  scrollHandRulesAt(x: number, y: number, delta: number, mode: number): boolean {
+    return this.hand?.scrollRulesAt(x, y, delta, mode) ?? false;
+  }
+
+  toggleHoveredHandRulesView(): boolean | null {
+    return this.hand?.toggleHoveredRulesView() ?? null;
+  }
+  setHoveredHandRulesActions(
+    actions: HandActionOption[],
+    onSelectAction: ((action: HandActionOption) => void) | null,
+  ): void {
+    this.hand?.setHoveredRulesActions(actions, onSelectAction);
+  }
+  setHoveredHandControls(spec: HandCardControlsSpec | null): void {
+    this.hand?.setHoveredControls(spec);
+  }
+
+  setHandScale(scale: number): void {
+    this.hand?.setScale(scale);
+    this.hand?.relayout();
+  }
+
+  setActionPanelBounds(bounds: ScreenBounds | null): void {
+    const left = bounds?.x ?? null;
+    if (this.actionPanelLeft === left) return;
+    this.actionPanelLeft = left;
+    this.hand?.relayout();
+    this.layoutSelfBar();
+    this.refreshCapsuleBlockers();
+  }
+
+  setCombatStaging(playerId: string, staging: SceneCombatStaging | null): void {
+    this.regions.get(playerId)?.region.setCombatStaging(staging);
+  }
+
+  applyCombatBlocks(blocks: { blockerId: string; attackerId: string }[]): void {
+    if (this.destroyed) return;
+    const canvasLeft = this.canvasRect().left;
+    const regionOf = (cardId: string): BoardRegion | null => {
+      for (const rec of this.regions.values()) {
+        if (rec.region.getCardPosition(cardId)) return rec.region;
+      }
+      return null;
+    };
+
+    const byAttacker = new Map<string, string[]>();
+    for (const { blockerId, attackerId } of blocks) {
+      const list = byAttacker.get(attackerId);
+      if (list) list.push(blockerId);
+      else byAttacker.set(attackerId, [blockerId]);
+    }
+
+    interface Acc {
+      attackerIds: Set<string>;
+      blockers: StagedBlocker[];
+      blockerIds: Set<string>;
+    }
+    const acc = new Map<BoardRegion, Acc>();
+    const accFor = (region: BoardRegion): Acc => {
+      let a = acc.get(region);
+      if (!a) {
+        a = { attackerIds: new Set(), blockers: [], blockerIds: new Set() };
+        acc.set(region, a);
+      }
+      return a;
+    };
+
+    for (const [attackerId, blockerIds] of byAttacker) {
+      const attackerRegion = regionOf(attackerId);
+      const pos = attackerRegion?.getCardPosition(attackerId);
+      if (!attackerRegion || !pos) continue;
+      const laneScreenX = pos.x + canvasLeft;
+      accFor(attackerRegion).attackerIds.add(attackerId);
+      blockerIds.forEach((blockerId, i) => {
+        const blockerRegion = regionOf(blockerId);
+        if (!blockerRegion) return;
+        const a = accFor(blockerRegion);
+        a.blockers.push({
+          id: blockerId,
+          laneScreenX,
+          attackerY: pos.y,
+          indexInLane: i,
+          laneCount: blockerIds.length,
+        });
+        a.blockerIds.add(blockerId);
+      });
+    }
+
+    for (const rec of this.regions.values()) {
+      const a = acc.get(rec.region);
+      const staged = !!a && (a.attackerIds.size > 0 || a.blockers.length > 0);
+      rec.region.setCombatStaging(
+        staged
+          ? { attackerIds: a!.attackerIds, blockers: a!.blockers, blockerIds: a!.blockerIds }
+          : null,
+      );
+      rec.region.container.zIndex = staged ? Z_STAGED_REGION : rec.isLocal ? 100 : 50;
+    }
+    this.refreshPhaseStripDim();
+  }
+
+  setArrowSpecs(specs: ArrowSpec[]): void {
+    this.arrowSpecs = specs;
+    this.overlayInvalidation?.();
+  }
+
+  setCastingArrow(arrow: { sourceCardId: string; hostile: boolean } | null): void {
+    this.castingArrow = arrow;
+    this.overlayInvalidation?.();
+  }
+
+  setDeclareBlockers(active: boolean): void {
+    this.declareBlockers = active;
+    if (!active) this.setBlockDragId(null);
+  }
+
+  private setBlockDragId(id: string | null): void {
+    if (this.blockDragBlockerId === id) return;
+    this.blockDragBlockerId = id;
+    this.overlayInvalidation?.();
+    this.callbacks.onBlockDragChange?.(id);
+  }
+
+  setDeclareAttackers(
+    active: boolean,
+    attackTargets: AttackTargetDto[],
+    attackerOptions: { attackerId: string; validTargetIds: string[] }[],
+  ): void {
+    this.declareAttackers = active;
+    this.attackTargets = attackTargets;
+    this.attackerOptions = attackerOptions;
+    if (!active) {
+      this.setAttackDragId(null);
+      this.unassignDrag = null;
+    }
+  }
+
+  private setAttackDragId(id: string | null): void {
+    if (this.attackDragAttackerId === id) return;
+    this.attackDragAttackerId = id;
+    this.overlayInvalidation?.();
+    if (id === null) {
+      this.attackDragTargetId = null;
+      const target =
+        this.hoveredCombatArrow?.to.kind === "card" ? this.hoveredCombatArrow.to.id : null;
+      this.updateAttackTargetRing(target, target !== null);
+    } else {
+      this.updateAttackTargetRing(null);
+    }
+    this.callbacks.onAttackDragChange?.(id);
+  }
+
+  private updateAttackTargetRing(cardId: string | null, pulsing = false): void {
+    for (const rec of this.regions.values()) rec.region.setAttackTargetRing(cardId, pulsing);
+  }
+
+  /** Resolve a scene-space point (root-local, as `getCardPosition` returns) to a
+   *  legal defender for `attackerId`: a planeswalker/battle card directly under
+   *  the pointer wins; otherwise the opponent whose field band the pointer is
+   *  over (proximity → the player). */
+  private resolveAttackTargetAt(gx: number, gy: number, attackerId: string): string | null {
+    const valid = this.attackerOptions.find((a) => a.attackerId === attackerId)?.validTargetIds;
+    if (!valid || valid.length === 0) return null;
+    const validSet = new Set(valid);
+    // Generous pad around each planeswalker/battle so dragging *near* one targets
+    // it; when several enlarged hit-zones overlap, the nearest centre wins.
+    let best: { id: string; dist: number } | null = null;
+    for (const t of this.attackTargets) {
+      if (t.kind === "player" || !validSet.has(t.id)) continue;
+      for (const rec of this.regions.values()) {
+        if (rec.isLocal) continue;
+        const center = rec.region.getCardPosition(t.id);
+        if (!center) continue;
+        if (!rec.region.containsPointInCard(t.id, gx, gy, ATTACK_TARGET_HIT_PAD)) continue;
+        const dist = (gx - center.x) ** 2 + (gy - center.y) ** 2;
+        if (!best || dist < best.dist) best = { id: t.id, dist };
+      }
+    }
+    if (best) return best.id;
+    const oppId = this.hoveredOpponentId;
+    if (
+      oppId &&
+      validSet.has(oppId) &&
+      this.attackTargets.some((t) => t.id === oppId && t.kind === "player")
+    ) {
+      return oppId;
+    }
+    return null;
+  }
+
+  setPhaseStripState(state: PhaseStripState): void {
+    this.phaseStrip.update(state);
+  }
+
+  setPhaseStripCallbacks(cb: PhaseStripCallbacks): void {
+    this.phaseStrip.setCallbacks(cb);
+  }
+  setPhaseDividerVisible(visible: boolean): void {
+    this.phaseStrip.setDividerVisible(visible);
+  }
+
+  protected setMobileHandOpen(open: boolean): void {
+    if (!this.presentation.setHandOpen(open)) return;
+    if (!open) this.hand?.resetHover();
+    this.syncHandPresentation();
+  }
+
+  protected setHandPeek(active: boolean): void {
+    if (this.handPeek === active) return;
+    this.handPeek = active;
+    this.syncHandPresentation();
+  }
+
+  setZoneTilesLocked(locked: boolean): void {
+    if (this.zoneTilesLocked === locked) return;
+    this.zoneTilesLocked = locked;
+    for (const { region } of this.regions.values()) region.setZoneTilesLocked(locked);
+  }
+
+  getLocalCapsuleBounds(): ScreenBounds | null {
+    return this.localPlayerId ? this.playerBars.getCapsuleBounds(this.localPlayerId) : null;
+  }
+
+  setStackAnchorProvider(provider: StackAnchorProvider | null): void {
+    this.stackProvider = provider;
+  }
+
+  setOverlayInvalidation(invalidate: (() => void) | null): void {
+    this.overlayInvalidation = invalidate;
+  }
+
+  setOverlayHitTest(hitTest: ((x: number, y: number) => boolean) | null): void {
+    this.overlayHitTest = hitTest;
+  }
+
+  suppressPointerTap(pointerId: number): void {
+    this.tapSuppressedPointers.add(pointerId);
+  }
+
+  protected setMobileHandControlBlocker(blocker: BlockingRect | null): void {
+    const pad = GAP / 2;
+    const next = blocker
+      ? {
+          x: blocker.x - pad,
+          y: blocker.y - pad,
+          width: blocker.width + pad * 2,
+          height: blocker.height + pad * 2,
+        }
+      : null;
+    if (!this.presentation.setHandControlBlocker(next)) return;
+    const local = this.localRegion();
+    const state = local?.getLastState();
+    if (local && state) local.updateBattlefield(state);
+  }
+  setDropActive(active: boolean): void {
+    this.dropActive = active;
+    this.localRegion()?.setDropActive(active);
+  }
+
+  commitPendingDrop(cardId: string, clientX: number, clientY: number): boolean {
+    const region = this.localRegion();
+    if (!region) return false;
+    const canvasRect = this.canvasRect();
+    region.drawDropGrid(clientX - canvasRect.left, clientY - canvasRect.top);
+    return region.commitPendingDrop(cardId);
+  }
+
+  clearPendingDrop(cardId: string): void {
+    this.localRegion()?.clearPendingDrop(cardId);
+  }
+
+  setAutoSort(value: boolean): void {
+    this.autoSort = value;
+    for (const rec of this.regions.values()) rec.region.setAutoSort(value);
+  }
+
+  previewEtb(): void {
+    for (const rec of this.regions.values()) rec.region.previewEtb();
+  }
+
+  setCardStyle(style: BattlefieldCardStyle): void {
+    if (this.destroyed) return;
+    setCardSpriteStyle(style);
+    for (const rec of this.regions.values()) rec.region.restyleCards();
+  }
+
+  setHoverDebug(on: boolean): void {
+    if (this.destroyed) return;
+    setCardSpriteHoverDebug(on);
+    for (const rec of this.regions.values()) rec.region.redrawHoverDebug();
+    this.hand?.setHoverDebug(on);
+  }
+  setPlayerPanelBoundsDebug(on: boolean): void {
+    if (this.destroyed) return;
+    this.playerBars.setBoundsDebug(on);
+  }
+
+  setGridSkeletonDebug(on: boolean): void {
+    if (this.destroyed) return;
+    this.gridSkeletonDebug = on;
+    for (const rec of this.regions.values()) rec.region.setSkeletonDebug(on);
+  }
+
+  setAttackRowDebug(on: boolean): void {
+    if (this.destroyed) return;
+    this.attackRowDebug = on;
+    for (const rec of this.regions.values()) rec.region.setAttackRowDebug(on);
+  }
+
+  setTheme(theme: Theme): void {
+    if (this.destroyed) return;
+    this.theme = theme;
+    this.dividers.setTheme(theme);
+    setCardSpriteTheme(theme);
+    this.hand?.restyle();
+    this.phaseStrip.setTheme(theme);
+    this.playerBars.setTheme(theme);
+    for (const rec of this.regions.values()) rec.region.redrawTheme();
+    this.applyDelimiters(); // repaint the collapse veil in the new theme colour
+    if (this.promptReference) this.setPromptReference(this.promptReference);
+    this.syncHandPresentation();
+    this.selection?.refresh();
+    this.overlay?.refreshAll();
+  }
+
+  private canvasRect(): DOMRect {
+    const frame = this.domRectTick;
+    if (this.canvasDomRectFrame !== frame || !this.canvasDomRect) {
+      this.canvasDomRect = this.app.canvas.getBoundingClientRect();
+      this.canvasDomRectFrame = frame;
+    }
+    return this.canvasDomRect;
+  }
+
+  resize(width: number, height: number): void {
+    if (this.destroyed) return;
+    this.app.renderer.resize(width, height);
+    this.dragHandler.setContainerSize(width, height);
+    this.canvasW = width;
+    this.canvasH = height;
+    this.playerBars.setViewport(width, height);
+    this.pinchPointers.clear();
+    this.resetBoardZoom();
+    this.syncHandPresentation();
+  }
+
+  setPromptReference(target: TargetRef | null): void {
+    this.promptReference = target;
+    const color =
+      target?.intent != null && intentIsHostile(target.intent)
+        ? this.theme.gameTheme.targeting.hostile
+        : this.theme.gameTheme.targeting.friendly;
+    const cardId = target?.kind === "card" ? target.id : null;
+    for (const rec of this.regions.values()) {
+      rec.region.setPromptReference(cardId, target ? hexToNum(color) : null);
+    }
+    this.playerBars.setPromptReference(
+      target?.kind === "player" ? target.id : null,
+      target ? color : null,
+    );
+  }
+
+  getPromptReferenceAnchor(target: TargetRef): ScreenPos | null {
+    if (target.kind === "player") return this.playerBars.getPlayerAnchor(target.id);
+    if (target.kind !== "card") return null;
+    for (const rec of this.regions.values()) {
+      const position = rec.region.getCardPosition(target.id);
+      if (position) return position;
+    }
+    return null;
+  }
+
+  private makeRegionHost(playerId: string, isLocal: boolean): RegionHost {
+    return {
+      getTheme: () => this.theme,
+      collectBlockers: () => [
+        ...(isLocal ? this.localBlockers() : []),
+        ...this.gridCapsuleBlockers(playerId, isLocal),
+      ],
+      getEntrySeed: (cardId) => this.entrySeedFor(playerId, isLocal, cardId),
+      getCombatGuestLayer: () => this.combatGuestLayer,
+      recordCardExit: (cardId, seed) => this.lastCardPositions.set(cardId, seed),
+      isSelected: (cardId) => (isLocal ? (this.selection?.has(cardId) ?? false) : false),
+      getDragTilt: (cardId) => (isLocal ? this.dragHandler.getDragTilt(cardId) : null),
+      rebuildOverlay: (entry, state) => {
+        if (isLocal) this.overlay?.rebuild(entry, state);
+      },
+      wireSprite: (sprite) => this.wireSprite(sprite, playerId, isLocal),
+      screenXToLocalX: (screenX) => screenX - this.canvasRect().left,
+      getHandReserveBottom: () =>
+        !isLocal ? 0 : this.presentation.localHandReserve(this.handReserveBottom()),
+      spawnFloatingText: (x, y, content, color) => this.spawnFloatingText(x, y, content, color),
+      previewCard: (card, bounds) => {
+        if (!card) {
+          this.callbacks.onHoverCard?.(null);
+          return;
+        }
+        this.callbacks.onHoverCard?.(card, bounds && this.toViewportBounds(bounds), {
+          useAnchor: true,
+        });
+      },
+      previewCards: (cards, bounds) => {
+        if (cards?.length) {
+          this.cancelHoverClear();
+          this.hoveredRegionRef?.setHoveredCard(null);
+          this.hoveredRegionRef = null;
+          this.hoveredCardId = null;
+          if (this.hand?.hasActiveHover()) this.hand.resetHover();
+        }
+        this.callbacks.onHoverZoneCards?.(
+          cards,
+          bounds ? this.toViewportBounds(bounds) : undefined,
+        );
+      },
+      isPointerTapSuppressed: (pointerId) => this.tapSuppressedPointers.has(pointerId),
+      isDestroyed: () => this.destroyed,
+    };
+  }
+
+  spawnFloatingText(canvasX: number, canvasY: number, content: string, color: number): void {
+    if (this.destroyed) return;
+    const text = new Text({
+      text: content,
+      style: {
+        fontFamily: UI_FONT_FAMILY,
+        fontSize: FLOATER_FONT_SIZE,
+        fontWeight: "900",
+        fill: color,
+        stroke: { color: hexToNum(this.theme.gameTheme.canvas.shadow), width: 4 },
+      },
+    });
+    text.anchor.set(0.5);
+    text.position.set(canvasX, canvasY);
+    this.floaterLayer.addChild(text);
+    this.floaters.push({ text, age: 0 });
+  }
+
+  private animateFloaters(frameRatio: number): void {
+    if (this.floaters.length === 0) return;
+    const survivors: { text: Text; age: number }[] = [];
+    for (const f of this.floaters) {
+      f.age += frameRatio;
+      f.text.y -= FLOATER_RISE_PER_FRAME * frameRatio;
+      const t = f.age / FLOATER_LIFETIME_FRAMES;
+      f.text.alpha = t < 0.5 ? 1 : Math.max(0, 1 - (t - 0.5) / 0.5);
+      if (f.age >= FLOATER_LIFETIME_FRAMES) {
+        this.floaterLayer.removeChild(f.text);
+        f.text.destroy();
+      } else {
+        survivors.push(f);
+      }
+    }
+    this.floaters = survivors;
+  }
+
+  private handReserveBottom(): number {
+    return this.presentation.handReserveBottom(this.hand, this.localZone());
+  }
+
+  private handReserveCb: ((px: number) => void) | null = null;
+  private lastEmittedHandReserve = -1;
+  setOnHandReserveChange(cb: ((px: number) => void) | null): void {
+    this.handReserveCb = cb;
+  }
+
+  private localBlockers(): BlockingRect[] {
+    return this.presentation.localBlockers(this.hand, this.localZone(), this.root);
+  }
+
+  private capsuleBlockers(playerId: string): BlockingRect[] {
+    const b = this.playerBars.getCapsuleBounds(playerId);
+    return b ? [b] : [];
+  }
+
+  private gridCapsuleBlockers(playerId: string, isLocal: boolean): BlockingRect[] {
+    if (isLocal || this.overview) return this.capsuleBlockers(playerId);
+    const record = this.regions.get(playerId);
+    const index = this.opponentIds.indexOf(playerId);
+    if (!this.barsEnabled || !record || index < 0 || this.boardWidth <= 0) return [];
+    const collapsedWidth = collapsedOpponentWidth(this.boardWidth, this.opponentIds.length);
+    const right = this.boardWidth - (this.opponentIds.length - index - 1) * collapsedWidth;
+    const x = record.zone.x;
+    const maxWidth = this.presentation.hudMaxWidth;
+    const width = Math.min(maxWidth, Math.max(1, right - x));
+    const preferredHeight = this.presentation.opponentHudHeight;
+    const height = Math.min(preferredHeight, Math.max(1, record.zone.height));
+    const tl = this.root.toGlobal(RECT_SCRATCH_A.set(x, record.zone.y), RECT_SCRATCH_A);
+    const br = this.root.toGlobal(
+      RECT_SCRATCH_B.set(x + width, record.zone.y + height),
+      RECT_SCRATCH_B,
+    );
+    return [{ x: tl.x, y: tl.y, width: br.x - tl.x, height: br.y - tl.y }];
+  }
+
+  private entrySeedFor(
+    playerId: string,
+    isLocal: boolean,
+    cardId: string,
+  ): { x: number; y: number; scaleX: number; scaleY: number; glide?: boolean } {
+    if (isLocal && this.hand) {
+      const live = this.hand.getLiveSpriteTransform(cardId);
+      if (live) {
+        const point = this.root.toGlobal(live);
+        return {
+          x: point.x,
+          y: point.y,
+          scaleX: live.scaleX * this.root.scale.x,
+          scaleY: live.scaleY * this.root.scale.y,
+        };
+      }
+    }
+    const remembered = this.lastCardPositions.get(cardId);
+    if (remembered) return { ...remembered, glide: true };
+    const stack = this.stackCardSeeds.get(cardId);
+    if (stack) return { x: stack.x, y: stack.y, scaleX: stack.scale, scaleY: stack.scale };
+    if (isLocal && this.hand) {
+      const origin = this.hand.getOriginSeed();
+      const point = this.root.toGlobal(origin);
+      return {
+        x: point.x,
+        y: point.y,
+        scaleX: origin.scale * this.root.scale.x,
+        scaleY: origin.scale * this.root.scale.y,
+      };
+    }
+    const zone = this.regions.get(playerId)?.zone;
+    const scale = this.cardScale;
+    if (!zone) return { x: 0, y: 0, scaleX: scale, scaleY: scale };
+    const point = this.root.toGlobal({
+      x: zone.x + zone.width / 2,
+      y: zone.y + (this.presentation.cardHeight * scale) / 2,
+    });
+    return {
+      x: point.x,
+      y: point.y,
+      scaleX: scale * this.root.scale.x,
+      scaleY: scale * this.root.scale.y,
+    };
+  }
+
+  private makeHandHost(): HandHost {
+    return {
+      getPlayZone: () => {
+        const zone = this.localZone();
+        if (!zone) return { x: 0, y: 0, width: 0, height: 0 };
+        const hudField =
+          this.barsEnabled && this.localPlayerId
+            ? (this.regions.get(this.localPlayerId)?.region.getPlaymatRect() ?? null)
+            : null;
+        const actionPanelLeft =
+          this.actionPanelLeft === null
+            ? null
+            : this.root.toLocal(
+                RECT_SCRATCH_A.set(this.actionPanelLeft, 0),
+                undefined,
+                RECT_SCRATCH_A,
+              ).x;
+        const { left, right } = this.presentation.handInsets(zone, hudField, actionPanelLeft);
+        if (left <= 0 && right <= 0) return zone;
+        return {
+          x: zone.x + left,
+          y: zone.y,
+          width: Math.max(0, zone.width - left - right),
+          height: zone.height,
+        };
+      },
+      getCallbacks: () => this.callbacks,
+      getTheme: () => this.theme,
+      isMirrored: () => false,
+      showsHand: () => true,
+      isDestroyed: () => this.destroyed,
+      setHandExclusion: (rect) => {
+        this.presentation.setHandExclusion(this.dragHandler, rect, this.handPeek);
+        this.localRegion()?.redrawBackground();
+      },
+    };
+  }
+
+  private makeSelectionHost(region: BoardRegion): SelectionHost {
+    return {
+      getPlayZone: () => this.localZone() ?? { x: 0, y: 0, width: 0, height: 0 },
+      getTheme: () => this.theme,
+      getEntries: () => region.getEntries(),
+      applyRing: (sprite) => region.applyBaseRing(sprite),
+      canRefreshRings: () => region.hasLastState(),
+      getBadgeX: (badgeWidth) =>
+        this.presentation.selectionBadgeX(
+          this.localZone() ?? { x: 0, y: 0, width: 0, height: 0 },
+          badgeWidth,
+        ),
+    };
+  }
+
+  private makeOverlayHost(region: BoardRegion): OverlayHost {
+    return {
+      getTheme: () => this.theme,
+      getCallbacks: () => this.callbacks,
+      getContainer: () => region.container,
+      getSelectedCardIds: () => this.selection?.getSelected() ?? new Set<string>(),
+      getLastState: () => region.getLastState(),
+      getEntries: () => region.getEntries(),
+      consumeCardTap: (id) =>
+        this.dragHandler.justDraggedCardIds.has(id) || this.longPress.consumeTap(id),
+      startCardPress: (sprite, e) => this.beginBattlefieldCardPress(region, sprite, e),
+      cancelHoverClear: () => this.cancelHoverClear(),
+      setCardHovered: (sprite, force = false, trigger) =>
+        this.setBattlefieldCardHovered(region, sprite, force, trigger),
+      rightClickCard: (sprite) => this.fireRightClickPreview(sprite),
+      scheduleHoverClear: (id) => this.scheduleHoverClear(id),
+      getCardScale: () => region.getCardScale(),
+      getCardHeight: () => this.presentation.cardHeight,
+      usesManaGrid: () => this.presentation.overlayUsesManaGrid(),
+    };
+  }
+
+  private wireSprite(sprite: CardSprite, playerId: string, isLocal: boolean): void {
+    sprite.eventMode = "static";
+    sprite.cursor = "pointer";
+    const region = this.regions.get(playerId)?.region;
+    // A guest attacker sitting in the local player's combat row (an opponent's
+    // creature, controllerId ≠ us) must keep the attacker wiring — tap/drop to
+    // block — not the local drag wiring, or it can't be blocked.
+    if (isLocal && sprite.card.controllerId === playerId) {
+      sprite.on("pointerdown", (e: FederatedPointerEvent) => {
+        e.stopPropagation();
+        if (e.button !== 0 || !region) return;
+        this.beginBattlefieldCardPress(region, sprite, e);
+      });
+      sprite.on("pointertap", (e: FederatedPointerEvent) => {
+        if (e.button !== 0) return;
+        if (this.dragHandler.justDraggedCardIds.has(sprite.card.id)) return;
+        if (this.longPress.consumeTap(sprite.card.id)) return;
+        const state = region?.getLastState();
+        if (state?.selectableCardIds?.includes(sprite.card.id)) {
+          this.callbacks.onClickCard?.(sprite.card);
+          return;
+        }
+        this.restoreCardPressSelection(sprite.card.id, e.pointerId);
+        this.fireTapPreview(sprite);
+      });
+    } else {
+      sprite.on("pointerdown", (e: FederatedPointerEvent) => {
+        if (e.button !== 0) return;
+        if (region) {
+          this.longPress.start(e, sprite.card.id, () => this.fireLongPressPreview(region, sprite));
+        }
+        // Grab our own declared attacker (staged in this opponent's band) to
+        // drag it back and un-declare it.
+        if (this.declareAttackers && sprite.card.controllerId === this.localPlayerId && region) {
+          e.stopPropagation();
+          this.callbacks.onDismissHoverPreview?.();
+          this.unassignDrag = { cardId: sprite.card.id, region, overOwn: false };
+          this.activeGesturePointerId = e.pointerId;
+        }
+      });
+      sprite.on("pointertap", (e: FederatedPointerEvent) => {
+        if (e.button !== 0) return;
+        if (this.longPress.consumeTap(sprite.card.id)) return;
+        const state = region?.getLastState() ?? null;
+        if (isAttackerTap(state, sprite.card.id)) {
+          this.callbacks.onAttackerClick?.(sprite.card);
+        } else if (state?.selectableCardIds?.includes(sprite.card.id)) {
+          this.callbacks.onClickCard?.(sprite.card);
+        } else {
+          this.fireTapPreview(sprite);
+        }
+      });
+      sprite.on("pointerup", () => {
+        if (
+          this.blockDragBlockerId &&
+          isAttackerTap(region?.getLastState() ?? null, sprite.card.id)
+        ) {
+          this.callbacks.onAssignBlock?.(this.blockDragBlockerId, sprite.card.id);
+          this.setBlockDragId(null);
+        }
+      });
+    }
+    sprite.on("pointerenter", (e: FederatedPointerEvent) => {
+      if (e.pointerType !== "touch" && region) {
+        this.setBattlefieldCardHovered(region, sprite, false, e);
+      }
+    });
+    sprite.on("pointermove", (e: FederatedPointerEvent) => {
+      if (e.pointerType !== "touch" && region) {
+        this.setBattlefieldCardHovered(region, sprite, true, e);
+      }
+    });
+    sprite.on("pointerleave", () => this.scheduleHoverClear(sprite.card.id));
+    sprite.on("rightclick", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      this.fireRightClickPreview(sprite);
+    });
+    // A sprite removed while hovered never fires pointerleave, which would
+    // leave the hover preview up until an unrelated dismiss.
+    sprite.on("destroyed", () => this.scheduleHoverClear(sprite.card.id));
+  }
+
+  private toViewportBounds(bounds: { x: number; y: number; width: number; height: number }): {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } {
+    const canvasRect = this.canvasRect();
+    return {
+      x: bounds.x + canvasRect.left,
+      y: bounds.y + canvasRect.top,
+      width: bounds.width,
+      height: bounds.height,
+    };
+  }
+
+  private fireRightClickPreview(sprite: CardSprite): void {
+    this.callbacks.onRightClickCard?.(sprite.card, this.toViewportBounds(sprite.getBounds()));
+  }
+  private fireTapPreview(sprite: CardSprite): void {
+    this.callbacks.onClickAnyCard?.(sprite.card, this.toViewportBounds(sprite.getBounds()));
+  }
+
+  private restoreCardPressSelection(cardId: string, pointerId: number): void {
+    const press = this.cardPressSelection;
+    if (!press || press.cardId !== cardId || press.pointerId !== pointerId) return;
+    this.cardPressSelection = null;
+    if (!this.selection) return;
+    this.selection.setSelected(new Set(press.selected));
+    this.selection.refresh();
+  }
+
+  private fireLongPressPreview(
+    region: BoardRegion,
+    sprite: CardSprite,
+    selectionBeforePress: ReadonlySet<string> | null = null,
+  ): void {
+    haptic("select");
+    if (this.dragHandler.isDragging) {
+      const state = region.getLastState();
+      if (state) region.updateBattlefield(state);
+    }
+    this.dragHandler.cancel();
+    this.attackDragCandidate = null;
+    if (this.blockDragBlockerId) this.setBlockDragId(null);
+    if (this.unassignDrag) {
+      const ud = this.unassignDrag;
+      this.unassignDrag = null;
+      const state = ud.region.getLastState();
+      if (state) ud.region.updateBattlefield(state);
+    }
+    if (selectionBeforePress && this.selection) {
+      this.selection.setSelected(new Set(selectionBeforePress));
+      this.selection.refresh();
+    }
+    if (this.callbacks.onLongPressCard) {
+      this.callbacks.onLongPressCard(sprite.card, this.toViewportBounds(sprite.getBounds()));
+      return;
+    }
+    this.setBattlefieldCardHovered(region, sprite, true);
+  }
+
+  private setBattlefieldCardHovered(
+    region: BoardRegion,
+    sprite: CardSprite,
+    force = false,
+    trigger?: PreviewPointerInput,
+  ): void {
+    if (this.hand?.hasActiveHover()) return;
+    this.cancelHoverClear();
+    if (!force && this.hoveredCardId === sprite.card.id) return;
+    const prevRegion = this.hoveredRegionRef;
+    if (prevRegion && prevRegion !== region) prevRegion.setHoveredCard(null);
+    this.hoveredRegionRef = region;
+    this.hoveredCardId = sprite.card.id;
+    region.setHoveredCard(sprite.card.id);
+    this.syncHoveredCombatTarget(region, sprite.card.id);
+
+    this.callbacks.onHoverCard?.(sprite.card, this.toViewportBounds(sprite.getBounds()), {
+      useAnchor: true,
+      trigger,
+    });
+  }
+
+  private scheduleHoverClear(cardId: string): void {
+    if (this.hoveredCardId !== cardId) return;
+    this.cancelHoverClear();
+    this.hoverClearTimer = window.setTimeout(() => {
+      this.hoverClearTimer = null;
+      if (this.destroyed) return;
+      if (this.hoveredCardId !== cardId) return;
+      this.hoveredRegionRef?.setHoveredCard(null);
+      this.hoveredRegionRef = null;
+      this.hoveredCardId = null;
+      this.syncHoveredCombatTarget(null, null);
+      this.callbacks.onHoverCard?.(null);
+    }, PREVIEW_TIMING.battlefieldHoverOutHoldMs);
+  }
+
+  private cancelHoverClear(): void {
+    if (this.hoverClearTimer !== null) {
+      window.clearTimeout(this.hoverClearTimer);
+      this.hoverClearTimer = null;
+    }
+  }
+
+  private beginBattlefieldCardPress(
+    region: BoardRegion,
+    sprite: CardSprite,
+    e: FederatedPointerEvent,
+  ): void {
+    if (this.destroyed || this.pinchStart) return;
+    const selectionBeforePress = new Set(this.selection?.getSelected() ?? []);
+    this.cardPressSelection = {
+      pointerId: e.pointerId,
+      cardId: sprite.card.id,
+      selected: selectionBeforePress,
+      restoreOnRelease: !(
+        region.getLastState()?.selectableCardIds?.includes(sprite.card.id) ?? false
+      ),
+    };
+    this.longPress.start(e, sprite.card.id, () => {
+      this.cardPressSelection = null;
+      this.fireLongPressPreview(region, sprite, selectionBeforePress);
+    });
+    this.onBattlefieldCardDown(sprite, e);
+  }
+
+  private syncHoveredCombatTarget(region: BoardRegion | null, cardId: string | null): void {
+    const target = region && cardId ? region.getCombatTarget(cardId) : null;
+    this.hoveredCombatArrow = target
+      ? {
+          from: { kind: "card", id: target.attackerId },
+          to:
+            target.targetKind === "card"
+              ? { kind: "card", id: target.targetId }
+              : { kind: "player", id: target.targetId },
+          type: "attack",
+        }
+      : null;
+    if (!this.attackDragAttackerId) {
+      const targetCardId = target?.targetKind === "card" ? target.targetId : null;
+      this.updateAttackTargetRing(targetCardId, targetCardId !== null);
+    }
+    this.overlayInvalidation?.();
+  }
+
+  private onBattlefieldCardDown(sprite: CardSprite, e: FederatedPointerEvent): void {
+    this.collapseStackPeeks();
+    if (this.destroyed) return;
+    if (this.pinchStart) return;
+    const local = this.localRegion();
+    const selection = this.selection;
+    if (!local || !selection) return;
+    if (this.declareBlockers && local.getLastState()?.selectableCardIds?.includes(sprite.card.id)) {
+      this.setBlockDragId(sprite.card.id);
+      this.activeGesturePointerId = e.pointerId;
+      this.syncHoveredCombatTarget(null, null);
+      this.callbacks.onHoverCard?.(null);
+      this.callbacks.onDismissHoverPreview?.();
+      return;
+    }
+    this.callbacks.onHoverCard?.(null);
+    this.syncHoveredCombatTarget(null, null);
+    const pos = this.root.toLocal(e.global);
+    selection.setSelected(
+      this.dragHandler.start(
+        sprite.card.id,
+        pos.x,
+        pos.y,
+        selection.getSelected(),
+        local.snapshotCurrentPositions(),
+        e.shiftKey,
+        e.pointerType === "touch" ? TOUCH_MOVE_SLOP_PX : undefined,
+      ),
+    );
+    this.activeGesturePointerId = e.pointerId;
+    selection.refresh();
+    this.attackDragCandidate =
+      this.declareAttackers && this.attackerOptions.some((a) => a.attackerId === sprite.card.id)
+        ? sprite.card.id
+        : null;
+  }
+
+  private onGlobalMove(e: FederatedPointerEvent): void {
+    if (this.destroyed) return;
+    if (topModal()) {
+      if (this.hand?.hasActiveHover()) this.hand.resetHover();
+      this.updateHoveredOpponent(-1, -1);
+      return;
+    }
+    if (this.pinchStart) return;
+    if (this.activeGesturePointerId !== null && e.pointerId !== this.activeGesturePointerId) {
+      return;
+    }
+    this.longPress.move(e.global.x, e.global.y);
+    const pos = this.root.toLocal(e.global);
+    if (e.pointerType !== "touch") this.updateHoveredOpponent(e.global.x, e.global.y);
+    if (this.unassignDrag) {
+      const ud = this.unassignDrag;
+      const entry = ud.region.getEntries().get(ud.cardId);
+      if (entry) {
+        entry.targetX = pos.x;
+        entry.targetY = pos.y;
+        entry.sprite.x = pos.x;
+        entry.sprite.y = pos.y;
+      }
+      // Only the self field counts as "own" — exclude the phase-strip band above
+      // it, or releasing over the strip would silently un-declare the attacker.
+      ud.overOwn = pos.y >= (this.localZone()?.y ?? this.topHeight);
+      return;
+    }
+    const local = this.localRegion();
+    const selection = this.selection;
+    const hand = this.hand;
+    if (!local || !selection || !hand) return;
+
+    if (selection.isMarqueeActive()) {
+      selection.moveMarquee(pos.x, pos.y);
+      return;
+    }
+
+    const draggingFromHand = hand.isDraggingFromHand();
+    if (draggingFromHand) hand.updateReorderAt(pos.x, pos.y);
+    const dragging = this.dragHandler.hasDrag || draggingFromHand;
+    if (!dragging && e.pointerType !== "touch") {
+      hand.updateHoverAt(pos.x, pos.y, e);
+    } else if (hand.hasActiveHover()) {
+      hand.resetHover();
+    }
+
+    const newPositions = this.dragHandler.move(pos.x, pos.y);
+    if (!newPositions) return;
+    this.cardPressSelection = null;
+    this.callbacks.onDismissHoverPreview?.();
+    const primaryId = this.dragHandler.primaryDraggingCardId;
+    let primaryPos: ScreenPos | null = null;
+    const draggingIds = this.dragHandler.draggingCardIds;
+    const entries = local.getEntries();
+    for (const [id, p] of newPositions) {
+      const entry = entries.get(id);
+      if (!entry) continue;
+      entry.targetX = p.x;
+      entry.targetY = p.y;
+      if (id === primaryId || (!primaryPos && !primaryId)) primaryPos = p;
+      local.followAttachmentsDuringDrag(id, p);
+    }
+
+    if (this.attackDragCandidate && !this.attackDragAttackerId) {
+      this.setAttackDragId(this.attackDragCandidate);
+    }
+    if (this.attackDragAttackerId) {
+      this.attackDragTargetId = this.resolveAttackTargetAt(pos.x, pos.y, this.attackDragAttackerId);
+      this.updateAttackTargetRing(this.attackDragTargetId);
+      this.hoveredCell = null;
+      this.stackTargetId = null;
+      local.hideGridSkeleton();
+      this.invalidDropPoint = null;
+      return;
+    }
+
+    const grid = local.getGridInfo();
+    this.hoveredCell =
+      primaryPos && grid ? dropCellFromPoint(grid, primaryPos.x, primaryPos.y) : null;
+    this.stackTargetId = this.hoveredCell
+      ? local.findStackTargetAt(this.hoveredCell, draggingIds)
+      : null;
+    this.invalidDropPoint = primaryPos && !this.hoveredCell ? primaryPos : null;
+    local.drawGridSkeleton(
+      draggingIds,
+      this.hoveredCell,
+      this.stackTargetId,
+      this.invalidDropPoint,
+    );
+  }
+
+  private onGlobalUp(e?: FederatedPointerEvent): void {
+    if (this.destroyed) return;
+    if (this.pinchStart) return;
+    if (
+      this.activeGesturePointerId !== null &&
+      e !== undefined &&
+      e.pointerId !== this.activeGesturePointerId
+    ) {
+      return;
+    }
+    const releasedPointerId = e?.pointerId;
+    if (
+      releasedPointerId !== undefined &&
+      this.cardPressSelection?.pointerId === releasedPointerId
+    ) {
+      const press = this.cardPressSelection;
+      window.setTimeout(() => {
+        if (this.cardPressSelection !== press) return;
+        if (press.restoreOnRelease && this.selection) {
+          this.selection.setSelected(new Set(press.selected));
+          this.selection.refresh();
+        }
+        this.cardPressSelection = null;
+      }, 0);
+    }
+    this.activeGesturePointerId = null;
+    this.attackDragCandidate = null;
+    this.longPress.cancel();
+    this.longPress.releaseFired();
+    if (this.unassignDrag) {
+      const ud = this.unassignDrag;
+      this.unassignDrag = null;
+      if (ud.overOwn) {
+        haptic("confirm");
+        this.callbacks.onUnassignAttacker?.(ud.cardId);
+      } else {
+        const state = ud.region.getLastState();
+        if (state) ud.region.updateBattlefield(state);
+      }
+      return;
+    }
+    if (this.blockDragBlockerId) {
+      haptic("confirm");
+      this.callbacks.onUnassignBlock?.(this.blockDragBlockerId);
+      this.setBlockDragId(null);
+      return;
+    }
+    if (e && this.hand?.isDraggingFromHand()) {
+      const pos = this.root.toLocal(e.global);
+      this.hand.updateReorderAt(pos.x, pos.y);
+    }
+    const handReorder = this.hand?.finishReorder();
+    if (handReorder) {
+      this.callbacks.onReorderHand?.(handReorder.cardId, handReorder.toIndex);
+      return;
+    }
+    const local = this.localRegion();
+    const selection = this.selection;
+    if (!local || !selection) return;
+
+    if (this.attackDragAttackerId) {
+      const draggedIds = [...this.dragHandler.draggingCardIds];
+      const targetId = this.attackDragTargetId;
+      const result = this.dragHandler.end();
+      this.setAttackDragId(null);
+      local.hideGridSkeleton();
+      if (result?.wasDrag) {
+        let assigned = false;
+        for (const id of draggedIds) {
+          const opt = this.attackerOptions.find((a) => a.attackerId === id);
+          if (!opt) continue;
+          if (targetId && opt.validTargetIds.includes(targetId)) {
+            assigned = true;
+            this.callbacks.onAssignAttacker?.(id, targetId);
+          } else {
+            this.callbacks.onUnassignAttacker?.(id);
+          }
+        }
+        if (assigned) haptic("confirm");
+      }
+      const state = local.getLastState();
+      if (state) local.updateBattlefield(state);
+      return;
+    }
+
+    if (selection.isMarqueeActive()) {
+      selection.endMarquee(local.snapshotCurrentPositions());
+      return;
+    }
+
+    const draggedIds = [...this.dragHandler.draggingCardIds];
+    const primaryId = this.dragHandler.primaryDraggingCardId;
+    const result = this.dragHandler.end();
+    const stackTargetId = this.stackTargetId;
+    const hoveredCell = this.hoveredCell;
+    this.stackTargetId = null;
+    this.hoveredCell = null;
+    this.invalidDropPoint = null;
+    local.hideGridSkeleton();
+
+    if (!result?.wasDrag) return;
+    if (stackTargetId && draggedIds.length > 0) {
+      local.commitStackDrop(draggedIds, stackTargetId);
+    } else if (hoveredCell) {
+      local.commitCellDrop(draggedIds, hoveredCell, primaryId);
+    }
+    haptic(stackTargetId || hoveredCell ? "confirm" : "warn");
+    const state = local.getLastState();
+    if (state) local.updateBattlefield(state);
+  }
+
+  private tick = (): void => {
+    if (this.destroyed) return;
+    this.syncDelimiterFogAnimation();
+    const frameRatio = setFrameRatio(this.app.ticker.deltaMS);
+    if (import.meta.env.DEV) this.samplePerf();
+    const delimitersWereSettling = this.delimitersSettling();
+    this.easeDelimiters();
+    if (delimitersWereSettling && this.arrowSpecs.length > 0) this.overlayInvalidation?.();
+    for (const rec of this.regions.values()) rec.region.animate(this.app.ticker.deltaMS);
+    this.dragHandler.dampenTilt(this.app.ticker.deltaMS);
+    this.hand?.animate();
+    for (const fan of this.opponentHands.values()) fan.animate();
+    this.playerBars.tick();
+    this.phaseStrip.tick();
+    this.phaseStrip.setDimAlpha(
+      lerp(this.phaseStrip.getDimAlpha(), this.phaseStripAlphaTarget, 0.2, 0.01),
+    );
+    this.animateFloaters(frameRatio);
+    this.domRectTick++;
+    this.captureStackSeeds();
+    const handReserve = this.handReserveBottom();
+    if (this.handReserveCb && handReserve !== this.lastEmittedHandReserve) {
+      this.lastEmittedHandReserve = handReserve;
+      this.handReserveCb(handReserve);
+    }
+    if (this.dropActive) {
+      const local = this.localRegion();
+      if (this.hand?.isDraggingPermanent()) {
+        const canvasRect = this.canvasRect();
+        local?.drawDropGrid(
+          this.cursorViewportX - canvasRect.left,
+          this.cursorViewportY - canvasRect.top,
+        );
+      } else {
+        local?.drawDropField();
+      }
+    }
+  };
+
+  private samplePerf(): void {
+    const ticker = this.app.ticker;
+    this.perfFrames += 1;
+    this.perfTotalDelta += ticker.deltaMS;
+    if (ticker.deltaMS < 250) {
+      this.perfSessionFrames += 1;
+      this.perfSessionDelta += ticker.deltaMS;
+      if (ticker.deltaMS > 1000 / 45) this.perfJankFrames += 1;
+    }
+    const fps = ticker.FPS;
+    if (fps < this.perfMinFps) this.perfMinFps = fps;
+    if (fps > this.perfMaxFps) this.perfMaxFps = fps;
+    const now = performance.now();
+    if (this.perfLastFlush === 0) this.perfLastFlush = now;
+    if (now - this.perfLastFlush < FPS_SAMPLE_INTERVAL_MS) return;
+    useGameDevStore.getState().setPixiPerfStats({
+      fps: this.perfFrames / ((now - this.perfLastFlush) / 1000),
+      minFps: this.perfMinFps === Infinity ? 0 : this.perfMinFps,
+      maxFps: this.perfMaxFps,
+      deltaMs: this.perfTotalDelta / Math.max(1, this.perfFrames),
+      sessionFps: this.perfSessionFrames / Math.max(0.001, this.perfSessionDelta / 1000),
+      sessionMinutes: (now - this.perfSessionStarted) / 60_000,
+      jankPercent: (this.perfJankFrames / Math.max(1, this.perfSessionFrames)) * 100,
+    });
+    this.perfFrames = 0;
+    this.perfTotalDelta = 0;
+    this.perfMinFps = Infinity;
+    this.perfMaxFps = 0;
+    this.perfLastFlush = now;
+  }
+
+  private captureStackSeeds(): void {
+    const now = performance.now();
+    for (const seed of this.stackProvider?.getSeeds() ?? []) {
+      this.stackCardSeeds.set(seed.cardId, { x: seed.x, y: seed.y, scale: seed.scale, ts: now });
+    }
+    // Seeds for cards that just left the stack persist until their TTL so a
+    // resolving spell still has a position to fly from.
+    for (const [id, seed] of this.stackCardSeeds) {
+      if (now - seed.ts > STACK_SEED_TTL_MS) this.stackCardSeeds.delete(id);
+    }
+  }
+
+  getArrowDefs(): ArrowDef[] {
+    if (this.destroyed) return [];
+    const castDragging = this.hand?.isDraggingPermanent() ?? false;
+    const interacting =
+      !!this.castingArrow ||
+      castDragging ||
+      !!this.blockDragBlockerId ||
+      !!this.attackDragAttackerId ||
+      !!this.hoveredCombatArrow;
+    // Suppress the (card-anchored) combat arrows while the accordion eases so they
+    // don't lag their moving targets — but keep live drag/casting arrows, or the
+    // player loses targeting feedback exactly when combat opens the fields.
+    if (this.delimitersSettling() && !interacting) return [];
+    if (this.arrowSpecs.length === 0 && !interacting) return [];
+    const canvasRect = this.canvasRect();
+    const resolved: ArrowDef[] = [];
+    const attackTargetCounts = new Map<string, number>();
+    const specCount = this.arrowSpecs.length + (this.hoveredCombatArrow ? 1 : 0);
+    for (let index = 0; index < specCount; index++) {
+      const s = index < this.arrowSpecs.length ? this.arrowSpecs[index]! : this.hoveredCombatArrow!;
+      if (s.type === "attack" && s.to.kind === "player") {
+        attackTargetCounts.set(s.to.id, (attackTargetCounts.get(s.to.id) ?? 0) + 1);
+      }
+    }
+    const attackTargetSeen = new Map<string, number>();
+    for (let index = 0; index < specCount; index++) {
+      const spec =
+        index < this.arrowSpecs.length ? this.arrowSpecs[index]! : this.hoveredCombatArrow!;
+      let from = this.resolveArrowEndpoint(spec.from, canvasRect);
+      const to = this.resolveTargetEndpoint(spec.to, canvasRect);
+      if (!from || !to) continue;
+      if (spec.from.kind === "stack") {
+        from = this.stackProvider?.getAnchor(spec.from.id, to.pos) ?? from;
+      }
+      if (spec.type === "attack" && spec.to.kind === "player") {
+        const total = attackTargetCounts.get(spec.to.id) ?? 1;
+        if (total > 1) {
+          const idx = attackTargetSeen.get(spec.to.id) ?? 0;
+          attackTargetSeen.set(spec.to.id, idx + 1);
+          to.pos.x += (idx - (total - 1) / 2) * ATTACK_ARROW_LANE_PX;
+        }
+      }
+      const targeting = this.theme.gameTheme.targeting;
+      const color =
+        spec.type === "attack"
+          ? hexToNum(targeting.hostile)
+          : spec.type === "block"
+            ? hexToNum(targeting.friendly)
+            : spec.hostile == null
+              ? undefined
+              : hexToNum(spec.hostile ? targeting.hostile : targeting.friendly);
+      // Placement arrows landing in a visible field also outline the target slot.
+      let slot: { width: number; height: number } | undefined;
+      if (spec.type === "placement" && spec.to.kind === "placement-ghost" && !to.hint) {
+        const region = spec.to.playerId
+          ? this.regions.get(spec.to.playerId)?.region
+          : this.localRegion();
+        const rect = region?.getPlacementGhostRect();
+        if (rect) slot = { width: rect.width, height: rect.height };
+      }
+      resolved.push({
+        fromX: from.x,
+        fromY: from.y,
+        toX: to.pos.x,
+        toY: to.pos.y,
+        type: spec.type,
+        color,
+        hint: to.hint,
+        slot,
+      });
+    }
+    if (this.castingArrow) {
+      // Resolve via the stack layer first — robust for casts from any zone
+      // (incl. the command zone, which has no sprite); fall back to the card
+      // resolver for battlefield ability sources.
+      const id = this.castingArrow.sourceCardId;
+      const target = {
+        x: this.cursorViewportX - canvasRect.left,
+        y: this.cursorViewportY - canvasRect.top,
+      };
+      const from =
+        this.stackProvider?.getCastingAnchor(id, target) ??
+        this.resolveArrowEndpoint({ kind: "card", id }, canvasRect);
+      if (from) {
+        const targeting = this.theme.gameTheme.targeting;
+        resolved.push({
+          fromX: from.x,
+          fromY: from.y,
+          toX: target.x,
+          toY: target.y,
+          type: "casting",
+          color: hexToNum(this.castingArrow.hostile ? targeting.hostile : targeting.friendly),
+        });
+      }
+    }
+    if (this.blockDragBlockerId) {
+      const from = this.resolveArrowEndpoint(
+        { kind: "card", id: this.blockDragBlockerId },
+        canvasRect,
+      );
+      if (from) {
+        resolved.push({
+          fromX: from.x,
+          fromY: from.y,
+          toX: this.cursorViewportX - canvasRect.left,
+          toY: this.cursorViewportY - canvasRect.top,
+          type: "block",
+        });
+      }
+    }
+    if (this.attackDragAttackerId) {
+      const from = this.resolveArrowEndpoint(
+        { kind: "card", id: this.attackDragAttackerId },
+        canvasRect,
+      );
+      if (from) {
+        let toX = this.cursorViewportX - canvasRect.left;
+        let toY = this.cursorViewportY - canvasRect.top;
+        if (this.attackDragTargetId) {
+          const tgt = this.attackTargets.find((t) => t.id === this.attackDragTargetId);
+          const to = this.resolveTargetEndpoint(
+            tgt?.kind === "player"
+              ? { kind: "player", id: this.attackDragTargetId }
+              : { kind: "card", id: this.attackDragTargetId },
+            canvasRect,
+          );
+          if (to) {
+            toX = to.pos.x;
+            toY = to.pos.y;
+          }
+        }
+        resolved.push({
+          fromX: from.x,
+          fromY: from.y,
+          toX,
+          toY,
+          type: "attack",
+          color: hexToNum(this.theme.gameTheme.targeting.hostile),
+        });
+      }
+    }
+    if (castDragging) {
+      const id = this.hand?.getDraggingCardId();
+      // A permanent dragged from a zone with no sprite (the command zone) falls
+      // back to its React element by card id.
+      const from = id
+        ? (this.hand?.getCardPosition(id) ??
+          this.domCenterCanvasLocal(`[data-card-id="${CSS.escape(id)}"]`, canvasRect))
+        : null;
+      if (from) {
+        resolved.push({
+          fromX: from.x,
+          fromY: from.y,
+          toX: this.cursorViewportX - canvasRect.left,
+          toY: this.cursorViewportY - canvasRect.top,
+          type: "placement",
+        });
+      }
+    }
+    return resolved;
+  }
+
+  private resolveTargetEndpoint(
+    ep: ArrowEndpoint,
+    canvasRect: DOMRect,
+  ): { pos: ScreenPos; hint: boolean } | null {
+    if (ep.kind === "card") {
+      for (const rec of this.regions.values()) {
+        const pos = rec.region.getCardPosition(ep.id);
+        if (!pos) continue;
+        if (rec.region.isCollapsed()) return { pos: rec.region.getBandCenter(), hint: true };
+        return { pos, hint: false };
+      }
+    } else if (ep.kind === "zone-tile" || (ep.kind === "placement-ghost" && ep.playerId)) {
+      const region = this.regions.get(ep.playerId!)?.region;
+      if (region?.isCollapsed()) return { pos: region.getBandCenter(), hint: true };
+    }
+    const pos = this.resolveArrowEndpoint(ep, canvasRect);
+    return pos ? { pos, hint: false } : null;
+  }
+
+  private resolveArrowEndpoint(ep: ArrowEndpoint, canvasRect: DOMRect): ScreenPos | null {
+    switch (ep.kind) {
+      case "card": {
+        for (const rec of this.regions.values()) {
+          const pos = rec.region.getCardPosition(ep.id);
+          if (pos) return pos;
+        }
+        const handPos = this.hand?.getCardPosition(ep.id);
+        if (handPos) return handPos;
+        return this.domCenterCanvasLocal(`[data-card-id="${CSS.escape(ep.id)}"]`, canvasRect);
+      }
+      case "player":
+        return (
+          this.playerBars.getPlayerAnchor(ep.id) ??
+          this.domCenterCanvasLocal(`[data-player-id="${CSS.escape(ep.id)}"]`, canvasRect)
+        );
+      case "stack":
+        return this.stackProvider?.getAnchor(ep.id) ?? null;
+      case "placement-ghost": {
+        const region = ep.playerId ? this.regions.get(ep.playerId)?.region : this.localRegion();
+        return region?.getPlacementGhostCenter() ?? null;
+      }
+      case "zone-tile":
+        return (
+          this.regions.get(ep.playerId)?.region.getZoneTileCenter(ep.key) ??
+          this.playerBars.getZoneAnchor(ep.playerId, ep.key) ??
+          this.playerBars.getPlayerAnchor(ep.playerId)
+        );
+    }
+  }
+
+  private domCenterCanvasLocal(selector: string, canvasRect: DOMRect): ScreenPos | null {
+    const els = document.querySelectorAll(selector);
+    for (const el of els) {
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) continue;
+      return {
+        x: r.left + r.width / 2 - canvasRect.left,
+        y: r.top + r.height / 2 - canvasRect.top,
+      };
+    }
+    return null;
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.overlayInvalidation = null;
+    this.dividers.destroy();
+    this.overlayHitTest = null;
+    if (import.meta.env.DEV) useGameDevStore.getState().setPixiPerfStats(null);
+    this.cancelHoverClear();
+    window.removeEventListener("pointermove", this.cursorListener);
+    window.removeEventListener("pointercancel", this.gestureCancelListener);
+    this.app.canvas.removeEventListener("pointerdown", this.stripOutsideListener);
+    this.app.canvas.removeEventListener("pointerdown", this.pinchDownListener);
+    window.removeEventListener("pointermove", this.pinchMoveListener);
+    window.removeEventListener("pointerup", this.pinchUpListener, { capture: true });
+    window.removeEventListener("pointercancel", this.pinchUpListener, { capture: true });
+    this.longPress.cancel();
+    this.app.canvas.removeEventListener("pointerleave", this.canvasLeaveListener);
+    this.app.stage.off("pointerleave", this.canvasLeaveListener);
+    this.app.ticker.remove(this.tick, this);
+    this.app.stage.off("pointerdown", this.onStageDown);
+    this.app.stage.off("pointermove", this.onStageMove);
+    this.app.stage.off("pointerup", this.onStageUp);
+    this.app.stage.off("pointerupoutside", this.onStageUp);
+    this.app.stage.off("pointertapcapture", this.onStageTapCapture);
+    try {
+      this.dragHandler.destroy();
+      this.phaseStrip.destroy();
+      this.playerBars.destroy();
+      this.hand?.destroy();
+      for (const fan of this.opponentHands.values()) fan.destroy();
+      this.selection?.destroy();
+      for (const rec of this.regions.values()) rec.region.destroy();
+      for (const f of this.floaters) f.text.destroy();
+      this.floaters = [];
+    } catch (err) {
+      console.warn("[pixi] BoardScene teardown threw:", err);
+    }
+    this.regions.clear();
+    this.opponentHands.clear();
+  }
+}

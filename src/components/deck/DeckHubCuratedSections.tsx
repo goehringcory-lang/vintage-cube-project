@@ -1,0 +1,173 @@
+import { useEffect, useState } from "react";
+import { Flame, Sparkles } from "lucide-react";
+import { DeckHubEntryCard } from "@/components/deck/DeckHubEntryCard";
+import { DeckHubTopDeckPreview } from "@/components/deck/DeckHubTopDeckPreview";
+import { fetchDeckHubEntries } from "@/api/hub";
+import type { DeckHubEntrySummary } from "@/api/hubTypes";
+import { availableEngines } from "@/lib/engines";
+import { useIsShortScreen, useIsTouch } from "@/hooks/useBreakpoints";
+import { cn } from "@/lib/utils";
+interface DeckHubCuratedSectionsProps {
+  onOpen: (id: string) => void;
+  onAuthor: (author: string) => void;
+}
+function SectionHeading({ title }: { title: string }) {
+  return <h2 className="mb-3 font-serif text-xl font-semibold">{title}</h2>;
+}
+export function DeckHubCuratedSections({ onOpen, onAuthor }: DeckHubCuratedSectionsProps) {
+  const [presets, setPresets] = useState<DeckHubEntrySummary[]>([]);
+  const [popular, setPopular] = useState<DeckHubEntrySummary[]>([]);
+  const [newest, setNewest] = useState<DeckHubEntrySummary[]>([]);
+  const shortScreen = useIsShortScreen();
+  const isTouch = useIsTouch();
+  const shortTouch = shortScreen && isTouch;
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    let active = true;
+    const engines = availableEngines();
+    void Promise.all([
+      fetchDeckHubEntries({ source: "presets", sort: "newest", engines, pageSize: 10 }),
+      fetchDeckHubEntries({ source: "all", sort: "favorites", engines, pageSize: 5 }),
+      fetchDeckHubEntries({ source: "all", sort: "newest", engines, pageSize: 6 }),
+    ])
+      .then(([presetResult, popularResult, newestResult]) => {
+        if (!active) return;
+        setPresets(presetResult.entries);
+        setPopular(popularResult.entries);
+        setNewest(newestResult.entries);
+        setLoaded(true);
+      })
+      .catch(() => {
+        if (active) setLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  if (shortTouch) return null;
+  if (isTouch) {
+    return (
+      <div className="pb-4">
+        <DeckHubTopDeckPreview onOpen={onOpen} onAuthor={onAuthor} />
+      </div>
+    );
+  }
+
+  if (!loaded) {
+    return (
+      <div className="space-y-10 pb-10">
+        <DeckHubTopDeckPreview onOpen={onOpen} onAuthor={onAuthor} />
+
+        <section className="rounded-2xl border border-border/70 bg-muted/20 p-3 sm:p-4">
+          <div className="mb-3 h-7 w-40 animate-pulse rounded bg-muted" />
+          <div className="@container grid grid-cols-[repeat(auto-fit,minmax(min(100%,16rem),1fr))] gap-3">
+            {Array.from({ length: 4 }, (_, index) => (
+              <div
+                key={index}
+                className={cn(
+                  "aspect-[4/3] animate-pulse rounded-lg bg-muted",
+                  index === 0 && "@min-[52rem]:col-span-2 @min-[52rem]:row-span-2",
+                )}
+              />
+            ))}
+          </div>
+        </section>
+
+        <section>
+          <div className="mb-3 h-7 w-32 animate-pulse rounded bg-muted" />
+          <div className="grid gap-3 xl:grid-cols-2">
+            {Array.from({ length: 4 }, (_, index) => (
+              <div key={index} className="aspect-[4/3] animate-pulse rounded-lg bg-muted" />
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-border/70 bg-primary/5 py-4">
+          <div className="mb-3 ml-4 h-7 w-36 animate-pulse rounded bg-muted" />
+          <div className="flex gap-3 overflow-hidden px-4 pb-1">
+            {Array.from({ length: 4 }, (_, index) => (
+              <div
+                key={index}
+                className="aspect-[4/3] w-64 shrink-0 animate-pulse rounded-lg bg-muted sm:w-72"
+              />
+            ))}
+          </div>
+        </section>
+      </div>
+    );
+  }
+  if (presets.length === 0 && popular.length === 0 && newest.length === 0) return null;
+  return (
+    <div className="space-y-10 pb-10">
+      <DeckHubTopDeckPreview onOpen={onOpen} onAuthor={onAuthor} />
+
+      {popular.length > 0 && (
+        <section className="rounded-2xl border border-border/70 bg-muted/20 p-3 sm:p-4">
+          <SectionHeading title={`Most favorited`} />
+          <div className="@container grid grid-cols-[repeat(auto-fit,minmax(min(100%,16rem),1fr))] gap-3">
+            {popular.map((entry, index) => (
+              <div
+                key={entry.id}
+                className={index === 0 ? "@min-[52rem]:col-span-2 @min-[52rem]:row-span-2" : ""}
+              >
+                <DeckHubEntryCard
+                  entry={entry}
+                  onOpen={() => onOpen(entry.id)}
+                  onAuthorClick={onAuthor}
+                />
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {newest.length > 0 && (
+        <section>
+          <SectionHeading title={`Fresh brews`} />
+          <div className="grid gap-3 xl:grid-cols-2">
+            {newest.map((entry) => (
+              <DeckHubEntryCard
+                key={entry.id}
+                entry={entry}
+                variant="list"
+                onOpen={() => onOpen(entry.id)}
+                onAuthorClick={onAuthor}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {presets.length > 0 && (
+        <section className="relative overflow-hidden rounded-2xl border border-border/70 bg-primary/5 py-4">
+          <Flame className="pointer-events-none absolute -right-5 -top-8 h-32 w-32 rotate-12 text-primary/5" />
+          <div className="px-4">
+            <SectionHeading title={`Pick up & play`} />
+          </div>
+          <div className="flex snap-x gap-3 overflow-x-auto px-4 pb-1 pr-8 no-scrollbar touch-scroll-fade">
+            {presets.map((entry, index) => (
+              <div
+                key={entry.id}
+                className="w-64 shrink-0 snap-start sm:w-72"
+                style={{ transform: `rotate(${index % 2 === 0 ? "-0.35deg" : "0.35deg"})` }}
+              >
+                <DeckHubEntryCard
+                  entry={entry}
+                  onOpen={() => onOpen(entry.id)}
+                  onAuthorClick={onAuthor}
+                />
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <div className="flex items-center gap-3 py-1 text-muted-foreground">
+        <span className="h-px flex-1 bg-border" />
+        <Sparkles className="h-4 w-4 text-primary" />
+        <span className="h-px flex-1 bg-border" />
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,848 @@
+package forge.harness.host;
+
+import forge.harness.common.CountingRandom;
+import forge.harness.common.HeadlessGuiBase;
+import forge.harness.common.ForgeEngineReset;
+import forge.harness.protocol.CardCosmetics;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import forge.StaticData;
+import forge.card.CardDb;
+import forge.card.CardEdition;
+import forge.deck.CardPool;
+import forge.deck.Deck;
+import forge.deck.DeckSection;
+import forge.game.Game;
+import forge.game.GameRules;
+import forge.game.GameType;
+import forge.game.Match;
+import forge.game.player.RegisteredPlayer;
+import forge.game.zone.ZoneType;
+import forge.gui.GuiBase;
+import forge.item.PaperCard;
+import forge.localinstance.properties.ForgePreferences;
+import forge.model.FModel;
+
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Product-facing entry point intended for the Rust j4rs backend.
+ *
+ * <p>The parity harness drives deterministic full-game runs. This adapter is the
+ * separate interactive surface: Rust should keep Forge's JVM alive, start a
+ * session here, then exchange prompts and player actions with an interactive
+ * PlayerController implementation.
+ */
+public final class ManaBrewEngineAdapter {
+    private static final Gson GSON = new Gson();
+    private static final Set<ManaBrewInteractiveSession> LIVE_SESSIONS = new HashSet<>();
+    private static final String PAUPER_COMMANDER = "PauperCommander";
+    private static final int PAUPER_COMMANDER_STARTING_LIFE = 30;
+    private static final int PAUPER_COMMANDER_DAMAGE_TO_LOSE = 16;
+    private final Map<String, ManaBrewInteractiveSession> sessions = new ConcurrentHashMap<>();
+    private volatile boolean initialized;
+    private String assetsDir;
+    private String replayIdentity;
+
+    public ManaBrewEngineAdapter() {
+    }
+
+    public synchronized void initialize(final String assetsDir) {
+        if (initialized) {
+            return;
+        }
+        if (assetsDir == null || assetsDir.isBlank()) {
+            throw new IllegalArgumentException("assetsDir is required");
+        }
+        this.assetsDir = assetsDir;
+        GuiBase.setInterface(new HeadlessGuiBase(assetsDir));
+        FModel.initialize(null, prefs -> {
+            prefs.setPref(ForgePreferences.FPref.LOAD_CARD_SCRIPTS_LAZILY, true);
+            prefs.setPref(ForgePreferences.FPref.DECKGEN_CARDBASED, false);
+            // Skips the tap/untap/mana replacement scan of zones other than
+            // battlefield and command (Card-Forge/forge#11160).
+            prefs.setPref(ForgePreferences.FPref.PERFORMANCE_MODE, true);
+            return null;
+        });
+        // The patch 24 runaway caps default to 25k per turn, sized for the heap. A
+        // turn that creates 800 tokens and fires 8k triggers already takes longer
+        // than a session; these end it as a Draw while the tab is still alive.
+        forge.game.Game.setRunawayCardsPerTurnCap(1000);
+        forge.game.Game.setRunawayTriggersPerTurnCap(5000);
+        initialized = true;
+    }
+
+    public SessionHandle startGame(final StartGameRequest request) {
+        synchronized (LIVE_SESSIONS) {
+            return startGameLocked(request);
+        }
+    }
+
+    private SessionHandle startGameLocked(final StartGameRequest request) {
+        Objects.requireNonNull(request, "request");
+        requireInitialized();
+
+        if (request.journalStart != null && request.getPlayers().stream().anyMatch(PlayerConfig::isAi)) {
+            throw new IllegalArgumentException("decision journal requires a seeded game with external decisions");
+        }
+        if (sessions.containsKey(request.getGameId())) {
+            throw new IllegalArgumentException("session already exists: " + request.getGameId());
+        }
+        if (!LIVE_SESSIONS.isEmpty() && (request.journalStart != null
+                || LIVE_SESSIONS.stream().anyMatch(ManaBrewInteractiveSession::hasDecisionJournal))) {
+            throw new IllegalStateException("decision replay requires an isolated engine process");
+        }
+        final java.util.Random rng = request.journalStart == null
+                ? new CountingRandom(request.getSeed(), "hosted") : new ReplayRandom(request.getSeed());
+        if (request.journalStart != null) {
+            forge.util.MyRandom.setRandom(rng);
+        }
+
+        final int playerCount = request.getPlayers().size();
+        final GameType gameType = resolveGameType(request);
+        final Set<GameType> variants = EnumSet.of(gameType);
+        final GameRules rules = new GameRules(gameType);
+        rules.setAppliedVariants(variants);
+        rules.setSimTimeout(120);
+        final boolean pauperCommander = PAUPER_COMMANDER.equals(request.getVariant());
+        if (pauperCommander) {
+            rules.setCommanderDamageToLose(PAUPER_COMMANDER_DAMAGE_TO_LOSE);
+        }
+        // The client draws its own card faces, so nothing here or in the
+        // protocol ever reads Forge's rendered rules text. Building it asks
+        // every conditional static ability whether it applies, and each of
+        // those filters the whole battlefield, which on a four-player board is
+        // a quarter of the engine's time.
+        rules.setRenderAbilityText(false);
+
+        // Resetting global counters under a live session would collide its ids;
+        // multiplexed processes only reset between idle periods.
+        if (LIVE_SESSIONS.isEmpty()) {
+            ForgeEngineReset.resetAllIdCounters();
+            forge.StaticData.instance().resetLazyLoadedCards();
+            forge.ImageKeys.clearCaches();
+        }
+        final ManaBrewInteractiveSession session =
+                new ManaBrewInteractiveSession(request.getGameId());
+        final List<RegisteredPlayer> registeredPlayers = new ArrayList<>();
+        final List<List<CardCosmeticBindings.DeckEntry>> deckEntries = new ArrayList<>();
+        final Set<Integer> botSeats = new HashSet<>();
+        for (PlayerConfig playerConfig : request.getPlayers()) {
+            if (playerConfig.isBot()) {
+                botSeats.add(registeredPlayers.size());
+            }
+            final List<CardCosmeticBindings.DeckEntry> entries = new ArrayList<>();
+            Deck deck = buildDeck(playerConfig, entries);
+            deckEntries.add(entries);
+            RegisteredPlayer registeredPlayer = RegisteredPlayer.forVariants(
+                    playerCount, variants, deck, null, false, null, null);
+            if (pauperCommander) {
+                registeredPlayer.setStartingLife(PAUPER_COMMANDER_STARTING_LIFE);
+            } else if (request.startingLifeSpecified) {
+                registeredPlayer.setStartingLife(request.getStartingLife());
+            }
+            if (playerConfig.isAi()) {
+                registeredPlayer.setPlayer(new ManaBrewAiLobbyPlayer(playerConfig.getName(), session));
+            } else {
+                registeredPlayer.setPlayer(new ManaBrewInteractiveLobbyPlayer(
+                        playerConfig.getName(), session));
+            }
+            registeredPlayers.add(registeredPlayer);
+        }
+
+        final Match match = new Match(rules, registeredPlayers, "ManaBrew");
+        final Game game = match.createGame();
+        session.attach(match, game, botSeats, request.isSnapshotRecording());
+        new CardCosmeticBindings(game, deckEntries, request.getPlayers());
+        if (request.checkpointMetrics) {
+            session.enableCheckpointMetrics();
+        }
+        if (request.journalStart != null) {
+            session.enableDecisionJournal(request.journalStart, request.journalCommitBarrier);
+        }
+        if (request.journalRewind) {
+            session.enableDecisionHistory(request.journalStart, request.replaySnapshot);
+        }
+        sessions.put(session.getSessionId(), session);
+        LIVE_SESSIONS.add(session);
+        session.start(rng);
+
+        List<Integer> playerIndexes = new ArrayList<>();
+        for (int i = 0; i < playerCount; i++) {
+            playerIndexes.add(i);
+        }
+        return new SessionHandle(session.getSessionId(), playerIndexes);
+    }
+
+    public String startGameJson(final String requestJson) {
+        Objects.requireNonNull(requestJson, "requestJson");
+        return GSON.toJson(startGame(parseStartGameRequest(requestJson)).toJsonObject());
+    }
+
+    public String submitAction(final String sessionId, final String actionJson) {
+        ManaBrewInteractiveSession session = getSession(sessionId);
+        Objects.requireNonNull(actionJson, "actionJson");
+        return session.submitAction(actionJson);
+    }
+
+    public String getPrompt(final String sessionId, final int playerIndex) {
+        ManaBrewInteractiveSession session = getSession(sessionId);
+        String prompt = session.getLatestPromptJson();
+        return prompt == null ? "" : prompt;
+    }
+
+    public String getSnapshot(final String sessionId, final int viewer) {
+        return getSession(sessionId).getSnapshotJson(viewer);
+    }
+
+    public String getGameOver(final String sessionId) {
+        final ManaBrewInteractiveSession session = getSession(sessionId);
+        final String error = session.getEngineError();
+        if (error != null) {
+            throw new IllegalStateException(error);
+        }
+        return String.valueOf(session.isGameOver());
+    }
+
+    public String readDecisionJournal(final String sessionId) {
+        return getSession(sessionId).readDecisionJournal();
+    }
+
+    public String acknowledgeDecisionJournal(final String sessionId, final long sequence) {
+        return getSession(sessionId).acknowledgeDecisionJournal(sequence);
+    }
+
+    public String drainDecisionJournal(final String sessionId) {
+        return getSession(sessionId).drainDecisionJournal();
+    }
+
+    public String getLibraryTop(final String sessionId, final int playerIndex, final int count) {
+        return InteractiveSnapshotExtractor.libraryTopJson(
+                getSession(sessionId).getGame(), playerIndex, count);
+    }
+
+    public String drainCheckpointMetrics(final String sessionId) {
+        return getSession(sessionId).drainCheckpointMetrics();
+    }
+
+    public String drainDirectives(final String sessionId) {
+        return getSession(sessionId).drainDirectives();
+    }
+
+    public String getStateRevision(final String sessionId) {
+        return String.valueOf(getSession(sessionId).getStateRevision());
+    }
+
+    public String getEngineError(final String sessionId) {
+        final String error = getSession(sessionId).getEngineError();
+        return error == null ? "" : error;
+    }
+
+    public boolean isReplaying(final String sessionId) {
+        return getSession(sessionId).isReplaying();
+    }
+
+    public String getRewindRequest(final String sessionId) {
+        return getSession(sessionId).getRewindRequest();
+    }
+
+    public String resumeAfterFailedRewind(final String sessionId) {
+        getSession(sessionId).resumeAfterFailedRewind();
+        return "";
+    }
+
+    public String replayReady(final String sessionId) {
+        final ManaBrewInteractiveSession session = getSession(sessionId);
+        if (session.getEngineError() != null) throw new IllegalStateException(session.getEngineError());
+        return Boolean.toString(!session.isReplaying() && session.getLatestPromptJson() != null);
+    }
+
+    public String endGameJson(final String sessionId) {
+        endGame(sessionId);
+        JsonObject response = new JsonObject();
+        response.addProperty("sessionId", sessionId);
+        response.addProperty("ended", true);
+        return response.toString();
+    }
+
+    public String abortGameJson(final String sessionId) {
+        return endGameJson(sessionId);
+    }
+
+    public void endGame(final String sessionId) {
+        requireSessionId(sessionId);
+        synchronized (LIVE_SESSIONS) {
+            ManaBrewInteractiveSession session = sessions.remove(sessionId);
+            if (session != null) {
+                session.close();
+                if (session.executionStopped()) {
+                    LIVE_SESSIONS.remove(session);
+                } else {
+                    throw new IllegalStateException("engine did not stop; discard this process before replay");
+                }
+            }
+        }
+    }
+
+    synchronized String replayIdentity() {
+        if (replayIdentity == null) {
+            replayIdentity = GameCheckpoint.identity(assetsDir);
+        }
+        return replayIdentity;
+    }
+
+    String replayBoundary(final String sessionId) {
+        return getSession(sessionId).exportReplaySnapshot(null);
+    }
+
+    public String exportReplaySnapshot(final String sessionId, final String history) {
+        return GameCheckpoint.withIdentity(getSession(sessionId).exportReplaySnapshot(history), replayIdentity());
+    }
+
+    public String restoreReplaySnapshot(final String snapshot) {
+        return GameCheckpoint.restore(this, snapshot);
+    }
+
+    private void requireInitialized() {
+        if (!initialized) {
+            throw new IllegalStateException("adapter must be initialized before starting games");
+        }
+    }
+
+    private ManaBrewInteractiveSession getSession(final String sessionId) {
+        requireSessionId(sessionId);
+        ManaBrewInteractiveSession session = sessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("unknown sessionId: " + sessionId);
+        }
+        return session;
+    }
+
+    static Deck buildDeck(final PlayerConfig playerConfig,
+            final List<CardCosmeticBindings.DeckEntry> entries) {
+        Deck deck = new Deck(playerConfig.getName());
+        CardPool main = deck.getOrCreate(DeckSection.Main);
+        final CardPool resolved = new CardPool();
+        for (CardIdentity card : playerConfig.getDeck()) {
+            addDeckEntry(main, resolved, card, ZoneType.Library, entries);
+        }
+        List<String> uniqueCommanders = new ArrayList<>();
+        Set<String> seenCommanders = new HashSet<>();
+        for (String commanderName : playerConfig.getCommanderNames()) {
+            if (commanderName == null || commanderName.isBlank()) {
+                continue;
+            }
+            if (seenCommanders.add(commanderName.toLowerCase(Locale.ROOT))) {
+                uniqueCommanders.add(commanderName);
+            }
+        }
+        for (String commanderName : uniqueCommanders) {
+            CardCosmeticBindings.DeckEntry commander = null;
+            for (final CardCosmeticBindings.DeckEntry entry : entries) {
+                if (entry.zone == ZoneType.Library
+                        && (matchesCardName(entry.paper.getName(), commanderName)
+                                || matchesCardName(entry.identity.getName(), commanderName))
+                        && (commander == null || entry.identity.commander)) {
+                    commander = entry;
+                    if (entry.identity.commander) {
+                        break;
+                    }
+                }
+            }
+            if (commander == null) {
+                throw new IllegalArgumentException("commander was not found in main deck: "
+                        + commanderName);
+            }
+            main.remove(commander.paper, 1);
+            deck.getOrCreate(DeckSection.Commander).add(commander.paper, 1);
+            commander.zone = ZoneType.Command;
+        }
+        if (!playerConfig.getSideboard().isEmpty()) {
+            CardPool sideboard = deck.getOrCreate(DeckSection.Sideboard);
+            for (CardIdentity card : playerConfig.getSideboard()) {
+                addDeckEntry(sideboard, resolved, card, ZoneType.Sideboard, entries);
+            }
+        }
+        if (!playerConfig.getAttractions().isEmpty()) {
+            CardPool attractions = deck.getOrCreate(DeckSection.Attractions);
+            for (CardIdentity card : playerConfig.getAttractions()) {
+                addDeckEntry(attractions, resolved, card, ZoneType.AttractionDeck, entries);
+            }
+        }
+        return deck;
+    }
+
+    private static boolean matchesCardName(final String name, final String requestedName) {
+        if (name == null) {
+            return false;
+        }
+        final int separator = name.indexOf(" // ");
+        final int length = separator < 0 ? name.length() : separator;
+        final int requestedSeparator = requestedName.indexOf(" // ");
+        final int requestedLength = requestedSeparator < 0
+                ? requestedName.length() : requestedSeparator;
+        return length == requestedLength && name.regionMatches(true, 0, requestedName, 0, length);
+    }
+
+    private static void addDeckEntry(final CardPool pool, final CardPool resolved,
+            final CardIdentity identity, final ZoneType zone,
+            final List<CardCosmeticBindings.DeckEntry> entries) {
+        resolved.clear();
+        resolved.add(cardRequest(identity), 1);
+        for (final Map.Entry<PaperCard, Integer> entry : resolved) {
+            pool.add(entry.getKey(), entry.getValue());
+            entries.add(new CardCosmeticBindings.DeckEntry(entry.getKey(), identity, zone));
+        }
+    }
+
+    static String cardRequest(final CardIdentity card) {
+        return cardRequest(card, staticDataNames());
+    }
+
+    static String cardRequest(final CardIdentity card, final CardNameIndex names) {
+        final String name = CardDb.CardRequest.compose(resolveCardName(card, names), card.isFoil());
+        if (card.getSetCode() == null || card.getSetCode().isBlank()) {
+            return name;
+        }
+        if (card.getCollectorNumber() == null || card.getCollectorNumber().isBlank()) {
+            return CardDb.CardRequest.compose(name, card.getSetCode());
+        }
+        return CardDb.CardRequest.compose(name, card.getSetCode(), card.getCollectorNumber());
+    }
+
+    /**
+     * The name Forge files a card under, given the name a deck asked for.
+     */
+    static String resolveCardName(final CardIdentity card, final CardNameIndex names) {
+        final String requested = card.getName();
+        if (requested == null || requested.isBlank() || names == null) {
+            return requested;
+        }
+        if (names.knowsCard(requested)) {
+            return requested;
+        }
+        final String printed = names.cardNamePrintedAs(
+                card.getSetCode(), card.getCollectorNumber(), requested);
+        if (printed != null && !printed.isBlank()) {
+            return printed;
+        }
+        final String byFlavorName = names.cardNameForFlavorName(requested);
+        return byFlavorName == null || byFlavorName.isBlank() ? requested : byFlavorName;
+    }
+
+    /** The card-database questions {@link #resolveCardName} asks, so a test can answer them. */
+    interface CardNameIndex {
+        boolean knowsCard(String name);
+
+        /** The card at this printing, when the edition files it under the given flavor name. */
+        String cardNamePrintedAs(String setCode, String collectorNumber, String flavorName);
+
+        String cardNameForFlavorName(String flavorName);
+    }
+
+    private static CardNameIndex staticDataNames() {
+        final StaticData data = StaticData.instance();
+        final CardDb cards = data == null ? null : data.getCommonCards();
+        if (cards == null) {
+            return null;
+        }
+        return new CardNameIndex() {
+            @Override
+            public boolean knowsCard(final String name) {
+                return !cards.getAllCards(name).isEmpty();
+            }
+
+            @Override
+            public String cardNamePrintedAs(
+                    final String setCode, final String collectorNumber, final String flavorName) {
+                if (setCode == null || setCode.isBlank()
+                        || collectorNumber == null || collectorNumber.isBlank()) {
+                    return null;
+                }
+                final CardEdition edition =
+                        data.getEditions().get(setCode.toUpperCase(Locale.ROOT));
+                if (edition == null) {
+                    return null;
+                }
+                final CardEdition.EditionEntry entry =
+                        edition.getCardFromCollectorNumber(collectorNumber);
+                if (entry == null) {
+                    return null;
+                }
+                return matchesCardName(entry.getFlavorName(), flavorName) ? entry.name() : null;
+            }
+
+            @Override
+            public String cardNameForFlavorName(final String flavorName) {
+                final PaperCard card = cards.getUniqueByName(flavorName);
+                return card == null ? null : card.getName();
+            }
+        };
+    }
+
+    private static void requireSessionId(final String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            throw new IllegalArgumentException("sessionId is required");
+        }
+    }
+
+    private static GameType resolveGameType(final StartGameRequest request) {
+        final String variant = request.getVariant();
+        if (variant != null && !variant.isBlank()) {
+            switch (variant) {
+                case "Commander":
+                case PAUPER_COMMANDER:
+                    return GameType.Commander;
+                case "Oathbreaker":
+                    return GameType.Oathbreaker;
+                case "Brawl":
+                    return GameType.Brawl;
+                case "Constructed":
+                    return GameType.Constructed;
+                default:
+                    throw new IllegalArgumentException("unknown game variant: " + variant);
+            }
+        }
+        final boolean commanderGame = request.getPlayers().size() > 2
+                || request.getStartingLife() == 40
+                || request.getPlayers().stream().anyMatch(player ->
+                        !player.getCommanderNames().isEmpty());
+        return commanderGame ? GameType.Commander : GameType.Constructed;
+    }
+
+    private static StartGameRequest parseStartGameRequest(final String requestJson) {
+        JsonObject root = JsonParser.parseString(requestJson).getAsJsonObject();
+        String gameId = requiredString(root, "gameId");
+        String variant = optionalString(root, "variant");
+        int startingLife = root.has("startingLife") ? root.get("startingLife").getAsInt() : 20;
+        long seed = root.has("seed") ? root.get("seed").getAsLong() : 42L;
+        boolean snapshotRecording = !root.has("snapshotRecording") || root.get("snapshotRecording").getAsBoolean();
+        JsonArray playerValues = root.getAsJsonArray("players");
+        if (playerValues == null) {
+            throw new IllegalArgumentException("players is required");
+        }
+        List<PlayerConfig> players = new ArrayList<>();
+        for (JsonElement playerValue : playerValues) {
+            JsonObject playerObject = playerValue.getAsJsonObject();
+            String name = requiredString(playerObject, "name");
+            List<String> commanderNames = new ArrayList<>();
+            if (playerObject.has("commanderNames")
+                    && playerObject.get("commanderNames").isJsonArray()) {
+                for (JsonElement commanderValue : playerObject.getAsJsonArray("commanderNames")) {
+                    if (!commanderValue.isJsonNull() && !commanderValue.getAsString().isBlank()) {
+                        commanderNames.add(commanderValue.getAsString());
+                    }
+                }
+            } else {
+                String commanderName = optionalString(playerObject, "commanderName");
+                if (commanderName != null && !commanderName.isBlank()) {
+                    commanderNames.add(commanderName);
+                }
+            }
+            JsonArray cardValues = playerObject.getAsJsonArray("deck");
+            if (cardValues == null) {
+                throw new IllegalArgumentException("player deck is required");
+            }
+            List<CardIdentity> deck = parseCardIdentities(cardValues);
+            List<CardIdentity> sideboard = playerObject.has("sideboard")
+                    ? parseCardIdentities(playerObject.getAsJsonArray("sideboard"))
+                    : List.of();
+            List<CardIdentity> attractions = playerObject.has("attractions")
+                    ? parseCardIdentities(playerObject.getAsJsonArray("attractions"))
+                    : List.of();
+            boolean ai = playerObject.has("ai")
+                    && !playerObject.get("ai").isJsonNull()
+                    && playerObject.get("ai").getAsBoolean();
+            boolean bot = playerObject.has("bot")
+                    && !playerObject.get("bot").isJsonNull()
+                    && playerObject.get("bot").getAsBoolean();
+            final PlayerConfig player = new PlayerConfig(name, deck, sideboard, attractions, commanderNames, ai, bot);
+            if (playerObject.has("tokens")) {
+                player.tokens = parseCardIdentities(playerObject.getAsJsonArray("tokens"));
+            }
+            players.add(player);
+        }
+        final StartGameRequest request = new StartGameRequest(
+                gameId, variant, startingLife, seed, snapshotRecording, players);
+        request.startingLifeSpecified = root.has("startingLife");
+        request.checkpointMetrics = root.has("checkpointMetrics") && root.get("checkpointMetrics").getAsBoolean();
+        request.journalRewind = root.has("journalRewind") && root.get("journalRewind").getAsBoolean();
+        if (root.has("replaySnapshot")) {
+            request.replaySnapshot = root.remove("replaySnapshot").getAsJsonObject();
+        }
+        if (root.has("checkpoint") || (root.has("checkpointExport") && root.get("checkpointExport").getAsBoolean())) {
+            throw new IllegalArgumentException("GameState checkpoints are unsupported; restore a replay snapshot instead");
+        }
+        if (root.has("decisionJournal") && root.get("decisionJournal").getAsBoolean()) {
+            request.journalStart = root.toString();
+        }
+        request.journalCommitBarrier = root.has("decisionJournalCommitBarrier")
+                && root.get("decisionJournalCommitBarrier").getAsBoolean();
+        if (request.journalCommitBarrier && request.journalStart == null) {
+            throw new IllegalArgumentException("journal commit barrier requires decisionJournal");
+        }
+        if (request.journalRewind && request.journalCommitBarrier) {
+            throw new IllegalArgumentException("journal rewind owns delivery and cannot use an external commit barrier");
+        }
+        if (request.journalRewind && request.journalStart == null) {
+            throw new IllegalArgumentException("journal rewind requires decisionJournal");
+        }
+        if (request.replaySnapshot != null && !request.journalRewind) {
+            throw new IllegalArgumentException("browser replay requires journalRewind");
+        }
+        return request;
+    }
+
+    private static List<CardIdentity> parseCardIdentities(final JsonArray cardValues) {
+        List<CardIdentity> cards = new ArrayList<>();
+        for (JsonElement cardValue : cardValues) {
+            JsonObject cardObject = cardValue.getAsJsonObject();
+            final CardIdentity card = new CardIdentity(
+                    requiredString(cardObject, "name"),
+                    optionalString(cardObject, "setCode"),
+                    optionalString(cardObject, "collectorNumber"),
+                    cardObject.has("foil") && cardObject.get("foil").getAsBoolean());
+            card.cosmetics = CardCosmeticsCodec.parse(cardObject.get("cosmetics"));
+            card.tokenScript = optionalString(cardObject, "tokenScript");
+            card.commander = cardObject.has("commander") && cardObject.get("commander").getAsBoolean();
+            cards.add(card);
+        }
+        return cards;
+    }
+
+
+    private static String requiredString(final JsonObject object, final String key) {
+        String value = optionalString(object, key);
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(key + " is required");
+        }
+        return value;
+    }
+
+    private static String optionalString(final JsonObject object, final String key) {
+        if (!object.has(key) || object.get(key).isJsonNull()) {
+            return null;
+        }
+        return object.get(key).getAsString();
+    }
+
+    public static final class StartGameRequest {
+        private boolean journalRewind;
+        private JsonObject replaySnapshot;
+        private final String gameId;
+        private final String variant;
+        private final int startingLife;
+        private boolean startingLifeSpecified = true;
+        private final long seed;
+        private final boolean snapshotRecording;
+        private boolean checkpointMetrics;
+        private String journalStart;
+        private boolean journalCommitBarrier;
+        private final List<PlayerConfig> players;
+
+        public StartGameRequest(
+                final String gameId,
+                final String variant,
+                final int startingLife,
+                final long seed,
+                final boolean snapshotRecording,
+                final List<PlayerConfig> players
+        ) {
+            if (gameId == null || gameId.isBlank()) {
+                throw new IllegalArgumentException("gameId is required");
+            }
+            if (players == null || players.size() < 2) {
+                throw new IllegalArgumentException("at least two players are required");
+            }
+            this.gameId = gameId;
+            this.variant = variant;
+            this.startingLife = startingLife;
+            this.seed = seed;
+            this.snapshotRecording = snapshotRecording;
+            this.players = List.copyOf(players);
+        }
+
+        public boolean isSnapshotRecording() {
+            return snapshotRecording;
+        }
+
+        public String getGameId() {
+            return gameId;
+        }
+
+        public String getVariant() {
+            return variant;
+        }
+
+        public int getStartingLife() {
+            return startingLife;
+        }
+
+        public long getSeed() {
+            return seed;
+        }
+
+        public List<PlayerConfig> getPlayers() {
+            return players;
+        }
+    }
+
+    public static final class PlayerConfig {
+        private final String name;
+        private final List<CardIdentity> deck;
+        private final List<CardIdentity> sideboard;
+        private final List<CardIdentity> attractions;
+        private List<CardIdentity> tokens = List.of();
+        private final List<String> commanderNames;
+        private final boolean ai;
+        private final boolean bot;
+
+        public PlayerConfig(
+                final String name,
+                final List<CardIdentity> deck,
+                final List<CardIdentity> sideboard,
+                final List<CardIdentity> attractions,
+                final List<String> commanderNames,
+                final boolean ai,
+                final boolean bot
+        ) {
+            if (name == null || name.isBlank()) {
+                throw new IllegalArgumentException("player name is required");
+            }
+            if (deck == null || deck.isEmpty()) {
+                throw new IllegalArgumentException("player deck is required");
+            }
+            this.name = name;
+            this.deck = List.copyOf(deck);
+            this.sideboard = sideboard == null ? List.of() : List.copyOf(sideboard);
+            this.attractions = attractions == null ? List.of() : List.copyOf(attractions);
+            this.commanderNames = commanderNames == null ? List.of() : List.copyOf(commanderNames);
+            this.ai = ai;
+            this.bot = bot;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public List<CardIdentity> getDeck() {
+            return deck;
+        }
+
+        public List<CardIdentity> getSideboard() {
+            return sideboard;
+        }
+
+        public List<CardIdentity> getAttractions() {
+            return attractions;
+        }
+
+        List<CardIdentity> getTokens() {
+            return tokens;
+        }
+
+        public List<String> getCommanderNames() {
+            return commanderNames;
+        }
+
+        public boolean isAi() {
+            return ai;
+        }
+
+        public boolean isBot() {
+            return bot;
+        }
+    }
+
+    public static final class CardIdentity {
+        private final String name;
+        private final String setCode;
+        private final String collectorNumber;
+        private final boolean foil;
+        private CardCosmetics cosmetics;
+        private String tokenScript;
+        private boolean commander;
+
+        public CardIdentity(
+                final String name,
+                final String setCode,
+                final String collectorNumber,
+                final boolean foil
+        ) {
+            if (name == null || name.isBlank()) {
+                throw new IllegalArgumentException("card name is required");
+            }
+            this.name = name;
+            this.setCode = setCode;
+            this.collectorNumber = collectorNumber;
+            this.foil = foil;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public String getSetCode() {
+            return setCode;
+        }
+
+        public String getCollectorNumber() {
+            return collectorNumber;
+        }
+
+        public boolean isFoil() {
+            return foil;
+        }
+
+        CardCosmetics getCosmetics() {
+            return cosmetics;
+        }
+
+        String getTokenScript() {
+            return tokenScript;
+        }
+    }
+
+    public static final class SessionHandle {
+        private final String sessionId;
+        private final List<Integer> playerIndexes;
+
+        public SessionHandle(final String sessionId, final List<Integer> playerIndexes) {
+            requireSessionId(sessionId);
+            this.sessionId = sessionId;
+            this.playerIndexes = new ArrayList<>(Objects.requireNonNull(playerIndexes,
+                    "playerIndexes"));
+        }
+
+        public String getSessionId() {
+            return sessionId;
+        }
+
+        public List<Integer> getPlayerIndexes() {
+            return List.copyOf(playerIndexes);
+        }
+
+        private JsonObject toJsonObject() {
+            JsonObject object = new JsonObject();
+            object.addProperty("sessionId", sessionId);
+            JsonArray players = new JsonArray();
+            for (Integer playerIndex : playerIndexes) {
+                players.add(playerIndex);
+            }
+            object.add("playerIndexes", players);
+            return object;
+        }
+    }
+}

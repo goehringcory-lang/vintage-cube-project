@@ -1,0 +1,1273 @@
+import { useState } from "react";
+import { toast } from "sonner";
+import {
+  CARD_SIZE_MULTIPLIER_MAX,
+  CARD_SIZE_MULTIPLIER_MIN,
+  usePreferencesStore,
+  type ZonePanelItem,
+} from "@/stores/usePreferencesStore";
+import { isFeatureEnabled } from "@/featureFlags";
+import { IRONSMITH_WASM_AVAILABLE } from "@/game/ironsmithWasmAvailable";
+import { relayUsername } from "@/lib/relayUsername";
+import { BattlefieldStylePreview } from "@/components/game/BattlefieldStylePreview";
+import { SoundControls } from "@/components/SoundControls";
+import {
+  INLINE_CARD_STYLE_OPTIONS,
+  IN_GAME_CARD_PREVIEW_STYLE_OPTIONS,
+} from "@/components/game/cardPreviewStyles";
+import { HAND_ORDER_OPTIONS } from "@/lib/handOrder";
+import { PlaymatEditorModal } from "@/components/editor/PlaymatEditorModal";
+import { useAssetStore, useAssetsAvailable, useAssetUrl } from "@/stores/useAssetStore";
+import { MANABREW_THEME, type ThemeColors } from "@/themes";
+import { useServerStore } from "@/stores/useServerStore";
+import { useGameStore } from "@/stores/useGameStore";
+import { useScryfallStore } from "@/stores/useScryfallStore";
+import { PromptPreferencesPanel } from "@/components/prompts/internal/PromptPreferencesPanel";
+import { KeybindingsPanel } from "@/components/settings/KeybindingsPanel";
+import { AccountSection } from "@/components/settings/AccountSection";
+import { MyAssetsSection } from "@/components/settings/MyAssetsSection";
+import { CardArtDownloadSection } from "@/components/settings/CardArtDownloadSection";
+import { CardGlintOfflineSection } from "@/components/settings/CardGlintOfflineSection";
+import { PreferenceCard } from "@/components/settings/PreferenceCard";
+import { LanguagePreferenceCard } from "@/components/settings/LanguagePreferenceCard";
+import { toPickerHexColor, parseThemeColor, formatThemeColor } from "@/themes/gameTheme";
+import type { GameThemeColorKey } from "@/themes/gameTheme";
+import {
+  APP_THEME_COLOR_DESCRIPTIONS,
+  APP_THEME_COLOR_LABELS,
+  APP_THEME_GROUPS,
+  GAME_THEME_COLOR_DESCRIPTIONS,
+  GAME_THEME_GROUPS,
+} from "@/themes/themeMetadata";
+import { getDefaultGameThemeColorMap } from "@/hooks/useTheme";
+import { Input } from "@/components/ui/input";
+import { AppSelect, AppSelectOption } from "@/components/ui/AppSelect";
+import { Label } from "@/components/ui/label";
+import { Button as BaseButton, type ButtonProps } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
+import { useTheme as useColorMode } from "next-themes";
+import { Navigate, useLocation } from "react-router-dom";
+import { HelpCircle, Minus, Pencil, Plus, Server, Trash2 } from "lucide-react";
+import { KNOWN_RELAYS, type KnownRelay } from "@/config/knownRelays";
+import { cn } from "@/lib/utils";
+import { useIsShortScreen, useIsTouch } from "@/hooks/useBreakpoints";
+/**
+ * Small `?` hover-help icon shown next to a picker label. Renders a
+ * custom CSS tooltip below the icon on hover / focus — native `title`
+ * attributes don't always fire reliably and are slow to appear, so we
+ * drive the popover with tailwind `group-hover` + `group-focus-within`.
+ * An invisible native `title` + `aria-label` remain for screen readers
+ * and for users who expect the OS tooltip as a fallback.
+ */
+function HelpMark({ description }: { description: string | undefined }) {
+  if (!description) return null;
+  return (
+    <button
+      type="button"
+      className="group relative inline-flex shrink-0 items-center justify-center touch:min-h-11 touch:min-w-11"
+      tabIndex={0}
+      role="button"
+      aria-label={description}
+    >
+      <HelpCircle className="h-3 w-3 text-muted-foreground/60 group-hover:text-foreground group-focus-within:text-foreground cursor-help" />
+      <span
+        role="tooltip"
+        className={cn(
+          "pointer-events-none absolute right-0 top-full z-50 mt-1 w-56 whitespace-normal",
+          "rounded-md border bg-popover px-2 py-1.5 text-ui-meta leading-snug text-popover-foreground shadow-lg",
+          "opacity-0 -translate-y-1 transition-all duration-150",
+          "group-hover:opacity-100 group-hover:translate-y-0",
+          "group-focus-within:opacity-100 group-focus-within:translate-y-0",
+        )}
+      >
+        {description}
+      </span>
+    </button>
+  );
+}
+
+function Button({ variant, className, ...props }: ButtonProps) {
+  const selected = variant === "selected";
+  return (
+    <BaseButton
+      {...props}
+      variant={variant}
+      aria-pressed={selected ? true : props["aria-pressed"]}
+      className={className}
+    />
+  );
+}
+
+const FLASH_MIN = 200;
+const FLASH_MAX = 2000;
+const FLASH_STEP = 100;
+type SettingsTab =
+  | "server"
+  | "preferences"
+  | "theme"
+  | "prompts"
+  | "keybindings"
+  | "cache"
+  | "account"
+  | "assets";
+
+export default function Settings() {
+  const isGameActive = useGameStore((s) => s.isGameActive);
+  const assetsTabAvailable = useAssetsAvailable();
+  const shortScreen = useIsShortScreen();
+  const isTouch = useIsTouch();
+  const shortTouch = shortScreen && isTouch;
+  const prefs = usePreferencesStore();
+  const { flashDurationMs, setFlashDurationMs } = prefs;
+  const server = useServerStore();
+  const { theme, setTheme, resolvedTheme } = useColorMode();
+  const location = useLocation();
+  const [activeTab, setActiveTab] = useState<SettingsTab>(() =>
+    location.state?.settingsTab === "account" && isFeatureEnabled("accounts")
+      ? "account"
+      : "preferences",
+  );
+  const settingsTabs: Array<{ value: SettingsTab; label: string }> = [
+    ...(isFeatureEnabled("accounts") ? [{ value: "account" as const, label: "Account" }] : []),
+    ...(assetsTabAvailable ? [{ value: "assets" as const, label: "My assets" }] : []),
+    { value: "preferences", label: "Preferences" },
+    { value: "theme", label: "Theme" },
+    { value: "prompts", label: "Prompts" },
+    { value: "keybindings", label: "Shortcuts" },
+    { value: "server", label: "Server" },
+    { value: "cache", label: "Cache" },
+  ];
+  const accountTabRequested =
+    location.state?.settingsTab === "account" && isFeatureEnabled("accounts");
+  const [accountTabHandled, setAccountTabHandled] = useState(accountTabRequested);
+  if (accountTabRequested !== accountTabHandled) {
+    setAccountTabHandled(accountTabRequested);
+    if (accountTabRequested) setActiveTab("account");
+  }
+  const [clearingCache, setClearingCache] = useState(false);
+  const [editingThemeColorPath, setEditingThemeColorPath] = useState<string | null>(null);
+  const [editingThemeColorValue, setEditingThemeColorValue] = useState("");
+  const [themeColorFilter, setThemeColorFilter] = useState("");
+  const DEFAULT_GAME_THEME_COLOR_MAP = getDefaultGameThemeColorMap(
+    resolvedTheme === "light" ? "light" : "dark",
+  );
+  const zoneOrder = prefs.zonePanelOrder;
+  const [playmatEditorOpen, setPlaymatEditorOpen] = useState(false);
+  const defaultPlaymat = useAssetUrl(prefs.defaultPlaymatAssetId);
+  const hasDefaultPlaymat = !!defaultPlaymat || !!prefs.defaultPlaymatSettings?.color;
+  function setZoneSlot(index: number, value: ZonePanelItem) {
+    const next = [...zoneOrder] as ZonePanelItem[];
+    const existingIndex = next.indexOf(value);
+    if (existingIndex !== -1 && existingIndex !== index) {
+      const prevValue = next[index]!;
+      next[index] = value;
+      next[existingIndex] = prevValue;
+    } else {
+      next[index] = value;
+    }
+    prefs.setZonePanelOrder(next);
+  }
+  const [host, setHost] = useState(prefs.serverHost);
+  const [port, setPort] = useState(String(prefs.serverPort));
+  const [password, setPassword] = useState(prefs.serverPassword);
+  const [savingServer, setSavingServer] = useState(false);
+  const [newServerName, setNewServerName] = useState("");
+  const hasChanges =
+    host !== prefs.serverHost ||
+    port !== String(prefs.serverPort) ||
+    password !== prefs.serverPassword;
+  function beginThemeColorEdit(path: string, value: string) {
+    setEditingThemeColorPath(path);
+    setEditingThemeColorValue(value);
+  }
+  function commitThemeColorEdit(path: string, fallbackValue: string) {
+    const next = editingThemeColorValue.trim() || fallbackValue;
+    const parsed = parseThemeColor(next);
+    if (!parsed) {
+      toast.error("Use a valid hex or rgb/rgba color.");
+      return;
+    }
+    const color = formatThemeColor(parsed.hex, parsed.alpha);
+    if (path.startsWith("app.")) {
+      prefs.setAppThemeColorOverride(
+        resolvedTheme === "light" ? "light" : "dark",
+        path.slice(4) as keyof ThemeColors,
+        color,
+      );
+    } else {
+      prefs.setGameThemeColorOverride(path, color);
+    }
+    setEditingThemeColorPath(null);
+    setEditingThemeColorValue("");
+  }
+  async function handleSave() {
+    prefs.setServerHost(host);
+    prefs.setServerPort(Number(port));
+    prefs.setServerPassword(password);
+    // Always disconnect first (kills any existing WS connection)
+    await server.disconnect();
+    const name = relayUsername();
+    if (name) {
+      await server.connect(host, Number(port), name, password);
+    }
+  }
+  async function applyKnownRelay(relay: KnownRelay) {
+    setHost(relay.host);
+    setPort(String(relay.port));
+    setPassword(relay.password);
+    prefs.setServerHost(relay.host);
+    prefs.setServerPort(relay.port);
+    prefs.setServerPassword(relay.password);
+    await server.disconnect();
+    const name = relayUsername();
+    if (name) {
+      await server.connect(relay.host, relay.port, name, relay.password);
+    }
+  }
+  function saveCurrentServer() {
+    const name = newServerName.trim();
+    if (!name) return;
+    if (KNOWN_RELAYS.some((r) => r.name === name)) {
+      toast.error(`That name is reserved for a built-in server`);
+      return;
+    }
+    prefs.addSavedServer({ name, host, port: Number(port), password });
+    setNewServerName("");
+    setSavingServer(false);
+    toast.success(`Saved "${name}"`);
+  }
+  async function handleClearImageCache() {
+    setClearingCache(true);
+    try {
+      useScryfallStore.getState().clearImageCaches();
+      if ("caches" in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+      toast.success(`Image cache cleared \u2014 reloading\u2026`);
+      window.location.reload();
+    } catch {
+      setClearingCache(false);
+      toast.error(`Couldn't clear the image cache`);
+    }
+  }
+  if (isGameActive) {
+    return <Navigate to="/play" replace />;
+  }
+  return (
+    <div
+      className={cn(
+        "h-full space-y-8 overflow-y-auto px-4 pt-8 pb-[calc(2rem+max(0px,100dvh-var(--visual-viewport-height)-var(--visual-viewport-top)))] sm:px-6 lg:px-8",
+        shortTouch && "space-y-4 pt-4 sm:pt-4",
+      )}
+    >
+      <section>
+        {isTouch ? (
+          <div>
+            <Label htmlFor="settings-section" className="sr-only">
+              Settings section
+            </Label>
+            <AppSelect
+              id="settings-section"
+              value={activeTab}
+              onValueChange={(value) => setActiveTab(value as SettingsTab)}
+              className="min-h-11 w-full rounded-md border border-input bg-background px-3 text-ui-label"
+            >
+              {settingsTabs.map((tab) => (
+                <AppSelectOption key={tab.value} value={tab.value}>
+                  {tab.label}
+                </AppSelectOption>
+              ))}
+            </AppSelect>
+          </div>
+        ) : (
+          <div className="flex items-center gap-6 overflow-x-auto border-b no-scrollbar touch-scroll-fade">
+            {settingsTabs.map((tab) => (
+              <button
+                key={tab.value}
+                type="button"
+                onClick={() => setActiveTab(tab.value)}
+                className={cn(
+                  "shrink-0 whitespace-nowrap border-b-2 pb-2 text-ui-label font-medium transition-colors touch:min-h-11 touch:min-w-11",
+                  activeTab === tab.value
+                    ? "border-primary text-foreground"
+                    : "border-transparent text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {activeTab === "account" && isFeatureEnabled("accounts") && <AccountSection />}
+
+      {activeTab === "assets" && <MyAssetsSection />}
+
+      {activeTab === "keybindings" && <KeybindingsPanel />}
+
+      {activeTab === "cache" && <CardArtDownloadSection />}
+      {activeTab === "cache" && <CardGlintOfflineSection />}
+
+      {activeTab === "cache" && (
+        <section className="space-y-4">
+          <h2 className="text-lg font-semibold">Cache</h2>
+          <div className="rounded-lg border bg-card/40 p-4 space-y-3 max-w-xl">
+            <Label>Card Image Cache</Label>
+            <p className="text-ui-body text-muted-foreground">
+              Drops Manabrew&apos;s in-memory card textures and image object URLs, clears the
+              CacheStorage API, then reloads so every card image is fetched fresh. Use this if
+              battlefield card art fails to appear. For a full browser HTTP cache wipe, use the
+              browser&apos;s &quot;Empty Cache and Hard Reload&quot; (DevTools open → right-click
+              reload).
+            </p>
+            <Button
+              variant="destructive"
+              onClick={() => void handleClearImageCache()}
+              disabled={clearingCache}
+            >
+              {clearingCache ? `Clearing\u2026` : `Clear image cache & reload`}
+            </Button>
+          </div>
+        </section>
+      )}
+
+      {activeTab === "prompts" && <PromptPreferencesPanel />}
+
+      {activeTab === "server" && (
+        <section className="space-y-4">
+          <h2 className="text-lg font-semibold">Server</h2>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="space-y-1">
+              <Label htmlFor="server-host">Host</Label>
+              <Input
+                id="server-host"
+                value={host}
+                onChange={(e) => setHost(e.target.value)}
+                placeholder={`localhost`}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="server-port">Port</Label>
+              <Input
+                id="server-port"
+                type="number"
+                value={port}
+                onChange={(e) => setPort(e.target.value)}
+                placeholder="9443"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="server-password">Password</Label>
+              <Input
+                id="server-password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={`forge`}
+              />
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <Button variant="primary" onClick={handleSave} disabled={!hasChanges && !server.error}>
+              Save & Reconnect
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline">
+                  <Server className="h-4 w-4" />
+                  Saved servers
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="min-w-56">
+                <DropdownMenuLabel>Built-in</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                {KNOWN_RELAYS.map((relay) => (
+                  <DropdownMenuItem key={relay.name} onSelect={() => void applyKnownRelay(relay)}>
+                    <div className="flex flex-col">
+                      <span className="text-ui-label">{relay.name}</span>
+                      <span className="text-ui-meta text-muted-foreground">
+                        {relay.host}:{relay.port}
+                      </span>
+                    </div>
+                  </DropdownMenuItem>
+                ))}
+                {prefs.savedServers.length > 0 && (
+                  <>
+                    <DropdownMenuLabel>Your servers</DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    {prefs.savedServers.map((relay) => (
+                      <DropdownMenuItem
+                        key={relay.name}
+                        onSelect={() => void applyKnownRelay(relay)}
+                        className="justify-between gap-2"
+                      >
+                        <div className="flex min-w-0 flex-col">
+                          <span className="truncate text-ui-label">{relay.name}</span>
+                          <span className="truncate text-ui-meta text-muted-foreground">
+                            {relay.host}:{relay.port}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label={`Remove ${relay.name}`}
+                          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive touch:min-h-11 touch:min-w-11 text-ui-label whitespace-normal"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            prefs.removeSavedServer(relay.name);
+                          }}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </DropdownMenuItem>
+                    ))}
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setNewServerName(host);
+                setSavingServer((v) => !v);
+              }}
+            >
+              Save current server…
+            </Button>
+            {server.connected && (
+              <span className="text-ui-meta text-success flex items-center gap-1">
+                <span className="h-2 w-2 rounded-full bg-success" />
+                Connected as {server.username}
+              </span>
+            )}
+            {server.connecting && (
+              <span className="text-ui-meta text-muted-foreground">Connecting...</span>
+            )}
+            {server.error && <span className="text-ui-meta text-destructive">{server.error}</span>}
+          </div>
+          {savingServer && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                autoFocus
+                value={newServerName}
+                onChange={(e) => setNewServerName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") saveCurrentServer();
+                  if (e.key === "Escape") setSavingServer(false);
+                }}
+                placeholder={`Name this server`}
+                className="max-w-xs"
+              />
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={saveCurrentServer}
+                disabled={!newServerName.trim()}
+              >
+                Save
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setSavingServer(false)}>
+                Cancel
+              </Button>
+              <span className="text-ui-meta text-muted-foreground">
+                Saves the current host, port, and password so you can switch back later.
+              </span>
+            </div>
+          )}
+          <p className="text-ui-body text-muted-foreground">
+            Server connection settings. Saving will disconnect and reconnect with the new
+            credentials.
+          </p>
+        </section>
+      )}
+
+      {activeTab === "preferences" && (
+        <section>
+          <div
+            className={cn(
+              "grid gap-4 grid-cols-[repeat(auto-fit,minmax(min(100%,22rem),1fr))]",
+              shortTouch && "gap-3",
+            )}
+          >
+            <PreferenceCard title="Sounds" description="Mute or set the volume for all app sounds.">
+              <SoundControls />
+            </PreferenceCard>
+            <LanguagePreferenceCard />
+            <PreferenceCard
+              title={`Default Playmat`}
+              description={`Used in games when the deck you're playing has no custom playmat of its own.`}
+            >
+              <div className="group relative">
+                <button
+                  type="button"
+                  onClick={() => setPlaymatEditorOpen(true)}
+                  title={hasDefaultPlaymat ? `Customize playmat` : `Set playmat`}
+                  className={cn(
+                    "flex aspect-video w-full items-center justify-center overflow-hidden rounded-lg border bg-muted touch:min-h-11 touch:min-w-11 text-ui-label whitespace-normal",
+                    "motion-safe:transition-[border-color,box-shadow] hover:border-primary/40 hover:shadow-sm",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    !hasDefaultPlaymat && "border-dashed",
+                    isTouch && "h-24 aspect-auto",
+                  )}
+                >
+                  {defaultPlaymat ? (
+                    <img
+                      src={defaultPlaymat}
+                      alt={`Your default playmat`}
+                      crossOrigin="anonymous"
+                      className="size-full object-cover"
+                    />
+                  ) : prefs.defaultPlaymatSettings?.color ? (
+                    <span
+                      className="size-full"
+                      style={{ backgroundColor: prefs.defaultPlaymatSettings.color }}
+                      aria-hidden
+                    />
+                  ) : (
+                    <span className="flex size-12 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm motion-safe:transition-opacity opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 touch:opacity-100">
+                      <Plus className="h-6 w-6" />
+                    </span>
+                  )}
+                </button>
+                {hasDefaultPlaymat && (
+                  <span className="pointer-events-none absolute -bottom-2 -right-2 flex size-6 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm transition-colors group-hover:text-foreground">
+                    <Pencil className="h-3 w-3" />
+                  </span>
+                )}
+                {hasDefaultPlaymat && (
+                  <button
+                    type="button"
+                    title={`Remove playmat`}
+                    onClick={() => {
+                      void useAssetStore.getState().remove(prefs.defaultPlaymatAssetId);
+                      prefs.setDefaultPlaymatAssetId(undefined);
+                      prefs.setDefaultPlaymatSettings(undefined);
+                    }}
+                    className="absolute -top-2 -right-2 flex size-6 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm motion-safe:transition-opacity opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto touch:opacity-100 touch:pointer-events-auto hover:border-destructive hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring before:absolute before:-inset-2.5 before:content-[''] touch:min-h-11 touch:min-w-11 text-ui-label whitespace-normal"
+                  >
+                    <Minus className="h-3 w-3" />
+                  </button>
+                )}
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Battlefield Zone Column Order`}
+              description={`Controls placement of Library / Graveyard / Exile in the in-field zone column.`}
+            >
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,7rem),1fr))] gap-2">
+                {(["Top", "Middle", "Bottom"] as const).map((slot, index) => (
+                  <div key={slot} className="space-y-1">
+                    <Label
+                      htmlFor={`zone-order-${index}`}
+                      className="text-ui-label text-muted-foreground"
+                    >
+                      {slot}
+                    </Label>
+                    <AppSelect
+                      id={`zone-order-${index}`}
+                      value={zoneOrder[index]}
+                      onValueChange={(value) => setZoneSlot(index, value as ZonePanelItem)}
+                      className="min-h-9 w-full rounded-md border border-input bg-background px-2 text-ui-label touch:min-h-11"
+                    >
+                      <AppSelectOption value="library">Library</AppSelectOption>
+                      <AppSelectOption value="graveyard">Graveyard</AppSelectOption>
+                      <AppSelectOption value="exile">Exile</AppSelectOption>
+                    </AppSelect>
+                  </div>
+                ))}
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Card Size`}
+              value={`${Math.round(prefs.cardSizeMultiplier * 100)}%`}
+              description={`Scales cards on every battlefield and your hand fan. 100% is the classic 3-row board; battlefield cards cap at a 2-row fill so the board stays playable, while the hand keeps growing past them.`}
+            >
+              <div className="flex flex-wrap items-start gap-4">
+                <div className="flex-1 space-y-3">
+                  <input
+                    type="range"
+                    min={Math.round(CARD_SIZE_MULTIPLIER_MIN * 100)}
+                    max={Math.round(CARD_SIZE_MULTIPLIER_MAX * 100)}
+                    step={5}
+                    value={Math.round(prefs.cardSizeMultiplier * 100)}
+                    onChange={(e) => prefs.setCardSizeMultiplier(Number(e.target.value) / 100)}
+                    className="h-11 w-full accent-primary touch:min-h-11 touch:min-w-11"
+                  />
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      variant={
+                        prefs.cardSizeMultiplier === CARD_SIZE_MULTIPLIER_MIN
+                          ? "selected"
+                          : "outline"
+                      }
+                      size="sm"
+                      onClick={() => prefs.setCardSizeMultiplier(CARD_SIZE_MULTIPLIER_MIN)}
+                    >
+                      75%
+                    </Button>
+                    <Button
+                      variant={prefs.cardSizeMultiplier === 1 ? "selected" : "outline"}
+                      size="sm"
+                      onClick={() => prefs.setCardSizeMultiplier(1)}
+                    >
+                      100%
+                    </Button>
+                    <Button
+                      variant={
+                        prefs.cardSizeMultiplier === CARD_SIZE_MULTIPLIER_MAX
+                          ? "selected"
+                          : "outline"
+                      }
+                      size="sm"
+                      onClick={() => prefs.setCardSizeMultiplier(CARD_SIZE_MULTIPLIER_MAX)}
+                    >
+                      150%
+                    </Button>
+                  </div>
+                </div>
+                <div className="w-[120px] shrink-0 flex justify-center">
+                  <BattlefieldStylePreview
+                    style={prefs.battlefieldCardStyle}
+                    width={Math.round(
+                      48 +
+                        ((prefs.cardSizeMultiplier - CARD_SIZE_MULTIPLIER_MIN) /
+                          (CARD_SIZE_MULTIPLIER_MAX - CARD_SIZE_MULTIPLIER_MIN)) *
+                          72,
+                    )}
+                  />
+                </div>
+              </div>
+            </PreferenceCard>
+            <PreferenceCard
+              title={`Hand Ordering`}
+              description={`Drag cards sideways for a custom order, or keep every hand sorted automatically by color or mana value.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                {HAND_ORDER_OPTIONS.map((option) => (
+                  <Button
+                    key={option.value}
+                    variant={prefs.handOrderMode === option.value ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setHandOrderMode(option.value)}
+                  >
+                    {option.label}
+                  </Button>
+                ))}
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Battlefield Layout`}
+              description={`"Free placement" lets you drag cards anywhere. "Auto-arrange" keeps the battlefield tidy in rows (creatures, then others, then lands) and ignores manual placement.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant={!prefs.battlefieldAutoSort ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setBattlefieldAutoSort(false)}
+                >
+                  Free placement
+                </Button>
+                <Button
+                  variant={prefs.battlefieldAutoSort ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setBattlefieldAutoSort(true)}
+                >
+                  Auto-arrange
+                </Button>
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Zone Piles`}
+              description={`"Locked" keeps the deck, graveyard, exile, and command piles fixed on the battlefield so a drag can't move them. Tapping to open still works.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant={!prefs.lockZoneTiles ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setLockZoneTiles(false)}
+                >
+                  Movable
+                </Button>
+                <Button
+                  variant={prefs.lockZoneTiles ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setLockZoneTiles(true)}
+                >
+                  Locked
+                </Button>
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Battlefield Card Style`}
+              description={`Manabrew shows a composed card with current game information. Realistic shows the printed scan. Art-forward uses artwork with compact labels. This setting only affects battlefield cards.`}
+            >
+              <div className="flex flex-wrap items-start gap-4">
+                <div className="flex-1 flex flex-wrap content-start gap-2">
+                  <Button
+                    variant={prefs.battlefieldCardStyle === "realistic" ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setBattlefieldCardStyle("realistic")}
+                  >
+                    Realistic
+                  </Button>
+                  <Button
+                    variant={prefs.battlefieldCardStyle === "art" ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setBattlefieldCardStyle("art")}
+                  >
+                    Art-forward
+                  </Button>
+                  <Button
+                    variant={prefs.battlefieldCardStyle === "frame" ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setBattlefieldCardStyle("frame")}
+                  >
+                    Manabrew
+                  </Button>
+                </div>
+                <BattlefieldStylePreview style={prefs.battlefieldCardStyle} />
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`In-game Animations`}
+              description={`Decorative board effects \u2014 creature entrance stomp + dust, stat and damage pops, glow pulses. Turn these off to save performance on weaker hardware; the board still works (cards move, state indicators and damage numbers stay).`}
+            >
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant={prefs.inGameAnimations ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setInGameAnimations(true)}
+                >
+                  On
+                </Button>
+                <Button
+                  variant={!prefs.inGameAnimations ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setInGameAnimations(false)}
+                >
+                  Off
+                </Button>
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Preload Card Images`}
+              description={`Loads every card image of every deck before the game starts, so cards never appear blank mid-game. On a slow connection, it might be worth turning this off.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant={prefs.preloadCardImages ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setPreloadCardImages(true)}
+                >
+                  On
+                </Button>
+                <Button
+                  variant={!prefs.preloadCardImages ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setPreloadCardImages(false)}
+                >
+                  Off
+                </Button>
+              </div>
+            </PreferenceCard>
+
+            {isFeatureEnabled("ironsmithRuntime") && IRONSMITH_WASM_AVAILABLE && (
+              <PreferenceCard
+                title={`Ironsmith engine (experimental)`}
+                description={`Adds the experimental Ironsmith trusted engine as a Create Room option. Card support is partial and games may be rough \u2014 off by default. Leave this off unless you're testing Ironsmith.`}
+              >
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    variant={prefs.ironsmithRuntimeEnabled ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setIronsmithRuntimeEnabled(true)}
+                  >
+                    On
+                  </Button>
+                  <Button
+                    variant={!prefs.ironsmithRuntimeEnabled ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setIronsmithRuntimeEnabled(false)}
+                  >
+                    Off
+                  </Button>
+                </div>
+              </PreferenceCard>
+            )}
+
+            <PreferenceCard
+              title={`AI opponent`}
+              description={`Choose who pilots computer opponents in Forge-engine games. ManaBot is fast. Forge bot makes stronger decisions, but can take 10+ seconds per bot on large Commander boards. The Manabrew engine always uses ManaBot.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant={prefs.aiController === "manabot" ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setAiController("manabot")}
+                >
+                  ManaBot
+                </Button>
+                <Button
+                  variant={prefs.aiController === "forge" ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setAiController("forge")}
+                >
+                  Forge bot
+                </Button>
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Opponent layout`}
+              description={`Focus on one opponent, or keep every opponent field equally visible.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant={prefs.opponentLayout === "focused" ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setOpponentLayout("focused")}
+                >
+                  Focused
+                </Button>
+                <Button
+                  variant={prefs.opponentLayout === "overview" ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setOpponentLayout("overview")}
+                >
+                  Overview
+                </Button>
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Peer to Peer`}
+              description={`Skip manabrew servers and connect directly to the other players at the table. This shares your IP address with the people you play with, and only activates if every player in the game has it enabled.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant={prefs.directTransport ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setDirectTransport(true)}
+                >
+                  On
+                </Button>
+                <Button
+                  variant={!prefs.directTransport ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => prefs.setDirectTransport(false)}
+                >
+                  Off
+                </Button>
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Hand Card Style`}
+              description={`Manabrew cards show current game information. Realistic shows the printed scan. Each card can still be switched.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                {INLINE_CARD_STYLE_OPTIONS.map((option) => (
+                  <Button
+                    key={option.value}
+                    variant={prefs.handCardStyle === option.value ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setHandCardStyle(option.value)}
+                  >
+                    {option.label}
+                  </Button>
+                ))}
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Default Stack Card View`}
+              description={`Choose the initial Manabrew or Realistic view for stack cards. Switching views does not flip the card's front/back face.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                {INLINE_CARD_STYLE_OPTIONS.map((option) => (
+                  <Button
+                    key={option.value}
+                    variant={prefs.stackCardStyle === option.value ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setStackCardStyle(option.value)}
+                  >
+                    {option.label}
+                  </Button>
+                ))}
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Card Preview Style`}
+              description={`Manabrew shows current rules and game information. Realistic shows the printed scan. Front/back face selection stays independent.`}
+            >
+              <div className="flex flex-wrap gap-2">
+                {IN_GAME_CARD_PREVIEW_STYLE_OPTIONS.map((option) => (
+                  <Button
+                    key={option.value}
+                    variant={prefs.inGameCardPreviewStyle === option.value ? "selected" : "outline"}
+                    size="sm"
+                    onClick={() => prefs.setInGameCardPreviewStyle(option.value)}
+                  >
+                    {option.label}
+                  </Button>
+                ))}
+              </div>
+            </PreferenceCard>
+
+            <PreferenceCard
+              title={`Flash duration`}
+              value={`${flashDurationMs}ms`}
+              description={`Card-play and turn-start flash duration.`}
+            >
+              <input
+                type="range"
+                min={FLASH_MIN}
+                max={FLASH_MAX}
+                step={FLASH_STEP}
+                value={flashDurationMs}
+                onChange={(e) => setFlashDurationMs(Number(e.target.value))}
+                className="h-11 w-full accent-primary touch:min-h-11 touch:min-w-11"
+              />
+            </PreferenceCard>
+          </div>
+          {playmatEditorOpen && (
+            <PlaymatEditorModal
+              onClose={() => setPlaymatEditorOpen(false)}
+              title={`Default Playmat`}
+              playmat={defaultPlaymat}
+              storedSettings={prefs.defaultPlaymatSettings}
+              playmatAssetId={prefs.defaultPlaymatAssetId}
+              setPlaymat={(_url, assetId) => prefs.setDefaultPlaymatAssetId(assetId)}
+              setPlaymatSettings={prefs.setDefaultPlaymatSettings}
+            />
+          )}
+        </section>
+      )}
+
+      {activeTab === "theme" && (
+        <section className="space-y-4">
+          <h2 className="text-lg font-semibold">Theme</h2>
+
+          <div className="max-w-xl">
+            <div className="rounded-lg border bg-card/40 p-4 space-y-2">
+              <Label>App Theme</Label>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant={theme === "light" ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => setTheme("light")}
+                >
+                  Light
+                </Button>
+                <Button
+                  variant={theme === "dark" ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => setTheme("dark")}
+                >
+                  Dark
+                </Button>
+                <Button
+                  variant={theme === "system" ? "selected" : "outline"}
+                  size="sm"
+                  onClick={() => setTheme("system")}
+                >
+                  System
+                </Button>
+              </div>
+              <p className="text-ui-meta text-muted-foreground">Controls app theme preference.</p>
+            </div>
+          </div>
+
+          <div className="pt-2">
+            <Input
+              placeholder={`Filter colors... (e.g. primary, counter, arrow)`}
+              value={themeColorFilter}
+              onChange={(e) => setThemeColorFilter(e.target.value)}
+              className="max-w-sm"
+            />
+          </div>
+
+          <div className="space-y-3 pt-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label>App Theme Colors</Label>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  prefs.resetAppThemeColorOverrides(resolvedTheme === "light" ? "light" : "dark")
+                }
+                disabled={
+                  Object.keys(
+                    prefs.appThemeColorOverrides[resolvedTheme === "light" ? "light" : "dark"],
+                  ).length === 0
+                }
+              >
+                Reset Colors
+              </Button>
+            </div>
+            <div className="grid gap-4 grid-cols-[repeat(auto-fit,minmax(min(100%,22rem),1fr))]">
+              {APP_THEME_GROUPS.map((group) => {
+                const mode = resolvedTheme === "dark" ? "dark" : "light";
+                const q = themeColorFilter.toLowerCase();
+                const filteredKeys = q
+                  ? group.keys.filter(
+                      (k) =>
+                        k.toLowerCase().includes(q) ||
+                        (APP_THEME_COLOR_LABELS[k] ?? "").toLowerCase().includes(q) ||
+                        group.heading.toLowerCase().includes(q),
+                    )
+                  : group.keys;
+                if (filteredKeys.length === 0) return null;
+                return (
+                  <div key={group.heading} className="rounded-lg border bg-card/40 p-4 space-y-1.5">
+                    <div className="flex flex-wrap items-baseline gap-2">
+                      <h4 className="text-ui-meta font-semibold uppercase tracking-wider text-muted-foreground">
+                        {group.heading}
+                      </h4>
+                      <span className="text-ui-meta text-muted-foreground/70">
+                        {group.description}
+                      </span>
+                    </div>
+                    <div className="space-y-1">
+                      {filteredKeys.map((key) => {
+                        const defaultValue = MANABREW_THEME[mode][key];
+                        const activeValue = prefs.appThemeColorOverrides[mode][key] ?? defaultValue;
+                        return (
+                          <div
+                            key={key}
+                            className="flex flex-col gap-1 rounded-md border px-2 py-1.5 min-w-0"
+                          >
+                            <Label className="text-ui-label font-mono break-words flex items-start gap-1">
+                              <span>{APP_THEME_COLOR_LABELS[key] ?? key}</span>
+                              <HelpMark description={APP_THEME_COLOR_DESCRIPTIONS[key]} />
+                            </Label>
+                            <div className="flex items-center gap-2 min-w-0">
+                              <input
+                                type="color"
+                                aria-label={APP_THEME_COLOR_LABELS[key]}
+                                value={toPickerHexColor(activeValue)}
+                                onChange={(e) =>
+                                  prefs.setAppThemeColorOverride(
+                                    mode,
+                                    key,
+                                    formatThemeColor(
+                                      e.target.value,
+                                      parseThemeColor(activeValue)!.alpha,
+                                    ),
+                                  )
+                                }
+                                className="min-h-8 w-10 shrink-0 rounded border border-input bg-transparent p-0.5 touch:min-h-11 touch:w-11 touch:min-h-11 touch:min-w-11"
+                              />
+                              {editingThemeColorPath === `app.${key}` ? (
+                                <input
+                                  autoFocus
+                                  aria-label={`${APP_THEME_COLOR_LABELS[key]} value`}
+                                  value={editingThemeColorValue}
+                                  onChange={(e) => setEditingThemeColorValue(e.target.value)}
+                                  onBlur={() => commitThemeColorEdit(`app.${key}`, defaultValue)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter")
+                                      commitThemeColorEdit(`app.${key}`, defaultValue);
+                                    if (e.key === "Escape") {
+                                      setEditingThemeColorPath(null);
+                                      setEditingThemeColorValue("");
+                                    }
+                                  }}
+                                  className="min-h-7 min-w-0 flex-1 rounded border border-input bg-background px-1.5 text-right text-ui-input font-mono touch:min-h-11 touch:min-w-11"
+                                  spellCheck={false}
+                                />
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="flex-1 min-w-0 text-right text-ui-label font-mono text-muted-foreground hover:text-foreground underline-offset-2 hover:underline break-all touch:min-h-11 touch:min-w-11 whitespace-normal"
+                                  onClick={() => beginThemeColorEdit(`app.${key}`, activeValue)}
+                                  title={`Click to edit color value`}
+                                >
+                                  {activeValue}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <p className="text-ui-meta text-muted-foreground">
+              Override individual Manabrew colors for the current app mode.
+            </p>
+          </div>
+
+          <div className="space-y-3 pt-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label>Game Theme Colors</Label>
+              <Button size="sm" variant="outline" onClick={prefs.resetGameThemeColorOverrides}>
+                Reset Colors
+              </Button>
+            </div>
+            <div className="grid gap-4 grid-cols-[repeat(auto-fit,minmax(min(100%,22rem),1fr))]">
+              {(() => {
+                const allPaths = Object.keys(DEFAULT_GAME_THEME_COLOR_MAP);
+                const grouped = new Set<string>();
+                const groups = GAME_THEME_GROUPS.map((g) => {
+                  const keys: string[] = [];
+                  if (g.prefixes) {
+                    for (const prefix of g.prefixes) {
+                      for (const path of allPaths) {
+                        if (path.startsWith(prefix) && !grouped.has(path)) {
+                          keys.push(path);
+                          grouped.add(path);
+                        }
+                      }
+                    }
+                  }
+                  if (g.exactKeys) {
+                    for (const path of g.exactKeys) {
+                      if (path in DEFAULT_GAME_THEME_COLOR_MAP && !grouped.has(path)) {
+                        keys.push(path);
+                        grouped.add(path);
+                      }
+                    }
+                  }
+                  return { ...g, keys };
+                });
+                const miscKeys = allPaths.filter((p) => !grouped.has(p));
+                if (miscKeys.length > 0) {
+                  groups.push({
+                    heading: `Other`,
+                    get description() {
+                      return `Tokens not covered by the groups above.`;
+                    },
+                    keys: miscKeys,
+                  });
+                }
+                const q = themeColorFilter.toLowerCase();
+                return groups
+                  .map((g) => {
+                    const filtered = q
+                      ? g.keys.filter(
+                          (k) => k.toLowerCase().includes(q) || g.heading.toLowerCase().includes(q),
+                        )
+                      : g.keys;
+                    return { ...g, keys: filtered };
+                  })
+                  .filter((g) => g.keys.length > 0)
+                  .map((group) => (
+                    <div
+                      key={group.heading}
+                      className="rounded-lg border bg-card/40 p-4 space-y-1.5"
+                    >
+                      <div className="flex flex-wrap items-baseline gap-2">
+                        <h4 className="text-ui-meta font-semibold uppercase tracking-wider text-muted-foreground">
+                          {group.heading}
+                        </h4>
+                        <span className="text-ui-meta text-muted-foreground/70">
+                          {group.description}
+                        </span>
+                      </div>
+                      <div className="space-y-1">
+                        {group.keys.map((path) => {
+                          const defaultColor = DEFAULT_GAME_THEME_COLOR_MAP[path] ?? "";
+                          const activeColor = prefs.gameThemeColorOverrides[path] ?? defaultColor;
+                          return (
+                            <div
+                              key={path}
+                              className="flex flex-col gap-1 rounded-md border px-2 py-1.5 min-w-0"
+                            >
+                              <Label
+                                htmlFor={`theme-color-${path}`}
+                                className="text-ui-meta font-mono break-words flex items-start gap-1"
+                              >
+                                <span>{path}</span>
+                                <HelpMark
+                                  description={
+                                    GAME_THEME_COLOR_DESCRIPTIONS[path as GameThemeColorKey]
+                                  }
+                                />
+                              </Label>
+                              <div className="flex items-center gap-2 min-w-0">
+                                <input
+                                  id={`theme-color-${path}`}
+                                  type="color"
+                                  value={toPickerHexColor(activeColor)}
+                                  onChange={(e) =>
+                                    prefs.setGameThemeColorOverride(
+                                      path,
+                                      formatThemeColor(
+                                        e.target.value,
+                                        parseThemeColor(activeColor)!.alpha,
+                                      ),
+                                    )
+                                  }
+                                  className="min-h-8 w-10 shrink-0 rounded border border-input bg-transparent p-0.5 touch:min-h-11 touch:w-11 touch:min-h-11 touch:min-w-11"
+                                />
+                                {editingThemeColorPath === path ? (
+                                  <input
+                                    autoFocus
+                                    value={editingThemeColorValue}
+                                    onChange={(e) => setEditingThemeColorValue(e.target.value)}
+                                    onBlur={() => commitThemeColorEdit(path, defaultColor)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") {
+                                        commitThemeColorEdit(path, defaultColor);
+                                      }
+                                      if (e.key === "Escape") {
+                                        setEditingThemeColorPath(null);
+                                        setEditingThemeColorValue("");
+                                      }
+                                    }}
+                                    className="min-h-7 min-w-0 flex-1 rounded border border-input bg-background px-1.5 text-right text-ui-input font-mono touch:min-h-11 touch:min-w-11"
+                                    autoComplete="off"
+                                    autoCorrect="off"
+                                    autoCapitalize="off"
+                                    spellCheck={false}
+                                  />
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="flex-1 min-w-0 text-right text-ui-label font-mono text-muted-foreground hover:text-foreground underline-offset-2 hover:underline break-all touch:min-h-11 touch:min-w-11 whitespace-normal"
+                                    onClick={() => beginThemeColorEdit(path, activeColor)}
+                                    title={`Click to edit color value`}
+                                  >
+                                    {activeColor}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ));
+              })()}
+            </div>
+            <p className="text-ui-meta text-muted-foreground">
+              Generated from game theme keys. Defaults come from Manabrew.
+            </p>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}

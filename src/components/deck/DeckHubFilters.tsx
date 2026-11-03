@@ -1,0 +1,90 @@
+import { useState } from "react";
+import { PanelRightClose, PanelRightOpen } from "lucide-react";
+import { DeckHubFilterPanel } from "@/components/deck/DeckHubFilterPanel";
+import { DeckHubFilterSheet } from "@/components/deck/DeckHubFilterSheet";
+import type { DeckHubDiscoveryFilters } from "@/components/deck/deckHub.types";
+import type { DeckHubFacets } from "@/api/hubTypes";
+import { cn } from "@/lib/utils";
+import { useIsShortScreen, useIsTouch } from "@/hooks/useBreakpoints";
+interface DeckHubFiltersProps {
+  filters: DeckHubDiscoveryFilters;
+  facets: DeckHubFacets | null;
+  facetsLoading: boolean;
+  activeFilterCount: number;
+  favoritesEnabled: boolean;
+  onChange: (patch: Partial<DeckHubDiscoveryFilters>) => void;
+  onClear: () => void;
+  total: number;
+  loaded: boolean;
+}
+
+export function DeckHubFilters({ total, loaded, ...filterProps }: DeckHubFiltersProps) {
+  const [expanded, setExpanded] = useState(
+    () => sessionStorage.getItem("manabrew:community-filters-expanded") !== "false",
+  );
+  const shortScreen = useIsShortScreen();
+  const isTouch = useIsTouch();
+  const shortTouch = shortScreen && isTouch;
+  function toggleExpanded() {
+    setExpanded((current) => {
+      sessionStorage.setItem("manabrew:community-filters-expanded", String(!current));
+      return !current;
+    });
+  }
+  return (
+    <div
+      className={cn(
+        "shrink-0 transition-[width] lg:order-2 lg:border-l",
+        expanded ? "lg:w-80 xl:w-96" : "lg:w-16",
+        shortTouch && "lg:order-none lg:w-auto lg:border-l-0",
+      )}
+    >
+      <div
+        className={cn(
+          "flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3 sm:px-6 lg:hidden",
+          shortTouch && "py-1.5 lg:flex",
+        )}
+      >
+        <p className="text-ui-meta text-muted-foreground" aria-live="polite">
+          {loaded
+            ? `${total.toLocaleString()} ${total === 1 ? "publication" : "publications"}`
+            : "Loading publications…"}
+        </p>
+        <DeckHubFilterSheet {...filterProps} />
+      </div>
+      <aside
+        className={cn("hidden h-full overflow-y-auto p-3 lg:block", shortTouch && "lg:hidden")}
+        aria-label={`Community filters`}
+      >
+        <div
+          className={cn(
+            "flex items-start",
+            expanded ? "mb-4 justify-between gap-2" : "justify-center",
+          )}
+        >
+          {expanded && (
+            <div>
+              <h2 className="font-serif text-xl font-semibold">Filters</h2>
+              <p className="mt-1 text-ui-meta text-muted-foreground">
+                Refine published deck results.
+              </p>
+            </div>
+          )}
+          <button
+            type="button"
+            className="shrink-0 rounded-md p-2 text-muted-foreground hover:bg-muted hover:text-foreground touch:min-h-11 touch:min-w-11"
+            aria-label={expanded ? `Collapse filters` : `Expand filters`}
+            onClick={toggleExpanded}
+          >
+            {expanded ? (
+              <PanelRightClose className="h-4 w-4" />
+            ) : (
+              <PanelRightOpen className="h-4 w-4" />
+            )}
+          </button>
+        </div>
+        {expanded && <DeckHubFilterPanel {...filterProps} />}
+      </aside>
+    </div>
+  );
+}

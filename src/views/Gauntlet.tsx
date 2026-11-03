@@ -1,0 +1,241 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { useTopBarOverride } from "@/components/layout/TopBarOverride";
+import LimitedDeckBuilder from "@/components/limited/LimitedDeckBuilder";
+import { LimitedTableSurface } from "@/components/limited/LimitedTableSurface";
+import { LimitedSettingsButton } from "@/components/limited/LimitedSettingsButton";
+import { useGameStore } from "@/stores/useGameStore";
+import { useLimitedStore } from "@/stores/useLimitedStore";
+import { useLimitedBuildStore } from "@/components/limited/useLimitedBuildStore";
+import { useLimitedSessionSource } from "@/components/limited/useLimitedSavedSession";
+import { ROUTES } from "@/lib/constants";
+import {
+  arm as armGauntletReturn,
+  clear as clearGauntletReturn,
+  gauntletProgress,
+  gauntletScore,
+} from "@/lib/gauntletReturn";
+import { resolveDeckCards } from "@/lib/limited.utils";
+import type { DraftCard, GauntletMatchDecks } from "@/types/limited";
+import type { Deck, DeckFormat } from "@/protocol/deck";
+
+async function buildGauntletDeck(
+  name: string,
+  main: DraftCard[],
+  sideboard: DraftCard[],
+  format: DeckFormat,
+): Promise<Deck> {
+  const [cards, resolvedSideboard] = await Promise.all([
+    resolveDeckCards(main),
+    resolveDeckCards(sideboard),
+  ]);
+  return { name, format, cards, sideboard: resolvedSideboard };
+}
+
+export default function Gauntlet() {
+  const { gauntletId } = useParams<{ gauntletId: string }>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const activeGauntlet = useLimitedStore((state) => state.activeGauntlet);
+  const refresh = useLimitedStore((state) => state.refreshGauntletState);
+  const advanceRound = useLimitedStore((state) => state.advanceGauntletRound);
+  const fetchMatchDecks = useLimitedStore((state) => state.fetchGauntletMatchDecks);
+  const updateHumanDeck = useLimitedStore((state) => state.updateGauntletHumanDeck);
+  const lastError = useLimitedStore((state) => state.lastError);
+  const startGame = useGameStore((state) => state.startGame);
+  const [loadedDecks, setLoadedDecks] = useState<{
+    gauntletId: string;
+    decks: GauntletMatchDecks;
+  } | null>(null);
+  const matchDecks =
+    loadedDecks && loadedDecks.gauntletId === gauntletId ? loadedDecks.decks : null;
+  const [builtDeck, setBuiltDeck] = useState<{
+    gauntletId: string;
+    main: DraftCard[];
+    sideboard: DraftCard[];
+  } | null>(null);
+  const [launching, setLaunching] = useState(false);
+  const launched = useRef<string | null>(null);
+  const launchPending = useRef(false);
+  const gauntlet = activeGauntlet?.gauntletId === gauntletId ? activeGauntlet : null;
+  const currentRound = gauntlet?.currentRound;
+  const progress = gauntlet ? gauntletProgress(gauntlet) : null;
+  const sourceBuild = useLimitedBuildStore((state) =>
+    progress ? state.sessions[progress.sessionKey] : undefined,
+  );
+  const referenceFormat = useLimitedSessionSource(progress?.sessionKey ?? null);
+
+  useTopBarOverride({
+    onHome: () => navigate(ROUTES.PLAY),
+  });
+  useEffect(() => {
+    if (gauntletId && !gauntlet) void refresh(gauntletId);
+  }, [gauntletId, gauntlet, refresh]);
+  useEffect(() => {
+    if (!gauntletId || currentRound === undefined) return;
+    let active = true;
+    void fetchMatchDecks(gauntletId).then(
+      (decks) => {
+        if (active) setLoadedDecks({ gauntletId, decks });
+      },
+      (error: unknown) => {
+        if (active) toast.error(`Failed to load pool: ${String(error)}`);
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [gauntletId, currentRound, fetchMatchDecks]);
+
+  const play = useCallback(async () => {
+    if (
+      !gauntlet ||
+      !builtDeck ||
+      builtDeck.gauntletId !== gauntlet.gauntletId ||
+      builtDeck.main.length < 40 ||
+      launchPending.current
+    )
+      return;
+    launchPending.current = true;
+    setLaunching(true);
+    try {
+      await updateHumanDeck(gauntlet.gauntletId, builtDeck.main, builtDeck.sideboard);
+      const decks = await fetchMatchDecks(gauntlet.gauntletId);
+      const format = gauntlet.kind === "sealed" ? "sealed" : "draft";
+      const [human, opponent] = await Promise.all([
+        buildGauntletDeck(decks.humanDeckName, decks.humanMain, decks.humanSideboard, format),
+        buildGauntletDeck(
+          gauntlet.currentOpponent?.deckName ?? "Draft opponent",
+          decks.opponentMain,
+          decks.opponentSideboard,
+          format,
+        ),
+      ]);
+      await armGauntletReturn(gauntlet);
+      const started = startGame(human, format, undefined, [opponent], "Forge", gauntlet.gauntletId);
+      navigate(ROUTES.PLAY, { state: { exitTo: `/gauntlet/${gauntlet.gauntletId}` } });
+      if (!(await started)) {
+        await clearGauntletReturn();
+        navigate(`/gauntlet/${gauntlet.gauntletId}`, { replace: true });
+      }
+    } catch (error) {
+      await clearGauntletReturn();
+      toast.error(`Failed to launch game: ${String(error)}`);
+    } finally {
+      launchPending.current = false;
+      setLaunching(false);
+    }
+  }, [gauntlet, builtDeck, updateHumanDeck, fetchMatchDecks, startGame, navigate]);
+
+  useEffect(() => {
+    if (
+      !(location.state as { launch?: boolean } | null)?.launch ||
+      !builtDeck ||
+      builtDeck.gauntletId !== gauntletId ||
+      launched.current === gauntletId
+    )
+      return;
+    launched.current = gauntletId ?? null;
+    navigate(location.pathname, { replace: true, state: null });
+    void play();
+  }, [location.state, location.pathname, builtDeck, gauntletId, navigate, play]);
+
+  const advance = async () => {
+    if (!gauntletId || launching) return;
+    setLaunching(true);
+    try {
+      await advanceRound(gauntletId);
+    } catch (error) {
+      toast.error(`Failed to advance round: ${String(error)}`);
+    } finally {
+      setLaunching(false);
+    }
+  };
+
+  if (!gauntlet || !progress) {
+    return (
+      <LimitedTableSurface className="items-center justify-center overflow-y-auto overscroll-contain px-4 py-3 text-ui-body break-words text-muted-foreground sm:px-6 lg:px-8">
+        <p className="max-h-full shrink-0 overflow-y-auto">
+          {lastError ?? "Loading Limited session…"}
+        </p>
+      </LimitedTableSurface>
+    );
+  }
+  const score = gauntletScore(gauntlet);
+  return (
+    <LimitedTableSurface className="min-w-0 gap-2 px-4 py-3 text-ui-body sm:px-6 lg:px-8">
+      <header className="flex max-h-[40%] shrink-0 flex-wrap items-center justify-between gap-3 overflow-y-auto overscroll-contain rounded-md border border-border bg-card px-3 py-2">
+        <div className="min-w-0 flex-1 basis-64 break-words">
+          <p className="text-ui-label font-semibold">
+            Round {gauntlet.currentRound} of {gauntlet.rounds} · {score.wins}–{score.losses} · Best
+            of {progress.bestOf}
+          </p>
+          <p className="text-ui-meta text-muted-foreground">
+            {gauntlet.completed
+              ? "Session complete. Your pool and builds remain available."
+              : score.matchOver
+                ? "Match won. Adjust your build before the next opponent."
+                : `Against ${gauntlet.currentOpponent?.deckName ?? "AI"}. Edit your deck between games.`}
+          </p>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          {!gauntlet.completed &&
+            (score.matchOver ? (
+              <Button variant="primary" onClick={() => void advance()} disabled={launching}>
+                Next round
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                onClick={() => void play()}
+                disabled={
+                  launching ||
+                  !builtDeck ||
+                  builtDeck.gauntletId !== gauntletId ||
+                  builtDeck.main.length < 40
+                }
+              >
+                {launching
+                  ? "Launching…"
+                  : score.wins + score.losses > 0
+                    ? "Play next game"
+                    : "Play game"}
+              </Button>
+            ))}
+          <LimitedSettingsButton
+            sessionKey={progress.sessionKey}
+            quickPick={gauntlet.kind === "draft"}
+          />
+        </div>
+      </header>
+      <div className="min-h-0 min-w-0 flex-1">
+        {matchDecks ? (
+          <LimitedDeckBuilder
+            key={progress.sessionKey}
+            sessionKey={progress.sessionKey}
+            pool={sourceBuild?.pool ?? [...matchDecks.humanMain, ...matchDecks.humanSideboard]}
+            initialMain={matchDecks.humanMain}
+            initialSideboard={matchDecks.humanSideboard}
+            defaultDeckName={matchDecks.humanDeckName}
+            format={gauntlet.kind === "sealed" ? "sealed" : "draft"}
+            reviewSessionId={progress.sessionKey}
+            referenceFormat={referenceFormat}
+            onChange={(deck) => setBuiltDeck({ gauntletId: gauntlet.gauntletId, ...deck })}
+          />
+        ) : (
+          <p className="text-ui-body text-muted-foreground">Loading card pool…</p>
+        )}
+      </div>
+      {lastError && (
+        <p
+          className="max-h-[20%] shrink-0 overflow-y-auto overscroll-contain text-ui-label break-words text-destructive"
+          role="alert"
+        >
+          {lastError}
+        </p>
+      )}
+    </LimitedTableSurface>
+  );
+}

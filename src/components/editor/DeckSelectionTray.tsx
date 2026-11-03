@@ -1,0 +1,195 @@
+import {
+  ArrowDownToLine,
+  ArrowUpToLine,
+  Bookmark,
+  BookmarkMinus,
+  ChevronDown,
+  ClipboardCopy,
+  Images,
+  Minus,
+  Plus,
+  X,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+interface DeckSelectionTrayProps {
+  count: number;
+  tags: string[];
+  appliedTags: string[];
+  onMoveToMain: () => void;
+  onMoveToSide: () => void;
+  onMoveToMaybe: () => void;
+  onAddCopy: () => void;
+  onRemoveCopy: () => void;
+  onCopy: () => void;
+  onTag: (tag: string) => void;
+  onUntag: (tag: string) => void;
+  onPrinting: () => void;
+  onRemove: () => void;
+  onClear: () => void;
+}
+export function DeckSelectionTray({
+  count,
+  tags,
+  appliedTags,
+  onMoveToMain,
+  onMoveToSide,
+  onMoveToMaybe,
+  onAddCopy,
+  onRemoveCopy,
+  onCopy,
+  onTag,
+  onUntag,
+  onPrinting,
+  onRemove,
+  onClear,
+}: DeckSelectionTrayProps) {
+  return (
+    <section
+      className="z-50 max-h-[40%] min-w-0 shrink-0 overflow-y-auto border-t border-selection-border/30 bg-background/95 px-3 pb-[calc(var(--safe-area-inset-bottom)+0.75rem)] pt-2 shadow-lg backdrop-blur sm:px-4 sm:pb-2"
+      aria-label={`Actions for selected cards`}
+    >
+      <div className="mb-2 flex items-center sm:hidden">
+        <div className="min-w-0 flex-1 text-ui-label font-medium text-selection-border">
+          {count} card{count !== 1 ? "s" : ""} selected
+        </div>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="touch:min-w-11 touch:min-h-11 min-h-9"
+          onClick={onClear}
+        >
+          Clear
+        </Button>
+      </div>
+      <div className="flex items-center gap-2 overflow-x-auto pb-1 sm:flex-wrap sm:overflow-visible sm:pb-0">
+        <div className="mr-2 hidden sm:block">
+          <div className="text-ui-label font-medium text-selection-border">
+            {count} card{count !== 1 ? "s" : ""} selected
+          </div>
+          <div className="text-ui-meta text-muted-foreground">Bulk editor</div>
+        </div>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              size="sm"
+              variant="outline"
+              className="touch:min-w-11 touch:min-h-11 min-h-10 shrink-0"
+            >
+              <ArrowUpToLine className="mr-1 h-3 w-3" /> Move
+              <ChevronDown className="ml-1 h-3 w-3 opacity-60" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start">
+            <DropdownMenuItem onSelect={onMoveToMain}>
+              <ArrowUpToLine className="mr-2 h-3.5 w-3.5" /> Main deck
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onMoveToSide}>
+              <ArrowDownToLine className="mr-2 h-3.5 w-3.5" /> Sideboard
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onMoveToMaybe}>Maybeboard</DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              size="sm"
+              variant="outline"
+              className="touch:min-w-11 touch:min-h-11 min-h-10 shrink-0"
+            >
+              Quantity <ChevronDown className="ml-1 h-3 w-3 opacity-60" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start">
+            <DropdownMenuItem onSelect={onAddCopy}>
+              <Plus className="mr-2 h-3.5 w-3.5" /> Add one each
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onRemoveCopy}>
+              <Minus className="mr-2 h-3.5 w-3.5" /> Remove one each
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        {tags.length > 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                size="sm"
+                variant="outline"
+                className="touch:min-w-11 touch:min-h-11 min-h-10 shrink-0"
+              >
+                <Bookmark className="mr-1 h-3 w-3" /> Tag
+                <ChevronDown className="ml-1 h-3 w-3 opacity-60" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {tags.map((tag) => (
+                <DropdownMenuItem key={tag} onSelect={() => onTag(tag)}>
+                  <Bookmark className="mr-2 h-3 w-3 text-primary/60" /> {tag}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {appliedTags.length > 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                size="sm"
+                variant="outline"
+                className="touch:min-w-11 touch:min-h-11 min-h-10 shrink-0"
+              >
+                <BookmarkMinus className="mr-1 h-3 w-3" /> Untag
+                <ChevronDown className="ml-1 h-3 w-3 opacity-60" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {appliedTags.map((tag) => (
+                <DropdownMenuItem key={tag} onSelect={() => onUntag(tag)}>
+                  <BookmarkMinus className="mr-2 h-3 w-3 text-destructive" /> {tag}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        <Button
+          size="sm"
+          variant="outline"
+          className="touch:min-w-11 touch:min-h-11 min-h-10 shrink-0"
+          onClick={onPrinting}
+        >
+          <Images className="mr-1 h-3 w-3" /> Printing
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="touch:min-w-11 touch:min-h-11 min-h-10 shrink-0"
+          onClick={onCopy}
+        >
+          <ClipboardCopy className="mr-1 h-3 w-3" /> Copy
+        </Button>
+        <div className="flex-1" />
+        <Button
+          size="sm"
+          variant="destructive-quiet"
+          className="touch:min-w-11 touch:min-h-11 min-h-10 shrink-0"
+          onClick={onRemove}
+        >
+          <X className="mr-1 h-3 w-3" /> Remove
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="touch:min-w-11 touch:min-h-11 hidden sm:inline-flex"
+          onClick={onClear}
+        >
+          Clear
+        </Button>
+      </div>
+    </section>
+  );
+}

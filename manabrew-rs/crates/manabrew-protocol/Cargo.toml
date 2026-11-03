@@ -1,0 +1,17 @@
+[package]
+name = "manabrew-protocol"
+version = "6.4.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+homepage = "https://docs.manabrew.app/protocol/"
+documentation = "https://docs.rs/manabrew-protocol"
+description = "Engine-free game DTOs shared by manabrew clients"
+
+[dependencies]
+forge-foundation = { path = "../forge-foundation", version = "0.7.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+ts-rs = { workspace = true }
+strum_macros = "0.28.0"
