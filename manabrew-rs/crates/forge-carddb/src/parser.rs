@@ -265,11 +265,16 @@ impl CardScriptParser {
                 }
             }
             Some(b'V') if key == "Variant" => {
-                if let Some(val) = value {
-                    let variant_colon = val.find(':');
-                    if let Some(pos) = variant_colon {
-                        let _variant_name = &val[..pos];
-                        let _variant_line = &val[pos + 1..];
+                if let Some((variant_name, variant_line)) = value_str.split_once(':') {
+                    if let Some(flavor_name) = variant_line.strip_prefix("FlavorName:") {
+                        self.ensure_face(face_idx);
+                        if let Some(face) = &mut self.faces[face_idx] {
+                            let face_name = face.name.clone();
+                            face.functional_variants
+                                .entry(variant_name.to_string())
+                                .or_insert_with(|| CardFace::new(face_name))
+                                .flavor_name = Some(flavor_name.trim().to_string());
+                        }
                     }
                 }
             }

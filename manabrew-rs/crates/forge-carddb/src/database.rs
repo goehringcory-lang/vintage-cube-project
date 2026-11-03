@@ -323,6 +323,9 @@ impl CardDatabase {
             if !card.name_lower.as_str().is_ascii() {
                 cards.add_normalized_name(card.display_name());
             }
+            for alias in variant_flavor_names(card.raw.as_str()) {
+                cards.register_flavor_alias(alias, card.name_lower.as_str());
+            }
         }
         let cards_result = LoadResult {
             loaded: archive.cards.len(),
@@ -401,16 +404,15 @@ impl CardDatabase {
 
     fn register_flavor_aliases_for_card(&mut self, card: &CardRules) {
         let canonical = card.name();
-        if let Some(alias) = &card.main_part.flavor_name {
-            self.register_flavor_alias(alias, &canonical);
-        }
-        if let Some(other) = &card.other_part {
-            if let Some(alias) = &other.flavor_name {
-                self.register_flavor_alias(alias, &canonical);
-            }
-        }
-        for face in card.specialized_parts.values() {
-            if let Some(alias) = &face.flavor_name {
+        let faces = std::iter::once(&card.main_part)
+            .chain(card.other_part.as_ref())
+            .chain(card.specialized_parts.values());
+        for face in faces {
+            let variants = face.functional_variants.values();
+            for alias in std::iter::once(face)
+                .chain(variants)
+                .filter_map(|f| f.flavor_name.as_deref())
+            {
                 self.register_flavor_alias(alias, &canonical);
             }
         }
@@ -523,6 +525,17 @@ impl CardDatabase {
             }
         }
     }
+}
+
+fn variant_flavor_names(raw: &str) -> impl Iterator<Item = &str> {
+    raw.contains(":FlavorName:")
+        .then(|| raw.lines())
+        .into_iter()
+        .flatten()
+        .filter_map(|line| line.strip_prefix("Variant:"))
+        .filter_map(|variant| variant.split_once(':'))
+        .filter_map(|(_, line)| line.strip_prefix("FlavorName:"))
+        .map(str::trim)
 }
 
 fn normalized_name_key(name: &str) -> String {

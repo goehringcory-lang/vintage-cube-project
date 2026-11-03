@@ -1,12 +1,13 @@
 import { useId } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MTGO_VINTAGE_CUBE_ID } from "@/api/limitedEdition";
 import type { CubeImportResult } from "@/types/limited";
 
 interface LimitedCubeSourceProps {
   input: string;
   onInputChange: (s: string) => void;
-  onImport: () => void | Promise<void>;
+  onImport: (cubeIdOrUrl?: string) => void | Promise<void>;
   onLoadFile: (file: File) => void | Promise<void>;
   cube: CubeImportResult | null;
   busy: boolean;
@@ -47,6 +48,15 @@ export function LimitedCubeSource({
             {busy ? "Importing…" : "Import Cube"}
           </Button>
         </div>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          disabled={busy}
+          onClick={() => void onImport(MTGO_VINTAGE_CUBE_ID)}
+        >
+          Use MTGO Vintage Cube
+        </Button>
       </div>
       <div className="space-y-2">
         <label htmlFor={`${id}-file`} className="block text-ui-label font-medium text-foreground">

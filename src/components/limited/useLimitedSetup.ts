@@ -150,10 +150,12 @@ export function useLimitedSetup(selectedCode: string, selectedVariant: string) {
       },
     });
   };
-  const onImport = async () => {
-    if (!cubeInput.trim()) return;
+  const onImport = async (cubeIdOrUrl = cubeInput) => {
+    const input = cubeIdOrUrl.trim();
+    if (!input) return;
+    setCubeInput(input);
     try {
-      const result = await importCube(cubeInput.trim());
+      const result = await importCube(input);
       setNumBoosters(Math.max(3, Math.min(12, result.numPacks)));
     } catch (error) {
       useLimitedStore.setState({ lastError: String(error) });
