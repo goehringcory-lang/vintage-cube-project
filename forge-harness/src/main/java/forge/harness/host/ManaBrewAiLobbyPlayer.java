@@ -6,6 +6,8 @@ import forge.game.Game;
 import forge.game.player.Player;
 import forge.game.player.PlayerController;
 import forge.game.spellability.SpellAbility;
+import forge.localinstance.properties.ForgePreferences.FPref;
+import forge.model.FModel;
 
 import java.util.List;
 
@@ -15,6 +17,7 @@ public final class ManaBrewAiLobbyPlayer extends LobbyPlayerAi {
     public ManaBrewAiLobbyPlayer(final String name, final ManaBrewInteractiveSession session) {
         super(name, null);
         this.session = session;
+        setAiProfile(FModel.getPreferences().getPref(FPref.UI_CURRENT_AI_PROFILE));
     }
 
     @Override
