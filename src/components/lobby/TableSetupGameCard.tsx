@@ -11,7 +11,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LimitedPickClockSetting } from "@/components/limited/LimitedPickClockSetting";
-import { fetchCubeMetadata } from "@/api/limitedEdition";
+import { fetchCubeMetadata, MTGO_VINTAGE_CUBE_ID } from "@/api/limitedEdition";
 import { FormatBadge } from "@/components/game/FormatBadge";
 import {
   FORMATS,
@@ -92,12 +92,14 @@ export function TableSetupGameCard({
   const [cubeInput, setCubeInput] = useState("");
   const [importingCube, setImportingCube] = useState(false);
   const [cubeImportError, setCubeImportError] = useState<string | null>(null);
-  async function handleImportCube() {
-    if (!cubeInput.trim()) return;
+  async function handleImportCube(cubeIdOrUrl = cubeInput) {
+    const input = cubeIdOrUrl.trim();
+    if (!input) return;
+    setCubeInput(input);
     setImportingCube(true);
     setCubeImportError(null);
     try {
-      const result = await fetchCubeMetadata(cubeInput.trim());
+      const result = await fetchCubeMetadata(input);
       onCubeImported(result);
       if (isSealed) {
         onSealedNumBoostersChange(Math.max(1, Math.min(12, result.numPacks)));
@@ -289,7 +291,7 @@ export function TableSetupGameCard({
                 type="button"
                 size="sm"
                 variant="outline"
-                onClick={handleImportCube}
+                onClick={() => void handleImportCube()}
                 disabled={importingCube || !cubeInput.trim()}
                 className="gap-1.5"
               >
@@ -301,6 +303,15 @@ export function TableSetupGameCard({
                 {importingCube ? `Importing\u2026` : `Import`}
               </Button>
             </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              onClick={() => void handleImportCube(MTGO_VINTAGE_CUBE_ID)}
+              disabled={importingCube}
+            >
+              Use MTGO Vintage Cube
+            </Button>
             {importedCube && (
               <p className="text-ui-meta text-muted-foreground">
                 Loaded: <span className="text-foreground/90">{importedCube.name}</span> —{""}

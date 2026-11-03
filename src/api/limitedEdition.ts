@@ -77,10 +77,21 @@ export function friendlyCubeError(err: unknown, input: string): string {
   return msg.length > 200 ? `${msg.slice(0, 197)}…` : msg;
 }
 
+export const MTGO_VINTAGE_CUBE_ID = "mtgo-vintage-cube";
+
+async function fetchCubeBody(cubeIdOrUrl: string): Promise<string> {
+  if (cubeIdOrUrl === MTGO_VINTAGE_CUBE_ID) {
+    const r = await fetch(`/cubes/${MTGO_VINTAGE_CUBE_ID}.dck`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.text();
+  }
+  const url = await getPlatform().invoke<string>("limited_cubecobra_url", { cubeIdOrUrl });
+  return platformFetchText(url);
+}
+
 async function importCubeRaw(cubeIdOrUrl: string): Promise<CubeImportResult> {
   const platform = getPlatform();
-  const url = await platform.invoke<string>("limited_cubecobra_url", { cubeIdOrUrl });
-  const body = await platformFetchText(url);
+  const body = await fetchCubeBody(cubeIdOrUrl);
   return platform.invoke<CubeImportResult>("limited_import_cube", {
     request: { cubeIdOrUrl },
     body,
