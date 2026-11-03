@@ -78,12 +78,8 @@ impl CubeImporter {
 fn parse_cube_id(input: &str, platform: CubeHostingPlatform) -> Result<String, String> {
     let id = match platform {
         CubeHostingPlatform::CubeCobra => {
-            let last = input
-                .trim()
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or("");
+            let path = input.trim().split(['?', '#']).next().unwrap_or("");
+            let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
             last.to_string()
         }
         CubeHostingPlatform::CubeArtisan => {

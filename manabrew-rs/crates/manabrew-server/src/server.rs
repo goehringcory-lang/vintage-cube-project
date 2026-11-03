@@ -226,14 +226,11 @@ fn uptime_secs() -> u64 {
 }
 
 fn mask_key(key: &str) -> String {
-    if key.len() <= 2 {
-        "*".repeat(key.len())
-    } else {
-        format!(
-            "{}{}{}",
-            &key[..1],
-            "*".repeat(key.len() - 2),
-            &key[key.len() - 1..]
-        )
+    let chars: Vec<char> = key.chars().collect();
+    match chars.as_slice() {
+        [first, middle @ .., last] if !middle.is_empty() => {
+            format!("{first}{}{last}", "*".repeat(middle.len()))
+        }
+        _ => "*".repeat(chars.len()),
     }
 }

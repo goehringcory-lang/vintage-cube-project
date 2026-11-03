@@ -32,6 +32,28 @@
 		header Cross-Origin-Resource-Policy "same-origin"
 	}
 
+	@static path /assets/*
+	handle @static {
+		header {
+			Cache-Control "public, immutable, max-age=31536000"
+			Cross-Origin-Opener-Policy "same-origin"
+			Cross-Origin-Embedder-Policy "require-corp"
+			Cross-Origin-Resource-Policy "same-origin"
+		}
+		file_server
+	}
+
+	@spellbook path_regexp spellbook ^/spellbook-api/(.*)$
+	handle @spellbook {
+		rewrite * /{re.spellbook.1}
+		reverse_proxy https://backend.commanderspellbook.com {
+			header_up Host backend.commanderspellbook.com
+			header_up -X-Forwarded-Host
+			header_down -Access-Control-Allow-Origin
+		}
+		header Cross-Origin-Resource-Policy "same-origin"
+	}
+
 	@cubecobra path_regexp cubecobra ^/cubecobra-download/cube/download/forge/([A-Za-z0-9-]+)$
 	handle @cubecobra {
 		rewrite * /cube/download/forge/{re.cubecobra.1}

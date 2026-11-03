@@ -140,6 +140,9 @@ pub fn resume_room_sync(
     player_id: &str,
     spec: ResumeRoomRequest,
 ) -> Result<ResumedRoom, ServerError> {
+    if uuid::Uuid::parse_str(&spec.room_id).is_err() {
+        return Err(ServerError::RoomNotFound(spec.room_id));
+    }
     let (username, current_room_id) = {
         let player = state
             .players
