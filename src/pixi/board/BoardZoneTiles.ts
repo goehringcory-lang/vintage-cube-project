@@ -689,7 +689,9 @@ export class BoardZoneTiles {
     for (const spec of this.specs) {
       const tile = this.tiles.get(spec.key);
       const pos = this.placements.get(spec.key);
-      if (!tile || !pos) continue;
+      if (!tile) continue;
+      tile.container.visible = !!pos;
+      if (!pos) continue;
       if (this.drag?.tile !== tile) tile.container.position.set(pos.x, pos.y);
       tile.container.hitArea = new Rectangle(-padX, -padY, cardW + padX * 2, cardH + padY * 2);
       const hl = spec.highlightColor ? hexToNum(spec.highlightColor) : null;

@@ -1,5 +1,14 @@
 import { UI_FONT_FAMILY } from "@/themes/typography";
-import { Application, Container, Graphics, Point, Text, type FederatedPointerEvent } from "pixi.js";
+import {
+  Application,
+  Container,
+  FillGradient,
+  Graphics,
+  Point,
+  Text,
+  type FederatedPointerEvent,
+} from "pixi.js";
+import { withAlpha } from "@/themes/gameTheme";
 import { isCardPreviewTarget } from "@/lib/cardPreviewEvents";
 import type { CardDto, PlaymatSettings } from "@/protocol/game";
 import type { AttackTargetDto, TargetRef } from "@/protocol/prompts/common";
@@ -21,12 +30,20 @@ import {
   type PhaseStripCallbacks,
   type PhaseStripState,
 } from "../PhaseStripLayer";
+import { PhaseArcLayer } from "../PhaseArcLayer";
 import { DragHandler } from "../DragHandler";
 import { dropCellFromPoint, type GridCell } from "../GridLayout";
 import { prewarmManaSymbols } from "../manaSymbolCache";
 import { lerp, setFrameRatio } from "./pixiHelpers";
 import { BattlefieldDividers } from "./BattlefieldDividers";
 import { DELIMITER_EASE } from "./boardLayout";
+import {
+  TABLETOP_STAGE,
+  tabletopOpponentHandScale,
+  tabletopStage,
+  type TabletopStage,
+} from "./tabletopStage";
+import { MEDALLION_BOX } from "../hud/PlayerHudCapsule";
 import { animationsEnabled } from "../effects/enabled";
 import { LongPressGesture } from "../LongPressGesture";
 import { PREVIEW_TIMING, type PreviewPointerInput } from "@/lib/cardPreview";
@@ -117,6 +134,7 @@ export class BoardScene {
   private theme: Theme;
   private root: Container;
   private collapseVeil: Graphics;
+  private backdrop: Graphics;
   private canvasW = 0;
   private canvasH = 0;
   private canvasDomRect: DOMRect | null = null;
@@ -180,6 +198,7 @@ export class BoardScene {
   private unassignDrag: { cardId: string; region: BoardRegion; overOwn: boolean } | null = null;
   private phaseStripAlphaTarget = 1;
   private stripBandPx = STRIP_BAND_PX;
+  private tabletop: TabletopStage | null = null;
   private readonly presentation: BoardScenePresentation;
   private tapSuppressedPointers = new Set<number>();
 
@@ -189,6 +208,7 @@ export class BoardScene {
   private overlay: BattlefieldOverlay | null = null;
   private dragHandler: DragHandler;
   private phaseStrip: PhaseStripLayer;
+  private phaseArc: PhaseArcLayer;
   private overview = false;
   private focusLocked = false;
 
@@ -280,6 +300,11 @@ export class BoardScene {
     this.dragHandler = new DragHandler();
     this.presentation.initializeHand(this.root, this.callbacks, this.app);
 
+    this.backdrop = new Graphics();
+    this.backdrop.eventMode = "none";
+    this.backdrop.zIndex = 1;
+    this.root.addChild(this.backdrop);
+
     this.collapseVeil = new Graphics();
     this.collapseVeil.eventMode = "none";
     this.collapseVeil.zIndex = 5550;
@@ -304,6 +329,10 @@ export class BoardScene {
     this.phaseStrip.onExpandedChange = () => this.refreshPhaseStripDim();
     this.presentation.configurePhaseStrip(this.phaseStrip);
     this.root.addChild(this.phaseStrip.container);
+
+    this.phaseArc = new PhaseArcLayer(this.theme);
+    this.phaseArc.container.zIndex = 7000;
+    this.root.addChild(this.phaseArc.container);
 
     this.combatGuestLayer = new Container();
     this.combatGuestLayer.sortableChildren = true;
@@ -416,6 +445,10 @@ export class BoardScene {
     if (this.destroyed) return;
     this.cardScale = scales.self;
     this.overview = layout.opponentLayout === "overview";
+    this.tabletop = layout.tabletop
+      ? tabletopStage(this.app.renderer.width, this.app.renderer.height)
+      : null;
+    const tabletopCenterX = this.tabletop ? this.tabletop.x + this.tabletop.width / 2 : null;
     const seen = new Set<string>();
     let oppIndex = 0;
 
@@ -431,6 +464,7 @@ export class BoardScene {
       if (existing) {
         existing.zone = zone;
         existing.region.container.zIndex = zIndex;
+        existing.region.setTabletop(tabletopCenterX);
         existing.region.setOverviewMode(this.overview && !spec.isLocal);
         existing.region.setCombatRowReserved(combatRowReserved);
         existing.region.setZone(zone, orientation);
@@ -446,6 +480,7 @@ export class BoardScene {
         regionScale,
         { orientation, combatRowReserved, presentation: this.presentation.region },
       );
+      region.setTabletop(tabletopCenterX);
       region.setPlaymatSettings(spec.playmatSettings);
       region.setOverviewMode(this.overview && !spec.isLocal);
       region.setPlaymat(spec.playmat);
@@ -486,6 +521,9 @@ export class BoardScene {
       if (this.localPlayerId === id) this.localPlayerId = null;
     }
 
+    this.hand?.setTabletop(this.tabletop?.scale ?? null);
+    this.drawBackdrop();
+    this.playerBars.setMedallion(this.tabletop !== null);
     this.positionPhaseStrip(layout);
     this.dragHandler.setCardScale(scales.self);
     this.dragHandler.setContainerSize(this.app.renderer.width, this.app.renderer.height);
@@ -609,11 +647,89 @@ export class BoardScene {
     if (changed) this.applyDelimiters();
   }
 
+  private drawBackdrop(): void {
+    this.backdrop.clear();
+    const stage = this.tabletop;
+    if (!stage) return;
+    const shadow = this.theme.gameTheme.canvas.shadow;
+    const width = this.app.renderer.width;
+    const height = this.app.renderer.height;
+    this.backdrop.rect(0, 0, width, height);
+    this.backdrop.fill({ color: hexToNum(shadow), alpha: TABLETOP_STAGE.backdropDarken });
+    this.backdrop.rect(stage.x, stage.y, stage.width, stage.height);
+    this.backdrop.fill(
+      new FillGradient({
+        type: "radial",
+        center: { x: 0.5, y: 0.48 },
+        innerRadius: 0.4,
+        outerCenter: { x: 0.5, y: 0.48 },
+        outerRadius: 0.75,
+        textureSpace: "local",
+        colorStops: [
+          { offset: 0, color: withAlpha(shadow, 0) },
+          { offset: 1, color: withAlpha(shadow, 0.45) },
+        ],
+      }),
+    );
+    if (stage.x > 0) {
+      this.backdrop.rect(0, 0, stage.x, height).rect(stage.x + stage.width, 0, stage.x, height);
+      this.backdrop.fill({ color: hexToNum(shadow), alpha: 0.6 });
+    }
+    if (stage.y > 0) {
+      this.backdrop.rect(0, 0, width, stage.y).rect(0, stage.y + stage.height, width, stage.y);
+      this.backdrop.fill({ color: hexToNum(shadow), alpha: 0.6 });
+    }
+  }
+
+  private placeMedallion(playerId: string, centerY: number, depth: number): void {
+    const stage = this.tabletop;
+    if (!stage) return;
+    const unit = stage.scale * depth;
+    const width = MEDALLION_BOX.width * unit;
+    const height = MEDALLION_BOX.height * unit;
+    this.playerBars.setRect(
+      playerId,
+      stage.x + stage.width / 2 - width / 2,
+      stage.y + centerY * stage.scale - MEDALLION_BOX.avatarCenterY * unit,
+      width,
+      height,
+      false,
+    );
+  }
+
+  private applyTabletopOpponents(): void {
+    const stage = this.tabletop!;
+    this.dividers.clear();
+    for (const id of this.opponentIds) {
+      const rec = this.regions.get(id);
+      if (!rec) continue;
+      rec.region.setClip(null, null);
+      this.opponentHands
+        .get(id)
+        ?.setBand(
+          stage.x,
+          stage.y,
+          stage.width,
+          rec.zone.height,
+          true,
+          tabletopOpponentHandScale(stage),
+        );
+      if (this.barsEnabled) {
+        this.placeMedallion(id, TABLETOP_STAGE.opponentAvatarCenterY, TABLETOP_STAGE.opponentScale);
+      }
+    }
+  }
+
   private applyDelimiters(): void {
     this.layoutSelfBar();
     const n = this.opponentIds.length;
     const W = this.boardWidth;
     if (n <= 0 || W <= 0) return;
+    this.collapseVeil.clear();
+    if (this.tabletop) {
+      this.applyTabletopOpponents();
+      return;
+    }
     const playerHudHeight = this.presentation.opponentHudHeight;
     this.collapseVeil.clear();
     if (this.overview) {
@@ -685,6 +801,10 @@ export class BoardScene {
 
   private layoutSelfBar(): void {
     if (!this.barsEnabled || !this.localPlayerId) return;
+    if (this.tabletop) {
+      this.placeMedallion(this.localPlayerId, TABLETOP_STAGE.avatarCenterY, 1);
+      return;
+    }
     const record = this.regions.get(this.localPlayerId);
     if (!record) return;
     const field = record.region.getPlaymatRect();
@@ -923,6 +1043,18 @@ export class BoardScene {
     this.phaseStrip.container.x = layout.self.x;
     this.phaseStrip.container.y = layout.dividerY - this.stripBandPx / 2;
     this.phaseStrip.resize(layout.self.width, this.stripBandPx);
+    const stage = this.tabletop;
+    this.phaseArc.container.visible = stage !== null;
+    if (stage) {
+      this.phaseStrip.container.visible = false;
+      this.phaseArc.place(
+        stage.x + stage.width / 2,
+        stage.y + TABLETOP_STAGE.avatarCenterY * stage.scale,
+        stage.scale,
+      );
+    } else {
+      this.presentation.configurePhaseStrip(this.phaseStrip);
+    }
   }
 
   private localRegion(): BoardRegion | null {
@@ -1223,10 +1355,12 @@ export class BoardScene {
 
   setPhaseStripState(state: PhaseStripState): void {
     this.phaseStrip.update(state);
+    this.phaseArc.update(state);
   }
 
   setPhaseStripCallbacks(cb: PhaseStripCallbacks): void {
     this.phaseStrip.setCallbacks(cb);
+    this.phaseArc.setCallbacks(cb);
   }
   setPhaseDividerVisible(visible: boolean): void {
     this.phaseStrip.setDividerVisible(visible);
@@ -1347,6 +1481,7 @@ export class BoardScene {
     setCardSpriteTheme(theme);
     this.hand?.restyle();
     this.phaseStrip.setTheme(theme);
+    this.phaseArc.setTheme(theme);
     this.playerBars.setTheme(theme);
     for (const rec of this.regions.values()) rec.region.redrawTheme();
     this.applyDelimiters(); // repaint the collapse veil in the new theme colour
@@ -1574,6 +1709,10 @@ export class BoardScene {
   private makeHandHost(): HandHost {
     return {
       getPlayZone: () => {
+        if (this.tabletop) {
+          const { x, y, width, height } = this.tabletop;
+          return { x, y, width, height };
+        }
         const zone = this.localZone();
         if (!zone) return { x: 0, y: 0, width: 0, height: 0 };
         const hudField =
@@ -2448,6 +2587,7 @@ export class BoardScene {
     try {
       this.dragHandler.destroy();
       this.phaseStrip.destroy();
+      this.phaseArc.destroy();
       this.playerBars.destroy();
       this.hand?.destroy();
       for (const fan of this.opponentHands.values()) fan.destroy();

@@ -15,7 +15,7 @@ import {
   type GridCell,
   type GridLayoutInfo,
 } from "../GridLayout";
-import { CARD_W, CARD_H } from "@/components/game/game.constants";
+import { CARD_W, CARD_H, ZONE_TILE_KEY } from "@/components/game/game.constants";
 import { hexToNum } from "../colorUtils";
 import { getFrameRatio, lerp, safeDestroy } from "./pixiHelpers";
 import { playStomp } from "../effects/stomp";
@@ -75,6 +75,7 @@ import type { BlockingRect, RegionHost, SceneCombatStaging, SpriteEntry } from "
 import { COLLAPSED_OPPONENT_WIDTH_PX, type RegionOrientation } from "./boardLayout";
 import { PlaymatLayer, playmatInset } from "./PlaymatLayer";
 import { CombatRowRenderer } from "./CombatRowRenderer";
+import { TABLETOP_STAGE } from "./tabletopStage";
 import { isCoarsePointer } from "@/lib/responsive";
 
 const COARSE_POINTER = isCoarsePointer();
@@ -101,6 +102,9 @@ interface BoardRegionOptions {
 }
 
 const ENTRANCE_LAND_PX = 8;
+const TABLETOP_GROUP_STEP = (12 * CARD_W) / TABLETOP_STAGE.battlefieldCardWidth;
+const TABLETOP_GROUP_MAX_STEPS = 3;
+const TABLETOP_ATTACH_STEP = (18 * CARD_W) / TABLETOP_STAGE.battlefieldCardWidth;
 const GLIDE_LAND_PX = 24;
 
 /** Keyed by the card object. The engine mints fresh `CardDto` objects per state
@@ -141,6 +145,9 @@ export class BoardRegion {
     uiParent: Map<string, string>;
   } | null = null;
   private cardScale: number;
+  private baseCardScale: number;
+  private tabletop = false;
+  private tabletopCenterX = 0;
   private combatRowReserved: boolean;
   private overview = false;
   private seatColor: string;
@@ -152,6 +159,7 @@ export class BoardRegion {
   private gridSkeletonGfx: Graphics;
   private zoneTiles: BoardZoneTiles;
   private zoneTileKeys: string[] = [];
+  private zoneTileCounts = new Map<string, number>();
   private readonly presentation: BoardRegionPresentation;
   private zoneTilesLocked = false;
   private zoneSlots = new Map<string, { col: number; row: number }>();
@@ -201,6 +209,7 @@ export class BoardRegion {
     this.host = host;
     this.seatColor = host.getTheme().gameTheme.canvas.neutral;
     this.cardScale = cardScale;
+    this.baseCardScale = cardScale;
     this.combatRowReserved = options.combatRowReserved;
     this.presentation = options.presentation;
     this.mirrored = options.orientation !== "bottom";
@@ -258,6 +267,7 @@ export class BoardRegion {
    *  the per-player specs; they occupy grid cells (bottom-left by default). */
   setZoneTiles(specs: ZoneTileSpec[]): void {
     this.zoneTileKeys = specs.map((s) => s.key);
+    this.zoneTileCounts = new Map(specs.map((s) => [s.key, s.count]));
     this.zoneTiles.setSpecs(specs);
     if (this.lastState) this.updateBattlefield(this.lastState);
     else this.placeZoneTiles(this.freshGrid(), new Set());
@@ -307,6 +317,10 @@ export class BoardRegion {
    *  column into the reserved attack-row band (synthetic row `grid.rows`) so the
    *  stack flows into that inner-edge slot before wrapping to the next column. */
   private placeZoneTiles(grid: GridLayoutInfo, occupied: Set<string>): void {
+    if (this.tabletop) {
+      this.placeTabletopZoneTiles();
+      return;
+    }
     const placements = new Map<string, { x: number; y: number }>();
     const taken = new Set<string>();
     const ignoreBlockers = this.presentation.ignoreZoneTileBlockers(this.mirrored);
@@ -489,8 +503,18 @@ export class BoardRegion {
     return this.presentation.localBlockers(this.mirrored, blockers);
   }
 
+  setTabletop(centerX: number | null): void {
+    const tabletop = centerX !== null;
+    if (this.tabletop === tabletop && this.tabletopCenterX === (centerX ?? 0)) return;
+    this.tabletop = tabletop;
+    this.tabletopCenterX = centerX ?? 0;
+    this.cardScale = this.baseCardScale;
+    if (this.lastState) this.updateBattlefield(this.lastState);
+  }
+
   setCardScale(scale: number): void {
-    if (!Number.isFinite(scale) || scale <= 0 || scale === this.cardScale) return;
+    if (!Number.isFinite(scale) || scale <= 0 || scale === this.baseCardScale) return;
+    this.baseCardScale = scale;
     this.cardScale = scale;
     if (this.lastState) this.updateBattlefield(this.lastState);
     else this.placeZoneTiles(this.freshGrid(), new Set());
@@ -902,7 +926,7 @@ export class BoardRegion {
       }
     }
     const tentativeTopLevel = state.cards.filter((c) => !effectiveParent.has(c.id));
-    this.applyOverflowStacking(tentativeTopLevel);
+    if (!this.tabletop) this.applyOverflowStacking(tentativeTopLevel);
     for (const [childId, parentId] of [...this.uiParent]) {
       if (!currentIds.has(childId) || !currentIds.has(parentId)) continue;
       if (childId === parentId) continue;
@@ -929,7 +953,9 @@ export class BoardRegion {
         this.userSlots.delete(id);
       }
     }
-    const positions = this.computeBattlefieldGrid(topLevelCards);
+    const positions = this.tabletop
+      ? this.computeTabletopRows(topLevelCards)
+      : this.computeBattlefieldGrid(topLevelCards);
     this.gridTargets = positions;
     for (const entry of this.entries.values()) this.applyTouchChrome(entry.sprite);
 
@@ -943,6 +969,7 @@ export class BoardRegion {
       const expanded = this.hoveredStackRoot === card.id;
       const groupSteps = Math.min(children.length, STACK_MAX_SLIDE_CARDS - 1);
       let attachIdx = 0;
+      let groupIdx = 0;
       const steps = new Map<string, number>();
       for (const child of children) {
         const isAttach = child.attachedTo === card.id;
@@ -952,6 +979,9 @@ export class BoardRegion {
             ? (attachIdx + 1) * ATTACH_FAN_STEP_Y
             : this.attachCollapsedStep(attachIdx);
           attachIdx += 1;
+        } else if (this.tabletop) {
+          groupIdx += 1;
+          step = TABLETOP_GROUP_STEP * Math.min(groupIdx, TABLETOP_GROUP_MAX_STEPS);
         } else {
           step = ATTACH_OFFSET_Y * Math.min(children.length - attachIdx, groupSteps);
         }
@@ -970,9 +1000,10 @@ export class BoardRegion {
             : expanded
               ? Z_ATTACH_FAN + (children.length - 1 - i)
               : children.length - i;
+        const groupShiftX = this.tabletop && !isAttach ? steps.get(child.id)! * this.cardScale : 0;
         this.placeBattlefieldCard(
           child,
-          center.x,
+          center.x - groupShiftX,
           hostCenterY - steps.get(child.id)! * this.cardScale,
           zIndex,
           state,
@@ -1176,6 +1207,7 @@ export class BoardRegion {
     if (topLevel.length < 2) return;
 
     const isStackable = (c: CardDto): boolean =>
+      (!this.tabletop || c.identity.isToken || battlefieldCardCategory(c) === "land") &&
       !c.isAttacking &&
       !this.combatStaging?.blockerIds.has(c.id) &&
       !c.attachedTo &&
@@ -1306,6 +1338,114 @@ export class BoardRegion {
       this.zoneCenterX(),
       this.userPlacedCards,
     );
+  }
+
+  private tabletopUnit(): number {
+    return (this.baseCardScale * CARD_W) / TABLETOP_STAGE.battlefieldCardWidth;
+  }
+
+  private placeTabletopZoneTiles(): void {
+    const unit = this.tabletopUnit();
+    const cardW = CARD_W * this.baseCardScale;
+    const cardH = CARD_H * this.baseCardScale;
+    const zone = this.zone;
+    const pad = TABLETOP_STAGE.rowEdgePad * unit;
+    const columnX = zone.x - (TABLETOP_STAGE.pileColumnWidth * unit + cardW) / 2;
+    const nearY = this.mirrored ? zone.y + pad : zone.y + zone.height - pad - cardH;
+    const farY = this.mirrored ? zone.y + zone.height - pad - cardH : zone.y + pad;
+    const placements = new Map<string, { x: number; y: number }>();
+    let besideX = columnX + cardW * 0.6;
+    for (const key of this.zoneTileKeys) {
+      if (key === ZONE_TILE_KEY.library) placements.set(key, { x: columnX, y: nearY });
+      else if (key === ZONE_TILE_KEY.graveyard) placements.set(key, { x: columnX, y: farY });
+      else if ((this.zoneTileCounts.get(key) ?? 0) > 0) {
+        placements.set(key, { x: besideX, y: farY });
+        besideX += cardW * 0.6;
+      }
+    }
+    this.zoneTiles.setGeometry(cardW, cardH, placements, this.touchHitPadScreen());
+  }
+
+  private tabletopFootprint(card: CardDto, scale: number): number {
+    return (card.tapped ? this.cardHeight() : CARD_W) * scale;
+  }
+
+  private tabletopRowFit(cards: CardDto[], width: number): number {
+    if (cards.length === 0) return 1;
+    const span = cards.reduce(
+      (sum, card, i) =>
+        sum +
+        this.tabletopFootprint(card, this.baseCardScale) *
+          (i === 0 ? 1 : TABLETOP_STAGE.minVisibleFrac),
+      0,
+    );
+    return Math.min(1, width / span);
+  }
+
+  private layoutTabletopRow(
+    cards: CardDto[],
+    left: number,
+    right: number,
+    y: number,
+    gap: number,
+    positions: Map<string, Point>,
+  ): void {
+    if (cards.length === 0) return;
+    const widths = cards.map((card) => this.tabletopFootprint(card, this.cardScale));
+    const available = right - left;
+    const total = widths.reduce((sum, w) => sum + w, 0);
+    const advances = widths.slice(1).map((w, i) => (widths[i]! + w) / 2);
+    const advanceSum = advances.reduce((sum, a) => sum + a, 0);
+    const fitGap = cards.length > 1 ? Math.min(gap, (available - total) / (cards.length - 1)) : 0;
+    const ratio =
+      fitGap >= 0 || advanceSum === 0
+        ? 1
+        : (available - (widths[0]! + widths[widths.length - 1]!) / 2) / advanceSum;
+    const step = Math.max(0, fitGap);
+    const span =
+      advances.reduce((sum, a) => sum + a * ratio + step, 0) +
+      (widths[0]! + widths[widths.length - 1]!) / 2;
+    let x = left + (available - span) / 2 + widths[0]! / 2;
+    cards.forEach((card, i) => {
+      if (i > 0) x += advances[i - 1]! * ratio + step;
+      positions.set(card.id, { x, y });
+    });
+  }
+
+  private computeTabletopRows(cards: CardDto[]): Map<string, Point> {
+    const positions = new Map<string, Point>();
+    this.gridInfo = this.freshGrid();
+    this.placeTabletopZoneTiles();
+    const zone = this.zone;
+    const unit = this.tabletopUnit();
+    const pad = TABLETOP_STAGE.rowEdgePad * unit;
+    const gap = TABLETOP_STAGE.rowGap * unit;
+    const front = cards.filter((card) => battlefieldCardCategory(card) === "creature");
+    const lands = cards.filter((card) => battlefieldCardCategory(card) === "land");
+    const others = cards.filter((card) => battlefieldCardCategory(card) === "other");
+    const left = zone.x + pad;
+    const right = zone.x + zone.width - pad;
+    const middle = this.tabletopCenterX;
+    const clearance = TABLETOP_STAGE.avatarClearance * unit;
+    const landRight = middle - clearance;
+    const otherLeft = middle + clearance;
+    const frontHalf = Math.min(middle - left, right - middle);
+    const fit = Math.max(
+      TABLETOP_STAGE.minFitScale,
+      Math.min(
+        this.tabletopRowFit(front, frontHalf * 2),
+        this.tabletopRowFit(lands, landRight - left),
+        this.tabletopRowFit(others, right - otherLeft),
+      ),
+    );
+    this.cardScale = this.baseCardScale * fit;
+    const cardH = this.cardHeight() * this.cardScale;
+    const nearY = this.mirrored ? zone.y + pad + cardH / 2 : zone.y + zone.height - pad - cardH / 2;
+    const farY = this.mirrored ? zone.y + zone.height - pad - cardH / 2 : zone.y + pad + cardH / 2;
+    this.layoutTabletopRow(front, middle - frontHalf, middle + frontHalf, farY, gap, positions);
+    this.layoutTabletopRow(lands, left, landRight, nearY, gap, positions);
+    this.layoutTabletopRow(others, otherLeft, right, nearY, gap, positions);
+    return positions;
   }
 
   private computeBattlefieldGrid(cards: CardDto[]): Map<string, Point> {
@@ -1808,6 +1948,7 @@ export class BoardRegion {
   }
 
   private attachCollapsedStep(attachIdx: number): number {
+    if (this.tabletop) return (attachIdx + 1) * TABLETOP_ATTACH_STEP;
     return ATTACH_OFFSET_Y + Math.min(attachIdx, ATTACH_PEEK_MAX) * ATTACH_PEEK_Y;
   }
 

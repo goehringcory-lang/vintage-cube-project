@@ -38,6 +38,7 @@ export class OpponentHandFan {
   private hoveredIndex: number | null = null;
   private hoverLeaveTimer: number | null = null;
   private band = { x: 0, y: 0, width: 0, height: 0 };
+  private scale = 1;
   private rulesViewDefault = false;
 
   constructor(host: OpponentHandFanHost, parent: Container) {
@@ -76,12 +77,21 @@ export class OpponentHandFan {
     for (const sprite of this.sprites.values()) sprite.setHandRulesView(active);
   }
 
-  setBand(x: number, y: number, width: number, height: number, visible: boolean): void {
+  setBand(x: number, y: number, width: number, height: number, visible: boolean, scale = 1): void {
     this.container.visible = visible;
     if (!visible) this.clearHover();
     const b = this.band;
-    if (b.x === x && b.y === y && b.width === width && b.height === height) return;
+    if (
+      b.x === x &&
+      b.y === y &&
+      b.width === width &&
+      b.height === height &&
+      this.scale === scale
+    ) {
+      return;
+    }
     this.band = { x, y, width, height };
+    this.scale = scale;
     this.mask.clear().rect(x, y, width, height).fill(0xffffff);
     this.layout();
   }
@@ -112,18 +122,19 @@ export class OpponentHandFan {
   }
 
   private dimensions() {
-    const cardW = Math.round(HAND_CARD_BASE.cardW * OPPONENT_HAND_SCALE);
-    const cardH = Math.round(HAND_CARD_BASE.cardH * OPPONENT_HAND_SCALE);
+    const scale = OPPONENT_HAND_SCALE * this.scale;
+    const cardW = Math.round(HAND_CARD_BASE.cardW * scale);
+    const cardH = Math.round(HAND_CARD_BASE.cardH * scale);
     return {
       cardW,
       cardH,
       sink: Math.round(cardH * OPPONENT_HAND_SINK_FRAC),
       hoverLift: Math.ceil(cardH * OPPONENT_HAND_SINK_FRAC) + GAP,
-      neighborPush: Math.round(HAND_FAN_PARAMS.neighborPush * OPPONENT_HAND_SCALE),
-      maxSpread: Math.round(HAND_FAN_PARAMS.maxSpread * OPPONENT_HAND_SCALE),
-      minSpread: Math.round(HAND_FAN_PARAMS.minSpread * OPPONENT_HAND_SCALE),
+      neighborPush: Math.round(HAND_FAN_PARAMS.neighborPush * scale),
+      maxSpread: Math.round(HAND_FAN_PARAMS.maxSpread * scale),
+      minSpread: Math.round(HAND_FAN_PARAMS.minSpread * scale),
       spreadWidth: Math.min(
-        Math.round(HAND_FAN_PARAMS.spreadWidth * OPPONENT_HAND_SCALE),
+        Math.round(HAND_FAN_PARAMS.spreadWidth * scale),
         Math.max(cardW, this.band.width - cardW),
       ),
     };

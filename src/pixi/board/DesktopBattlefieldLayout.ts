@@ -1,7 +1,54 @@
 import { BATTLEFIELD_MIN_ROWS_LARGEST, FIELD_INNER_EDGE_PAD_PX } from "../constants";
 import { battlefieldScaleForMultiplier, scaleForRowsWithCombatRow } from "../GridLayout";
 import { computeBoardLayout } from "./boardLayout";
-import type { BattlefieldLayoutPolicy, BattlefieldLayoutResult } from "./battlefieldLayoutPolicy";
+import type {
+  BattlefieldLayoutInput,
+  BattlefieldLayoutPolicy,
+  BattlefieldLayoutResult,
+} from "./battlefieldLayoutPolicy";
+import {
+  TABLETOP_STAGE,
+  tabletopCardScale,
+  tabletopStage,
+  tabletopStageRect,
+} from "./tabletopStage";
+import { GAME_CARD_SIZES } from "@/components/game/game.constants";
+
+function computeTabletop(input: BattlefieldLayoutInput): BattlefieldLayoutResult {
+  const stage = tabletopStage(input.width, input.height);
+  const fieldX = TABLETOP_STAGE.pileColumnWidth;
+  const fieldWidth = TABLETOP_STAGE.width - fieldX - TABLETOP_STAGE.stackColumnWidth;
+  const centerline = TABLETOP_STAGE.height * TABLETOP_STAGE.centerlineFrac;
+  const self = tabletopStageRect(
+    stage,
+    fieldX,
+    centerline,
+    fieldWidth,
+    TABLETOP_STAGE.selfFieldBottom - centerline,
+  );
+  const opponent = tabletopStageRect(
+    stage,
+    fieldX,
+    TABLETOP_STAGE.opponentFieldTop,
+    fieldWidth,
+    centerline - TABLETOP_STAGE.opponentFieldTop,
+  );
+  const selfScale = tabletopCardScale(stage);
+  return {
+    layout: {
+      self,
+      opponents: [{ rect: opponent, orientation: "top" }],
+      dividerY: stage.centerlineY,
+      stripBandPx: 0,
+      opponentLayout: "focused",
+      tabletop: true,
+    },
+    scales: { self: selfScale, opponent: selfScale * TABLETOP_STAGE.opponentScale },
+    combatRowReserved: false,
+    handScale: (TABLETOP_STAGE.handCardWidth / GAME_CARD_SIZES.hand.width) * stage.scale,
+    selfClusterMaxHeight: Math.max(input.observedHandReserve, input.requestedBottomReserve),
+  };
+}
 
 export const DESKTOP_BATTLEFIELD_LAYOUT: BattlefieldLayoutPolicy = {
   showPhaseDivider: true,
@@ -14,6 +61,7 @@ export const DESKTOP_BATTLEFIELD_LAYOUT: BattlefieldLayoutPolicy = {
   },
 
   compute(input): BattlefieldLayoutResult {
+    if (input.opponentCount === 1) return computeTabletop(input);
     const layout = computeBoardLayout(
       input.width,
       input.height,
