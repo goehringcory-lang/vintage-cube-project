@@ -65,8 +65,8 @@ export function choosePresetCoverCardName(
 }
 
 export async function loadPresetDeckDefinitions(
-  indexUrl = "/preset_decks/index.json",
-  deckBaseUrl = "/preset_decks",
+  indexUrl = `${import.meta.env.BASE_URL}preset_decks/index.json`,
+  deckBaseUrl = `${import.meta.env.BASE_URL}preset_decks`,
 ): Promise<PresetDeckDefinition[]> {
   const indexResponse = await fetch(indexUrl);
   if (!indexResponse.ok) {

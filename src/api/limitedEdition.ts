@@ -81,7 +81,7 @@ export const MTGO_VINTAGE_CUBE_ID = "mtgo-vintage-cube";
 
 async function fetchCubeBody(cubeIdOrUrl: string): Promise<string> {
   if (cubeIdOrUrl === MTGO_VINTAGE_CUBE_ID) {
-    const r = await fetch(`/cubes/${MTGO_VINTAGE_CUBE_ID}.dck`);
+    const r = await fetch(`${import.meta.env.BASE_URL}cubes/${MTGO_VINTAGE_CUBE_ID}.dck`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.text();
   }

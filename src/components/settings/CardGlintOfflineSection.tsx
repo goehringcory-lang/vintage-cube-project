@@ -92,7 +92,7 @@ export function CardGlintOfflineSection() {
         {" ·"}
         <a
           className="touch:inline-flex touch:min-h-11 touch:items-center underline"
-          href="/card-glint-licenses/games-magic-NOTICE.md"
+          href={`${import.meta.env.BASE_URL}card-glint-licenses/games-magic-NOTICE.md`}
           target="_blank"
           rel="noreferrer"
         >

@@ -451,6 +451,8 @@ export const manaSymbolUrl = (code: ManaCode) => {
   if (scryfallAssetsMirrored)
     return scryfallAssetUrl(`https://svgs.scryfall.io/card-symbols/${file}`);
   const defaultBase =
-    getPlatformType() === "web" ? "/scryfall-symbols/" : "https://svgs.scryfall.io/card-symbols/";
+    getPlatformType() === "web"
+      ? `${import.meta.env.BASE_URL}scryfall-symbols/`
+      : "https://svgs.scryfall.io/card-symbols/";
   return `${import.meta.env.VITE_SCRYFALL_SYMBOL_BASE || defaultBase}${file}`;
 };

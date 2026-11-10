@@ -4,7 +4,7 @@ export function BrandSection() {
     <section id="brand" className="scroll-mt-24 space-y-6">
       <div className="relative overflow-hidden rounded-2xl border border-border">
         <img
-          src="/manabrew_brewery_1.png"
+          src={`${import.meta.env.BASE_URL}manabrew_brewery_1.png`}
           alt={`Manabrew brand art`}
           className="absolute inset-0 h-full w-full object-cover opacity-30"
         />
