@@ -46,6 +46,8 @@ const SKULL_ICON_NAME = "skull-crossed-bones";
 const OFFLINE_ICON_NAME = "aerial-signal";
 const DETAILS_ICON_NAME = "info";
 const PANEL_PADDING = 10;
+export const MEDALLION_BOX = { width: 136, height: 146, avatarCenterY: 68, diameter: 104 } as const;
+const MEDALLION_ORNAMENTS = 12;
 const AVATAR_DIAMETER = 44;
 const SHALLOW_AVATAR_MIN_HEIGHT = 96;
 const SHALLOW_RESOURCE_IDENTITY_OVERLAP = 30;
@@ -182,6 +184,7 @@ export class PlayerHudCapsule {
   private height = 0;
   private column = false;
   private compact = false;
+  private medallion = false;
   private boundsDebug = false;
   private avatarUrl: string | null = null;
   private renderedLife: number | null = null;
@@ -432,6 +435,12 @@ export class PlayerHudCapsule {
       s.manaPool,
       s.badges,
     ]);
+  }
+
+  setMedallion(medallion: boolean): void {
+    if (this.medallion === medallion) return;
+    this.medallion = medallion;
+    this.render();
   }
 
   setCompact(compact: boolean): void {
@@ -688,7 +697,8 @@ export class PlayerHudCapsule {
       pip.sprite.visible = false;
       pip.count.visible = false;
     }
-    if (this.column) this.renderColumn(w, h);
+    if (this.medallion) this.renderMedallion(w, h);
+    else if (this.column) this.renderColumn(w, h);
     else this.renderCapsule(w, h);
     this.applyLifeAnim();
     this.applyResourceAnimations();
@@ -819,6 +829,56 @@ export class PlayerHudCapsule {
       ? this.layoutMana(pad, resourceY, w - pad * 2, 2, short ? 18 : 24) + 6
       : resourceY;
     this.layoutStates(pad, stateY, w - pad * 2, this.panelHeight - stateY - 4, 2);
+  }
+
+  private renderMedallion(w: number, h: number): void {
+    const gt = this.theme.gameTheme;
+    const unit = w / MEDALLION_BOX.width;
+    const diameter = MEDALLION_BOX.diameter * unit;
+    const radius = diameter / 2;
+    const cx = w / 2;
+    const cy = MEDALLION_BOX.avatarCenterY * unit;
+    const seat = hexToNum(this.spec.color);
+    const lit = this.spec.isActiveTurn;
+    this.panelHeight = h;
+    this.identityWidth = w;
+    this.identityHeight = h;
+    this.drawPlate(w, h);
+    this.bg.circle(cx, cy, radius + 12 * unit);
+    this.bg.fill({ color: hexToNum(gt.canvas.shadow), alpha: 0.85 });
+    if (lit) {
+      this.bg.circle(cx, cy, radius + 15 * unit);
+      this.bg.stroke({ color: seat, width: 6 * unit, alpha: 0.3 });
+    }
+    this.bg.circle(cx, cy, radius + 8 * unit);
+    this.bg.stroke({ color: seat, width: 4 * unit, alpha: lit ? 1 : 0.35 });
+    this.bg.circle(cx, cy, radius + 2 * unit);
+    this.bg.stroke({ color: hexToNum(gt.textOnTinted), width: 1.5 * unit, alpha: lit ? 0.6 : 0.2 });
+    for (let i = 0; i < MEDALLION_ORNAMENTS; i++) {
+      const angle = (i / MEDALLION_ORNAMENTS) * Math.PI * 2;
+      const ox = cx + Math.cos(angle) * (radius + 8 * unit);
+      const oy = cy + Math.sin(angle) * (radius + 8 * unit);
+      const size = (i % 3 === 0 ? 5 : 3) * unit;
+      this.bg.poly([ox, oy - size, ox + size, oy, ox, oy + size, ox - size, oy]);
+      this.bg.fill({ color: seat, alpha: lit ? 1 : 0.45 });
+    }
+    this.avatarCx = cx;
+    this.avatarCy = cy;
+    this.avatarDia = diameter;
+    this.drawAvatar(cx, cy, diameter, true);
+    const plateW = 78 * unit;
+    const plateH = 44 * unit;
+    const plateY = cy + radius - plateH * 0.35;
+    this.bg.roundRect(cx - plateW / 2, plateY, plateW, plateH, 10 * unit);
+    this.bg.fill({ color: hexToNum(gt.canvas.shadow), alpha: 0.95 });
+    this.bg.roundRect(cx - plateW / 2, plateY, plateW, plateH, 10 * unit);
+    this.bg.stroke({ color: seat, width: 2 * unit, alpha: lit ? 0.9 : 0.4 });
+    this.lifeFontSize = Math.round(40 * unit);
+    this.life.style = this.textStyle(this.lifeFontSize, "800");
+    this.life.anchor.set(0.5, 0.5);
+    this.life.position.set(cx, plateY + plateH / 2);
+    this.heart.visible = false;
+    this.layoutFloatingMana(cx + 128 * unit, cy);
   }
 
   private renderCompactCapsule(w: number, h: number): void {

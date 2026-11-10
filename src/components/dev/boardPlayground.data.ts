@@ -18,6 +18,7 @@ export const PLAYGROUND_SCENARIOS = [
   { id: "sparse", label: "Sparse · two players" },
   { id: "crowded", label: "Crowded · Commander pod" },
   { id: "combat", label: "Combat · three defenders" },
+  { id: "duel", label: "Crowded · 1v1 tabletop" },
   { id: "player-panels", label: "Player panels · four players" },
 ] as const;
 export type PlaygroundScenarioId = (typeof PLAYGROUND_SCENARIOS)[number]["id"];
@@ -221,9 +222,10 @@ export interface PlaygroundTable {
 }
 
 export function createPlaygroundTable(scenario: PlaygroundScenarioId): PlaygroundTable {
-  const crowded = scenario === "crowded" || scenario === "combat";
+  const duel = scenario === "duel";
+  const crowded = scenario === "crowded" || scenario === "combat" || duel;
   const playerPanels = scenario === "player-panels";
-  const players = PLAYGROUND_PLAYERS.slice(0, crowded || playerPanels ? 4 : 2);
+  const players = PLAYGROUND_PLAYERS.slice(0, (crowded && !duel) || playerPanels ? 4 : 2);
   const cards = HAND.slice(0, scenario === "opening" || scenario === "theme" ? 7 : 5).map(
     (spec, i) => makePlaygroundCard(spec, `lab-hand-${i}`, LOCAL_PLAYER_ID, "hand"),
   );
@@ -241,7 +243,8 @@ export function createPlaygroundTable(scenario: PlaygroundScenarioId): Playgroun
       ),
     );
     if (opening) continue;
-    for (let i = 0; i < (crowded ? 8 : scenario === "theme" && seat === 0 ? 3 : 2); i++) {
+    const creatureCount = duel ? 12 : crowded ? 8 : scenario === "theme" && seat === 0 ? 3 : 2;
+    for (let i = 0; i < creatureCount; i++) {
       const card = makePlaygroundCard(
         PLAYGROUND_CREATURES[(i + seat) % PLAYGROUND_CREATURES.length]!,
         `${player.id}-creature-${i}`,
@@ -266,7 +269,7 @@ export function createPlaygroundTable(scenario: PlaygroundScenarioId): Playgroun
       }
       cards.push(card);
     }
-    for (let i = 0; i < (crowded ? 9 : 3); i++) {
+    for (let i = 0; i < (duel ? 14 : crowded ? 9 : 3); i++) {
       const card = makePlaygroundCard(
         PLAYGROUND_LANDS[(i + seat) % PLAYGROUND_LANDS.length]!,
         `${player.id}-land-${i}`,

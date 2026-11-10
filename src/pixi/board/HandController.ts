@@ -11,8 +11,12 @@ import {
   COMPACT_HAND_FAN_PARAMS,
   computeBaseLayout,
   computeHandLayout,
+  computeTabletopBaseLayout,
   HAND_FAN_PARAMS,
+  TABLETOP_FAN_MAX_STEP,
+  type BaseCardLayout,
 } from "../HandLayout";
+import { TABLETOP_STAGE } from "./tabletopStage";
 import { HAND_CARD_BASE } from "@/components/game/game.styles";
 import { HandReorderIndicator } from "../HandReorderIndicator";
 import { CARD_W, CARD_H } from "@/components/game/game.constants";
@@ -60,6 +64,7 @@ export class HandController {
   private hoverDebugGfx: Graphics;
   private reorderIndicator: HandReorderIndicator;
   private hoverDebug = false;
+  private tabletopUnit: number | null = null;
 
   constructor(host: HandHost, parent: Container) {
     this.host = host;
@@ -101,6 +106,28 @@ export class HandController {
     }
   }
 
+  setTabletop(unit: number | null): void {
+    if (this.tabletopUnit === unit) return;
+    this.tabletopUnit = unit;
+    this.relayout();
+  }
+
+  private baseLayout(
+    count: number,
+    dims: ReturnType<HandController["getDimensions"]>,
+  ): BaseCardLayout[] {
+    if (this.tabletopUnit !== null) {
+      return computeTabletopBaseLayout(
+        count,
+        dims.cardW,
+        dims.spreadWidth,
+        TABLETOP_STAGE.handRotationDeg,
+        TABLETOP_STAGE.handDropPx * this.tabletopUnit,
+      );
+    }
+    return computeBaseLayout(count, dims.cardW, dims.maxSpread, dims.minSpread, dims.spreadWidth);
+  }
+
   setScale(scale: number): void {
     // Growth-only cap: an enlarged fan can't take more than a fraction of the
     // region's height, but the cap never pushes the fan below the authored
@@ -131,6 +158,7 @@ export class HandController {
   }
 
   private bottomSinkFrac(): number {
+    if (this.tabletopUnit !== null) return TABLETOP_STAGE.handHiddenFrac;
     if (this.peek) return HAND_BOTTOM_SINK_FRAC_PEEK;
     if (this.sheetOpen) return HAND_BOTTOM_SINK_FRAC_SHEET;
     return this.compact ? HAND_BOTTOM_SINK_FRAC_COMPACT : HAND_BOTTOM_SINK_FRAC;
@@ -176,13 +204,7 @@ export class HandController {
     this.host.setHandExclusion(this.getBlockerRect());
 
     const dims = this.getDimensions();
-    const baseLayout = computeBaseLayout(
-      cards.length,
-      dims.cardW,
-      dims.maxSpread,
-      dims.minSpread,
-      dims.spreadWidth,
-    );
+    const baseLayout = this.baseLayout(cards.length, dims);
     const layout = computeHandLayout(
       cards.length,
       dims.cardW,
@@ -193,6 +215,8 @@ export class HandController {
       this.hoveredIndex,
       dims.hoverLift,
       dims.neighborPush,
+      baseLayout,
+      this.tabletopUnit === null ? undefined : TABLETOP_STAGE.handHoverScale,
     );
 
     const zone = this.host.getPlayZone();
@@ -347,13 +371,7 @@ export class HandController {
 
     const remaining = state.cards.filter((card) => card.id !== draggedId);
     const dims = this.getDimensions();
-    const layout = computeBaseLayout(
-      remaining.length,
-      dims.cardW,
-      dims.maxSpread,
-      dims.minSpread,
-      dims.spreadWidth,
-    );
+    const layout = this.baseLayout(remaining.length, dims);
     const zone = this.host.getPlayZone();
     const centerX = zone.x + zone.width / 2;
     let nextIndex = remaining.length;
@@ -526,6 +544,25 @@ export class HandController {
   }
 
   getDimensions() {
+    if (this.tabletopUnit !== null) {
+      const unit = this.tabletopUnit;
+      const cardW = Math.round(TABLETOP_STAGE.handCardWidth * unit);
+      const spreadWidth = Math.round(TABLETOP_STAGE.width * TABLETOP_STAGE.handMaxWidthFrac * unit);
+      const count = this.lastState?.cards.length ?? 0;
+      const spread =
+        count > 1
+          ? Math.min(cardW * TABLETOP_FAN_MAX_STEP, (spreadWidth - cardW) / (count - 1))
+          : 0;
+      return {
+        cardW,
+        cardH: Math.round(TABLETOP_STAGE.handCardHeight * unit),
+        hoverLift: Math.round(TABLETOP_STAGE.handHoverLift * unit),
+        neighborPush: Math.round(TABLETOP_STAGE.handNeighborPush * unit),
+        maxSpread: Math.floor(spread),
+        minSpread: Math.floor(spread),
+        spreadWidth,
+      };
+    }
     const base = HAND_CARD_BASE;
     const params = this.sheetOpen ? COMPACT_HAND_FAN_PARAMS : HAND_FAN_PARAMS;
     const scale = this.vScale;

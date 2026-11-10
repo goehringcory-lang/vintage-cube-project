@@ -399,7 +399,7 @@ export const usePreferencesStore = create<PreferencesState>()(
           opponentLayout: "focused",
           setOpponentLayout: (opponentLayout) => set({ opponentLayout }),
 
-          opponentHandFan: "revealed",
+          opponentHandFan: "always",
           setOpponentHandFan: (opponentHandFan) => set({ opponentHandFan }),
 
           hapticFeedback: true,

@@ -58,6 +58,25 @@ export function computeBaseLayout(
   });
 }
 
+export const TABLETOP_FAN_MAX_STEP = 0.72;
+
+export function computeTabletopBaseLayout(
+  count: number,
+  cardW: number,
+  maxWidth: number,
+  rotationDeg: number,
+  dropPx: number,
+): BaseCardLayout[] {
+  if (count === 0) return [];
+  const middle = (count - 1) / 2;
+  const spread =
+    count > 1 ? Math.min(cardW * TABLETOP_FAN_MAX_STEP, (maxWidth - cardW) / (count - 1)) : 0;
+  return Array.from({ length: count }, (_, i) => {
+    const offset = i - middle;
+    return { x: offset * spread, drop: offset * offset * dropPx, rot: offset * rotationDeg };
+  });
+}
+
 export function computeHandLayout(
   count: number,
   cardW: number,
@@ -68,12 +87,15 @@ export function computeHandLayout(
   hoveredIndex: number | null,
   hoverLift: number,
   neighborPush: number,
+  presetPositions?: BaseCardLayout[],
+  hoverScale = HOVER_SCALE,
 ): HandCardLayout[] {
-  const basePositions = computeBaseLayout(count, cardW, maxSpread, minSpread, spreadWidth);
+  const basePositions =
+    presetPositions ?? computeBaseLayout(count, cardW, maxSpread, minSpread, spreadWidth);
   if (basePositions.length === 0) return [];
 
-  const hovW = Math.round(cardW * HOVER_SCALE);
-  const hovH = Math.round(cardH * HOVER_SCALE);
+  const hovW = Math.round(cardW * hoverScale);
+  const hovH = Math.round(cardH * hoverScale);
 
   return basePositions.map((pos, i) => {
     const isHov = hoveredIndex === i;

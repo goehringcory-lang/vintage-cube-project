@@ -26,6 +26,7 @@ export class PlayerHudLayer {
   private capsules = new Map<string, PlayerHudCapsule>();
   private tooltip: PlayerHudTooltip;
   private compact = false;
+  private medallion = false;
   private boundsDebug = false;
 
   constructor(
@@ -72,6 +73,7 @@ export class PlayerHudLayer {
         this.container.addChild(capsule.container);
         this.capsules.set(spec.playerId, capsule);
         capsule.setCompact(this.compact);
+        capsule.setMedallion(this.medallion);
         capsule.setBoundsDebug(this.boundsDebug);
       }
       capsule.setSpec(spec);
@@ -92,6 +94,12 @@ export class PlayerHudLayer {
     column: boolean,
   ): void {
     this.capsules.get(playerId)?.setRect(x, y, width, height, column);
+  }
+
+  setMedallion(medallion: boolean): void {
+    if (this.medallion === medallion) return;
+    this.medallion = medallion;
+    for (const capsule of this.capsules.values()) capsule.setMedallion(medallion);
   }
 
   setCompact(compact: boolean): void {

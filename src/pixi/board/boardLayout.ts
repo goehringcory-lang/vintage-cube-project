@@ -19,6 +19,7 @@ export interface BoardLayout {
   dividerY: number;
   stripBandPx: number;
   opponentLayout: "focused" | "overview";
+  tabletop: boolean;
 }
 
 /** Fixed vertical band, in px, reserved at the center for the phase strip. */
@@ -78,5 +79,6 @@ export function computeBoardLayout(
     dividerY,
     stripBandPx: band,
     opponentLayout: overview ? "overview" : "focused",
+    tabletop: false,
   };
 }
