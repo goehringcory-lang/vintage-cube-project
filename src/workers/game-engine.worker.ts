@@ -83,7 +83,7 @@ let gameRunning = false;
 
 /**
  */
-const CARD_ARCHIVE_MANIFEST_URL = "/wasm/cardset.manifest.json";
+const CARD_ARCHIVE_MANIFEST_URL = `${import.meta.env.BASE_URL}wasm/cardset.manifest.json`;
 const CARD_ARCHIVE_CACHE = "manabrew-card-archive";
 const LEGACY_CARD_ARCHIVE_CACHES = ["manabrew-card-archive-v4"];
 
@@ -216,7 +216,7 @@ async function fetchCardArchive(reload: boolean): Promise<ArrayBuffer> {
     throw new Error(`Failed to fetch card archive manifest: ${manifestResp.status}`);
   }
   const manifest = (await manifestResp.json()) as CardArchiveManifest;
-  const archiveUrl = `/wasm/${manifest.archive}`;
+  const archiveUrl = `${import.meta.env.BASE_URL}wasm/${manifest.archive}`;
 
   const cache = await caches.open(CARD_ARCHIVE_CACHE);
   for (const req of await cache.keys()) {

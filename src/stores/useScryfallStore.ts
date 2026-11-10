@@ -274,7 +274,7 @@ let loadedTokenArchive: TokenArchiveIndex | null = null;
 const printingsByOracleId = new Map<string, ScryfallCard[]>();
 
 async function loadTokenArchive(): Promise<TokenArchiveIndex> {
-  tokenArchivePromise ??= fetch("/token_archive.json")
+  tokenArchivePromise ??= fetch(`${import.meta.env.BASE_URL}token_archive.json`)
     .then((response) => {
       if (!response.ok) throw new Error(`Failed to load token archive: ${response.status}`);
       return response.json() as Promise<TokenArchive>;

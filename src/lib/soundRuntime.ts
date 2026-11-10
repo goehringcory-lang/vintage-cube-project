@@ -11,7 +11,12 @@ interface SoundDefinition {
 }
 
 function soundDefinition(name: string, volume: number, cooldownMs = 0): SoundDefinition {
-  return { alias: `sound.${name}`, src: `/sounds/${name}.wav`, volume, cooldownMs };
+  return {
+    alias: `sound.${name}`,
+    src: `${import.meta.env.BASE_URL}sounds/${name}.wav`,
+    volume,
+    cooldownMs,
+  };
 }
 
 const SOUNDS = {

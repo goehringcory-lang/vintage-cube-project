@@ -263,13 +263,13 @@ export const ASSETS: {
     file: "public/manabrew_brewery_1.png",
     kind: "Backdrop",
     use: "Full-bleed brand art",
-    preview: "/manabrew_brewery_1.png",
+    preview: `${import.meta.env.BASE_URL}manabrew_brewery_1.png`,
   },
   {
     file: "public/manabrew_brewery_2.png",
     kind: "Backdrop",
     use: "Alternate brand art",
-    preview: "/manabrew_brewery_2.png",
+    preview: `${import.meta.env.BASE_URL}manabrew_brewery_2.png`,
   },
   {
     file: "public/apple-touch-icon.png",
