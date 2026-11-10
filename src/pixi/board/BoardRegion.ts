@@ -296,7 +296,7 @@ export class BoardRegion {
   }
 
   private cardHeight(): number {
-    return this.presentation.cardHeight;
+    return this.tabletop ? CARD_W : this.presentation.cardHeight;
   }
 
   private freshGrid(): GridLayoutInfo {
@@ -508,8 +508,12 @@ export class BoardRegion {
   setTabletop(centerX: number | null): void {
     const tabletop = centerX !== null;
     if (this.tabletop === tabletop && this.tabletopCenterX === (centerX ?? 0)) return;
+    const modeChanged = this.tabletop !== tabletop;
     this.tabletop = tabletop;
     this.tabletopCenterX = centerX ?? 0;
+    if (modeChanged) {
+      for (const entry of this.entries.values()) this.configureBattlefieldSprite(entry.sprite);
+    }
     this.cardScale = this.baseCardScale;
     if (this.lastState) this.updateBattlefield(this.lastState);
   }
@@ -1357,8 +1361,8 @@ export class BoardRegion {
 
   private placeTabletopZoneTiles(): void {
     const unit = this.tabletopUnit();
-    const cardW = CARD_W * this.baseCardScale;
-    const cardH = CARD_H * this.baseCardScale;
+    const cardW = TABLETOP_STAGE.pileCardWidth * unit;
+    const cardH = (cardW * CARD_H) / CARD_W;
     const zone = this.zone;
     const pad = TABLETOP_STAGE.rowEdgePad * unit;
     const columnX = zone.x - (TABLETOP_STAGE.pileColumnWidth * unit + cardW) / 2;
@@ -1746,10 +1750,15 @@ export class BoardRegion {
     sprite.setChromeScale(Math.max(1, 1 / this.cardScale));
   }
 
+  private configureBattlefieldSprite(sprite: CardSprite): void {
+    this.presentation.configureSprite(sprite);
+    if (this.tabletop) sprite.setCompactSquare(true);
+  }
+
   private ensureBattlefieldEntry(card: CardDto): void {
     if (this.entries.has(card.id)) return;
     const sprite = new CardSprite(card);
-    this.presentation.configureSprite(sprite);
+    this.configureBattlefieldSprite(sprite);
     this.host.wireSprite(sprite);
     this.applyTouchChrome(sprite);
     this.container.addChild(sprite);

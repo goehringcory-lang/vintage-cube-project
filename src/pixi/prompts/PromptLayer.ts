@@ -1145,7 +1145,7 @@ export class PromptLayer extends PromptModalLayer {
     const passLabel = morphed ? endLabel : counting ? "PASSING" : "PASS";
     const combo = morphed ? endCombo : passCombo;
     let height = Math.max(
-      minimal ? 44 : 40,
+      minimal ? 44 : 60,
       getUiControlFloor(),
       Math.ceil(getUiFontFloor("label") * 1.35) + 12,
     );
@@ -1215,7 +1215,7 @@ export class PromptLayer extends PromptModalLayer {
           labelPlacement: endIconOnly ? "hidden" : "inline",
           tooltip: endIconOnly,
           paddingX: 14,
-          fontSize: 10,
+          fontSize: 12,
           fontWeight: "700",
           letterSpacing: 1,
           foreground: withAlpha(this.theme.appTheme["primary-foreground"], 0.75),
@@ -1235,9 +1235,9 @@ export class PromptLayer extends PromptModalLayer {
         height,
         width: priorityColumn ? availableWidth : availableWidth - (end?.buttonWidth ?? 0),
         paddingX: 16,
-        fontSize: 12,
+        fontSize: 20,
         fontWeight: "900",
-        letterSpacing: 1.44,
+        letterSpacing: 2.4,
         foreground: this.theme.appTheme["primary-foreground"],
         backgroundColor: this.theme.appTheme["primary-foreground"],
         backgroundAlpha: morphed ? 0.15 : 0,
@@ -1260,13 +1260,13 @@ export class PromptLayer extends PromptModalLayer {
     const container = new Container();
     const clipped = new Container();
     const surface = new Graphics()
-      .roundRect(0, 0, availableWidth, totalHeight, 8)
+      .roundRect(0, 0, availableWidth, totalHeight, totalHeight / 2)
       .fill({ color: hexToNum(this.theme.appTheme.primary) });
     const mask = new Graphics()
-      .roundRect(0, 0, availableWidth, totalHeight, 8)
+      .roundRect(0, 0, availableWidth, totalHeight, totalHeight / 2)
       .fill({ color: 0xffffff });
     const ring = new Graphics()
-      .roundRect(0.5, 0.5, availableWidth - 1, totalHeight - 1, 7.5)
+      .roundRect(0.5, 0.5, availableWidth - 1, totalHeight - 1, totalHeight / 2 - 0.5)
       .stroke({
         color: hexToNum(this.theme.appTheme["primary-foreground"]),
         width: 1,
