@@ -19,6 +19,7 @@ export const PLAYGROUND_SCENARIOS = [
   { id: "crowded", label: "Crowded · Commander pod" },
   { id: "combat", label: "Combat · three defenders" },
   { id: "duel", label: "Crowded · 1v1 tabletop" },
+  { id: "midgame", label: "Midgame · 1v1 tabletop" },
   { id: "player-panels", label: "Player panels · four players" },
 ] as const;
 export type PlaygroundScenarioId = (typeof PLAYGROUND_SCENARIOS)[number]["id"];
@@ -223,6 +224,7 @@ export interface PlaygroundTable {
 
 export function createPlaygroundTable(scenario: PlaygroundScenarioId): PlaygroundTable {
   const duel = scenario === "duel";
+  const midgame = scenario === "midgame";
   const crowded = scenario === "crowded" || scenario === "combat" || duel;
   const playerPanels = scenario === "player-panels";
   const players = PLAYGROUND_PLAYERS.slice(0, (crowded && !duel) || playerPanels ? 4 : 2);
@@ -243,7 +245,15 @@ export function createPlaygroundTable(scenario: PlaygroundScenarioId): Playgroun
       ),
     );
     if (opening) continue;
-    const creatureCount = duel ? 12 : crowded ? 8 : scenario === "theme" && seat === 0 ? 3 : 2;
+    const creatureCount = duel
+      ? 12
+      : midgame
+        ? 3
+        : crowded
+          ? 8
+          : scenario === "theme" && seat === 0
+            ? 3
+            : 2;
     for (let i = 0; i < creatureCount; i++) {
       const card = makePlaygroundCard(
         PLAYGROUND_CREATURES[(i + seat) % PLAYGROUND_CREATURES.length]!,
@@ -269,9 +279,27 @@ export function createPlaygroundTable(scenario: PlaygroundScenarioId): Playgroun
       }
       cards.push(card);
     }
-    for (let i = 0; i < (duel ? 14 : crowded ? 9 : 3); i++) {
+    if (midgame) {
+      for (let i = 0; i < 6; i++) {
+        const token = makePlaygroundCard(
+          {
+            name: "Soldier",
+            types: ["Creature"],
+            subtypes: ["Soldier"],
+            color: "W",
+            power: "1",
+            toughness: "1",
+          },
+          `${player.id}-token-${i}`,
+          player.id,
+        );
+        token.identity = { ...token.identity, isToken: true };
+        cards.push(token);
+      }
+    }
+    for (let i = 0; i < (duel ? 14 : midgame ? 7 : crowded ? 9 : 3); i++) {
       const card = makePlaygroundCard(
-        PLAYGROUND_LANDS[(i + seat) % PLAYGROUND_LANDS.length]!,
+        PLAYGROUND_LANDS[midgame ? (i < 4 ? seat : 2) : (i + seat) % PLAYGROUND_LANDS.length]!,
         `${player.id}-land-${i}`,
         player.id,
       );
