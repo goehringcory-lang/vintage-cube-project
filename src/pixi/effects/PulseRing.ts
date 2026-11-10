@@ -25,6 +25,18 @@ export class PulseRing {
     const startTween = this.key === "";
     this.key = key;
     this.gfx.clear();
+    const unit = strokeWidth / PULSE_RING.strokeWidth;
+    for (const layer of PULSE_RING.halo) {
+      const offset = layer.offset * unit;
+      this.gfx.roundRect(
+        x - offset,
+        y - offset,
+        width + offset * 2,
+        height + offset * 2,
+        radius + offset,
+      );
+      this.gfx.stroke({ color, width: layer.width * unit, alpha: layer.alpha });
+    }
     this.gfx.roundRect(x, y, width, height, radius);
     this.gfx.stroke({ color, width: strokeWidth });
     if (!startTween) return;
