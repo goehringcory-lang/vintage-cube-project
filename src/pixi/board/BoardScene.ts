@@ -651,34 +651,97 @@ export class BoardScene {
     this.backdrop.clear();
     const stage = this.tabletop;
     if (!stage) return;
-    const shadow = this.theme.gameTheme.canvas.shadow;
+    const gt = this.theme.gameTheme;
+    const shadow = gt.canvas.shadow;
     const width = this.app.renderer.width;
     const height = this.app.renderer.height;
     this.backdrop.rect(0, 0, width, height);
     this.backdrop.fill({ color: hexToNum(shadow), alpha: TABLETOP_STAGE.backdropDarken });
-    this.backdrop.rect(stage.x, stage.y, stage.width, stage.height);
+    this.backdrop.rect(0, 0, width, height);
     this.backdrop.fill(
       new FillGradient({
         type: "radial",
-        center: { x: 0.5, y: 0.48 },
-        innerRadius: 0.4,
-        outerCenter: { x: 0.5, y: 0.48 },
-        outerRadius: 0.75,
+        center: { x: 0.5, y: TABLETOP_STAGE.centerlineFrac },
+        innerRadius: 0.45,
+        outerCenter: { x: 0.5, y: TABLETOP_STAGE.centerlineFrac },
+        outerRadius: 0.8,
         textureSpace: "local",
         colorStops: [
           { offset: 0, color: withAlpha(shadow, 0) },
-          { offset: 1, color: withAlpha(shadow, 0.45) },
+          { offset: 1, color: withAlpha(shadow, 0.4) },
         ],
       }),
     );
-    if (stage.x > 0) {
-      this.backdrop.rect(0, 0, stage.x, height).rect(stage.x + stage.width, 0, stage.x, height);
-      this.backdrop.fill({ color: hexToNum(shadow), alpha: 0.6 });
+    const s = stage.scale;
+    const inset = 14 * s;
+    const matX = stage.x + TABLETOP_STAGE.pileColumnWidth * s - inset;
+    const matY = stage.y + TABLETOP_STAGE.opponentFieldTop * s - inset;
+    const matW =
+      (TABLETOP_STAGE.width - TABLETOP_STAGE.pileColumnWidth - TABLETOP_STAGE.stackColumnWidth) *
+        s +
+      inset * 2;
+    const matH = (TABLETOP_STAGE.selfFieldBottom - TABLETOP_STAGE.opponentFieldTop) * s + inset * 2;
+    const radius = 28 * s;
+    const ink = hexToNum(gt.textGhost);
+    this.backdrop.rect(0, 0, width, height);
+    this.backdrop.fill({ color: hexToNum(shadow), alpha: 0.3 });
+    this.backdrop.roundRect(matX, matY, matW, matH, radius);
+    this.backdrop.cut();
+    this.backdrop.roundRect(matX, matY, matW, matH, radius);
+    this.backdrop.fill(
+      new FillGradient({
+        type: "radial",
+        center: { x: 0.5, y: 0.5 },
+        innerRadius: 0,
+        outerCenter: { x: 0.5, y: 0.5 },
+        outerRadius: 0.7,
+        textureSpace: "local",
+        colorStops: [
+          { offset: 0, color: withAlpha(gt.textGhost, 0.1) },
+          { offset: 1, color: withAlpha(gt.textGhost, 0.02) },
+        ],
+      }),
+    );
+    this.backdrop.roundRect(matX, matY, matW, matH, radius);
+    this.backdrop.stroke({ color: ink, width: 2 * s, alpha: 0.35 });
+    this.backdrop.roundRect(
+      matX + 8 * s,
+      matY + 8 * s,
+      matW - 16 * s,
+      matH - 16 * s,
+      radius - 8 * s,
+    );
+    this.backdrop.stroke({ color: ink, width: 1 * s, alpha: 0.14 });
+    const cx = stage.x + stage.width / 2;
+    const cy = stage.centerlineY;
+    const ring = 54 * s;
+    this.backdrop
+      .moveTo(matX + 40 * s, cy)
+      .lineTo(cx - ring - 18 * s, cy)
+      .moveTo(cx + ring + 18 * s, cy)
+      .lineTo(matX + matW - 40 * s, cy);
+    this.backdrop.stroke({ color: ink, width: 1.5 * s, alpha: 0.18 });
+    this.backdrop.circle(cx, cy, ring);
+    this.backdrop.stroke({ color: ink, width: 2 * s, alpha: 0.2 });
+    this.backdrop.circle(cx, cy, ring * 0.7);
+    this.backdrop.stroke({ color: ink, width: 1 * s, alpha: 0.16 });
+    for (let i = 0; i < 4; i++) {
+      const angle = (i * Math.PI) / 2;
+      const dx = Math.cos(angle) * (ring + 9 * s);
+      const dy = Math.sin(angle) * (ring + 9 * s);
+      const d = 5 * s;
+      this.backdrop.poly([
+        cx + dx,
+        cy + dy - d,
+        cx + dx + d,
+        cy + dy,
+        cx + dx,
+        cy + dy + d,
+        cx + dx - d,
+        cy + dy,
+      ]);
     }
-    if (stage.y > 0) {
-      this.backdrop.rect(0, 0, width, stage.y).rect(0, stage.y + stage.height, width, stage.y);
-      this.backdrop.fill({ color: hexToNum(shadow), alpha: 0.6 });
-    }
+    this.backdrop.fill({ color: ink, alpha: 0.28 });
   }
 
   private placeMedallion(playerId: string, centerY: number, depth: number): void {

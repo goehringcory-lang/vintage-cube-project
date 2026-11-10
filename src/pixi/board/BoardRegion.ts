@@ -104,6 +104,7 @@ interface BoardRegionOptions {
 const ENTRANCE_LAND_PX = 8;
 const TABLETOP_GROUP_STEP = (12 * CARD_W) / TABLETOP_STAGE.battlefieldCardWidth;
 const TABLETOP_GROUP_MAX_STEPS = 3;
+const TABLETOP_EXTRA_PILE_STEP = 0.35;
 const TABLETOP_ATTACH_STEP = (18 * CARD_W) / TABLETOP_STAGE.battlefieldCardWidth;
 const GLIDE_LAND_PX = 24;
 
@@ -189,6 +190,7 @@ export class BoardRegion {
   private attackRowDebugGfx = new Graphics();
   private combatRow: CombatRowRenderer;
   private effectiveChildrenMap = new Map<string, string[]>();
+  private tabletopGroupCounts = new Map<string, number>();
   private cardById = new Map<string, CardDto>();
   private lastState: BattlefieldState | null = null;
   private pendingDrop: { cardId: string; slot: { col: number; row: number } } | null = null;
@@ -953,6 +955,15 @@ export class BoardRegion {
         this.userSlots.delete(id);
       }
     }
+    if (this.tabletop) {
+      const attachedIds = new Set(state.cards.filter((c) => c.attachedTo).map((c) => c.id));
+      this.tabletopGroupCounts = new Map(
+        [...effectiveChildren].map(([id, childIds]) => [
+          id,
+          childIds.filter((childId) => !attachedIds.has(childId)).length,
+        ]),
+      );
+    }
     const positions = this.tabletop
       ? this.computeTabletopRows(topLevelCards)
       : this.computeBattlefieldGrid(topLevelCards);
@@ -1354,20 +1365,27 @@ export class BoardRegion {
     const nearY = this.mirrored ? zone.y + pad : zone.y + zone.height - pad - cardH;
     const farY = this.mirrored ? zone.y + zone.height - pad - cardH : zone.y + pad;
     const placements = new Map<string, { x: number; y: number }>();
-    let besideX = columnX + cardW * 0.6;
+    let besideX = columnX + cardW * TABLETOP_EXTRA_PILE_STEP;
     for (const key of this.zoneTileKeys) {
       if (key === ZONE_TILE_KEY.library) placements.set(key, { x: columnX, y: nearY });
       else if (key === ZONE_TILE_KEY.graveyard) placements.set(key, { x: columnX, y: farY });
       else if ((this.zoneTileCounts.get(key) ?? 0) > 0) {
         placements.set(key, { x: besideX, y: farY });
-        besideX += cardW * 0.6;
+        besideX += cardW * TABLETOP_EXTRA_PILE_STEP;
       }
     }
     this.zoneTiles.setGeometry(cardW, cardH, placements, this.touchHitPadScreen());
   }
 
+  private tabletopGroupSpread(card: CardDto, scale: number): number {
+    const groupCount = this.tabletopGroupCounts.get(card.id) ?? 0;
+    return TABLETOP_GROUP_STEP * Math.min(groupCount, TABLETOP_GROUP_MAX_STEPS) * scale;
+  }
+
   private tabletopFootprint(card: CardDto, scale: number): number {
-    return (card.tapped ? this.cardHeight() : CARD_W) * scale;
+    return (
+      (card.tapped ? this.cardHeight() : CARD_W) * scale + this.tabletopGroupSpread(card, scale)
+    );
   }
 
   private tabletopRowFit(cards: CardDto[], width: number): number {
@@ -1408,7 +1426,7 @@ export class BoardRegion {
     let x = left + (available - span) / 2 + widths[0]! / 2;
     cards.forEach((card, i) => {
       if (i > 0) x += advances[i - 1]! * ratio + step;
-      positions.set(card.id, { x, y });
+      positions.set(card.id, { x: x + this.tabletopGroupSpread(card, this.cardScale) / 2, y });
     });
   }
 
